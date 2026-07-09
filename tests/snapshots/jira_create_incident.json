@@ -1,0 +1,42 @@
+{
+  "schema": {
+    "description": "Create a Jira incident from a structured, PII-gated ticket. Off by default: requires jira.enable_write in the plugin config AND the JIRA_API_TOKEN credential, and every call is approval-escalated. All outbound text is PII-redacted; any referenced evidence file must pass the validate_no_pii gate (clean and complete) or the call refuses.",
+    "name": "jira_create_incident",
+    "parameters": {
+      "properties": {
+        "body": {
+          "description": "Issue description (plain text).",
+          "type": "string"
+        },
+        "evidence_paths": {
+          "description": "Local evidence files referenced by this ticket; each must pass the PII gate before anything is sent.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "labels": {
+          "description": "Optional labels to set on the issue.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "severity": {
+          "description": "Optional severity note (recorded in the description).",
+          "type": "string"
+        },
+        "title": {
+          "description": "Issue summary line.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "body"
+      ],
+      "type": "object"
+    }
+  },
+  "toolset": "jira_incidents"
+}

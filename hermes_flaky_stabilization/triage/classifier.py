@@ -129,6 +129,7 @@ def _build_input(
     excerpt: str,
     prior: dict[str, Any] | None,
     enrichment: Any | None,
+    incident_context: Any | None = None,
 ) -> list[dict[str, str]]:
     """Build the structured `input` blocks: excerpt + optional hints, as DATA."""
     blocks: list[dict[str, str]] = []
@@ -148,6 +149,14 @@ def _build_input(
             "type": "text",
             "text": "TEST-HISTORY ENRICHMENT (untrusted data, weak prior):\n"
             + str(enrichment)[:_MAX_ENRICHMENT_CHARS],
+        })
+    if incident_context:
+        # NET-NEW (plan D9): the incidents→triage feedback loop — related
+        # incidents from the local index seed the classifier as a weak prior.
+        blocks.append({
+            "type": "text",
+            "text": "RELATED-INCIDENTS HINT (untrusted data, weak prior):\n"
+            + str(incident_context)[:_MAX_ENRICHMENT_CHARS],
         })
     blocks.append({
         "type": "text",
@@ -196,6 +205,7 @@ def classify(
     *,
     prior: dict[str, Any] | None = None,
     enrichment: Any | None = None,
+    incident_context: Any | None = None,
     max_tokens: int = 700,
     timeout: float = 60.0,
 ) -> dict[str, Any]:
@@ -208,7 +218,7 @@ def classify(
         try:
             result = llm.complete_structured(
                 instructions=INSTRUCTIONS,
-                input=_build_input(excerpt, prior, enrichment),
+                input=_build_input(excerpt, prior, enrichment, incident_context),
                 json_schema=CLASSIFICATION_SCHEMA,
                 schema_name="ci_failure_classification",
                 temperature=0.0,

@@ -125,6 +125,7 @@ def triage_pipeline_failure(
     dispatch_tool: ToolDispatcher | None = None,
     hermes_home: str | None = None,
     enable_enrichment: bool = True,
+    incident_context: Any | None = None,
 ) -> str:
     """Triage one CI/CD pipeline failure log. Always returns a JSON string."""
     # --- validate (before any side effect) -------------------------------
@@ -188,8 +189,18 @@ def triage_pipeline_failure(
             # orchestrator's single chokepoint; enrichment.enrich never redacts.
             enrichment_data = redact.redact_obj(enrichment_data)
 
+    # NET-NEW (plan D9): incidents→triage feedback — the orchestrator may seed
+    # related incidents from the local index as an extra weak prior. Same
+    # redaction chokepoint as enrichment: scrub before the LLM sees or the
+    # payload echoes it.
+    if incident_context is not None:
+        incident_context = redact.redact_obj(incident_context)
+
     # --- classify --------------------------------------------------------
-    result = classifier.classify(llm, excerpt, prior=prior, enrichment=enrichment_data)
+    result = classifier.classify(
+        llm, excerpt, prior=prior, enrichment=enrichment_data,
+        incident_context=incident_context,
+    )
 
     # --- record ----------------------------------------------------------
     prior_occurrences = int(prior.get("occurrences", 0)) if prior else 0
@@ -228,4 +239,6 @@ def triage_pipeline_failure(
         payload["prior_match"] = "fuzzy"
     if enrichment_data is not None:
         payload["enrichment"] = enrichment_data
+    if incident_context is not None:
+        payload["incident_context"] = incident_context
     return _ok(payload)

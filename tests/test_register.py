@@ -15,8 +15,8 @@ from _doubles import FakePluginContext, load_plugin_module
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Phase-5 surface: + the three incident read tools (plain tools now — the
-# exclusive memory slot stays free, plan D1) and the two lifecycle hooks.
+# The complete surface (plan §6.2): 13 preserved tools + 3 net-new, 5 hooks,
+# 3 slash commands, 2 CLI commands, 1 skill.
 EXPECTED_TOOLS: set[str] = {
     "test_failure_lookup",
     "module_failure_history",
@@ -31,14 +31,18 @@ EXPECTED_TOOLS: set[str] = {
     "jira_search_incident",
     "jira_get_root_cause",
     "jira_link_session",
+    "jira_create_incident",
+    "stabilize_test_failure",
+    "find_duplicate_incidents",
 }
 EXPECTED_HOOKS: set[str] = {
     "pre_approval_request",
     "post_approval_response",
     "pre_llm_call",
     "on_session_start",
+    "pre_tool_call",
 }
-EXPECTED_COMMANDS: set[str] = {"improve-bug", "heal"}
+EXPECTED_COMMANDS: set[str] = {"improve-bug", "heal", "stabilize"}
 EXPECTED_CLI_COMMANDS = {"flaky-stab", "test-history"}
 EXPECTED_SKILLS: set[str] = {"flaky-healer"}
 
@@ -56,6 +60,9 @@ EXPECTED_TOOLSETS = {
     "jira_search_incident": "jira_incidents",
     "jira_get_root_cause": "jira_incidents",
     "jira_link_session": "jira_incidents",
+    "jira_create_incident": "jira_incidents",
+    "stabilize_test_failure": "flaky_stabilization",
+    "find_duplicate_incidents": "flaky_stabilization",
 }
 
 

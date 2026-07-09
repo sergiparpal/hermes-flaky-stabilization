@@ -33,7 +33,40 @@ def register(ctx) -> None:
     pii.register(ctx)
     incidents_service = incidents.register(ctx)
 
-    # Lifecycle hooks (incident context injection + session-start sync).
+    # NET-NEW tracker write-back (plan D7) — shipped disabled, check_fn-hidden.
+    from .incidents import write as incidents_write
+
+    incidents_write.register_tool(ctx)
+
+    # NET-NEW orchestration surface (plan D9).
+    from .orchestrator import pipeline as orchestrator_pipeline
+
+    ctx.register_tool(
+        name="stabilize_test_failure",
+        toolset="flaky_stabilization",
+        schema=orchestrator_pipeline.STABILIZE_SCHEMA,
+        handler=orchestrator_pipeline.make_tool_handler(ctx, incidents_service),
+    )
+    ctx.register_tool(
+        name="find_duplicate_incidents",
+        toolset="flaky_stabilization",
+        schema=orchestrator_pipeline.FIND_DUPLICATES_SCHEMA,
+        handler=orchestrator_pipeline.make_find_duplicates_handler(incidents_service),
+    )
+    try:
+        ctx.register_command(
+            "stabilize",
+            orchestrator_pipeline.make_command(ctx, incidents_service),
+            description=(
+                "Run the stabilization pipeline on a CI log or failing test: "
+                "/stabilize <log-or-test-id> [repo_dir=…] [mode=suggest|pr]"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — command is optional
+        logger.warning("%s: /stabilize not registered: %s", PLUGIN_NAME, exc)
+
+    # Lifecycle + gating hooks (incident context injection, session-start sync,
+    # approval escalation).
     from .orchestrator import hooks as orchestrator_hooks
 
     orchestrator_hooks.register(ctx, incidents_service=incidents_service)

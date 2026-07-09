@@ -87,3 +87,60 @@ def ingest_directory(conn, dir_path: Path) -> tuple[list[int], int]:
     if skipped:
         logger.warning("test-history: ingested %d file(s), skipped %d", len(run_ids), skipped)
     return run_ids, skipped
+
+
+# ---------------------------------------------------------------------------
+# NET-NEW (unified plugin, plan D9 loop 1)
+# ---------------------------------------------------------------------------
+
+
+def ingest_synthetic_run(conn, *, suite_name: str = "flaky-healer-burnin",
+                         cases: list[dict], run_timestamp: str | None = None,
+                         source_file: str | None = None, commit: bool = True) -> int:
+    """Persist a synthetic run (e.g. a healer burn-in outcome) as normal rows.
+
+    The schema is unchanged — this is just another run; ``source_file`` is a
+    descriptive pseudo-path (default ``synthetic://<suite_name>/<timestamp>``)
+    so provenance is visible in ``test_runs``. Each case dict may carry
+    ``classname``, ``name`` (required), ``file_path``, ``status`` (default
+    ``passed``), ``failure_message``, ``failure_type``, ``stack_trace``,
+    ``duration_ms``, ``line_number``. Returns the new ``test_runs.id``.
+    """
+    from datetime import UTC, datetime
+
+    if not cases:
+        raise ValueError("cases must be a non-empty list")
+    stamp = run_timestamp or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    pseudo = source_file or f"synthetic://{suite_name}/{stamp}"
+    failures = sum(1 for c in cases if c.get("status") == "failed")
+    errors = sum(1 for c in cases if c.get("status") == "error")
+    skipped = sum(1 for c in cases if c.get("status") == "skipped")
+
+    cur = conn.execute(
+        "INSERT INTO test_runs "
+        "(suite_name, run_timestamp, total, failures, errors, skipped, source_file) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (suite_name, stamp, len(cases), failures, errors, skipped, pseudo),
+    )
+    run_id = cur.lastrowid
+    try:
+        conn.executemany(
+            "INSERT INTO test_cases "
+            "(run_id, classname, name, file_path, line_number, status, duration_ms, "
+            " failure_message, failure_type, stack_trace) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (run_id, c.get("classname"), c["name"], c.get("file_path"),
+                 c.get("line_number"), c.get("status", "passed"), c.get("duration_ms"),
+                 c.get("failure_message"), c.get("failure_type"), c.get("stack_trace"))
+                for c in cases
+            ],
+        )
+    except Exception:
+        # Mirror ingest_file's rollback discipline: never leave an orphan run.
+        conn.execute("DELETE FROM test_cases WHERE run_id = ?", (run_id,))
+        conn.execute("DELETE FROM test_runs WHERE id = ?", (run_id,))
+        raise
+    if commit:
+        conn.commit()
+    return run_id

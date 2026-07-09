@@ -1,0 +1,56 @@
+{
+  "schema": {
+    "description": "Run the full flaky-test stabilization pipeline on one failure: look up the test's failure history and flaky verdict, triage the CI log into a category, then either heal the flaky test in a sandbox (optionally opening a PR) or draft a structured, PII-gated bug ticket with local duplicate-incident candidates. Returns a JSON envelope with every stage's result and an overall outcome: healed, pr_opened, ticket_created, ticket_ready, or needs_attention.",
+    "name": "stabilize_test_failure",
+    "parameters": {
+      "properties": {
+        "build_id": {
+          "description": "CI run id — with 'repo', fetches the log via GitHub Actions.",
+          "type": "string"
+        },
+        "evidence_paths": {
+          "description": "Extra evidence files for the bug branch's PII gate.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "log_url_or_path": {
+          "description": "CI log to triage (local path or https URL).",
+          "type": "string"
+        },
+        "mode": {
+          "description": "Healer mode; 'pr' needs approval (default from config).",
+          "enum": [
+            "suggest",
+            "pr"
+          ],
+          "type": "string"
+        },
+        "project": {
+          "description": "Project key for triage pattern learning.",
+          "type": "string"
+        },
+        "repo": {
+          "description": "GitHub 'owner/name' for build_id log fetching.",
+          "type": "string"
+        },
+        "repo_dir": {
+          "description": "Project checkout for the healer branch (required to heal).",
+          "type": "string"
+        },
+        "test_id": {
+          "description": "Failing test id ('classname::name', 'file::name', or bare name).",
+          "type": "string"
+        },
+        "trace_path": {
+          "description": "Optional Playwright trace.zip for healer diagnosis.",
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    }
+  },
+  "toolset": "flaky_stabilization"
+}

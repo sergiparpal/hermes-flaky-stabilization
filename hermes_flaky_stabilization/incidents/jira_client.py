@@ -182,3 +182,20 @@ class JiraClient:
             "GET", f"/rest/api/{self.api_version}/issue/{urllib.parse.quote(key)}",
             params=params or None,
         )
+
+    # -- NET-NEW (unified plugin, plan D7): the single write endpoint ---------
+
+    def create_issue(self, fields: dict[str, Any]) -> dict[str, Any]:
+        """POST ``/rest/api/{v}/issue`` — create one issue from *fields*.
+
+        The legacy client was deliberately GET-only; this is the one write the
+        unified plugin adds (``jira_create_incident``, plan D7). It reuses the
+        hardened transport: https-only base URL, enforced timeouts, and error
+        surfaces that carry the HTTP status but NEVER the response body (which
+        could echo the request's incident text into logs).
+        """
+        if not isinstance(fields, dict) or not fields:
+            raise ValueError("fields must be a non-empty dict")
+        return self._request(
+            "POST", f"/rest/api/{self.api_version}/issue", body={"fields": fields}
+        )

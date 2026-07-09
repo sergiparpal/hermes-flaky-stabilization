@@ -1,0 +1,24 @@
+{
+  "schema": {
+    "description": "Search the local Jira incident index for likely duplicates of a bug summary (FTS + token-overlap ranking; PII redacted). Purely local — no tracker round-trip. Use before filing a new incident.",
+    "name": "find_duplicate_incidents",
+    "parameters": {
+      "properties": {
+        "limit": {
+          "default": 5,
+          "description": "Max candidates (default 5).",
+          "type": "integer"
+        },
+        "summary": {
+          "description": "Bug title/summary to match.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "summary"
+      ],
+      "type": "object"
+    }
+  },
+  "toolset": "flaky_stabilization"
+}
