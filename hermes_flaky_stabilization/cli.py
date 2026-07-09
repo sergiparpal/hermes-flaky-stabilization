@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import closing
+from pathlib import Path
 
 SUBCOMMAND_DEST = "flaky_stab_cmd"
 
@@ -87,12 +88,25 @@ def setup_cli(parser) -> None:
     p_cron.add_argument("--no-create", dest="no_create", action="store_true",
                         help="Only write the shim + config; print the command instead "
                              "of creating the job")
+    p_cron.add_argument("--with-jira-sync", dest="with_jira_sync", action="store_true",
+                        help="Also install a second no-agent job that runs "
+                             "`hermes flaky-stab jira sync` on the same schedule")
 
     # -- incidents-owned (argument definitions from incidents.cli) --
     from .incidents import cli as incidents_cli
 
     p_jira = subs.add_parser("jira", help="Manage the local Jira incident index")
     incidents_cli.register_cli(p_jira)
+
+    # -- unified-owned: legacy data migration (plan Phase 7 / §10) --
+    p_migrate = subs.add_parser(
+        "migrate", help="Copy data from the four legacy plugin DBs into state.db"
+    )
+    p_migrate.add_argument("--dry-run", dest="dry_run", action="store_true",
+                           help="Report what would be copied; write nothing")
+    p_migrate.add_argument("--healer-db", dest="healer_db", default=None,
+                           help="Override the legacy healer.db path (e.g. a "
+                                "relocated FLAKY_HEALER_DATA_DIR)")
 
 
 def run_cli(args) -> int:
@@ -107,33 +121,175 @@ def run_cli(args) -> int:
     if command in _DETECTIVE_COMMANDS:
         from .detective import cli as detective_cli
 
-        return getattr(detective_cli, _DETECTIVE_COMMANDS[command])(args)
+        rc = getattr(detective_cli, _DETECTIVE_COMMANDS[command])(args)
+        if command == "install-cron" and rc == 0 and getattr(args, "with_jira_sync", False):
+            rc = _install_jira_sync_job(args)
+        return rc
     if command == "jira":
         from .incidents import cli as incidents_cli
 
         incidents_cli.hermes_jira_incidents_command(args)
         return 0
+    if command == "migrate":
+        return _cmd_migrate(args)
     print(f"flaky-stab: unknown subcommand {command!r}")  # unreachable via argparse
     return 2
 
 
+def _cmd_migrate(args) -> int:
+    from .storage import migrate_legacy
+
+    overrides = {}
+    if getattr(args, "healer_db", None):
+        from pathlib import Path
+
+        overrides["flaky_healer"] = Path(args.healer_db)
+    reports = migrate_legacy.migrate(dry_run=args.dry_run, overrides=overrides)
+    for report in reports:
+        if not report.found:
+            print(f"{report.name}: {report.path} (not found — skipped)")
+            continue
+        if report.skipped and not report.tables:
+            print(f"{report.name}: {report.path} ({report.skipped})")
+            continue
+        detail = ", ".join(f"{table}={count}" for table, count in report.tables.items())
+        verb = "would copy" if args.dry_run else "copied"
+        print(f"{report.name}: {report.path} — {verb} {detail or 'nothing'}")
+    if args.dry_run:
+        print("dry-run: nothing was written")
+    else:
+        print("migration complete (sources untouched; re-running adds nothing)")
+    return 0
+
+
+JIRA_SYNC_SHIM = "flaky-stab-jira-sync.sh"
+JIRA_SYNC_JOB = "flaky-stabilization-jira-sync"
+
+
+def _install_jira_sync_job(args) -> int:
+    """Optionally install the second no-agent job (plan D10 --with-jira-sync)."""
+    import shlex
+    import shutil
+    import subprocess
+
+    from . import config as unified_config
+    from . import paths
+
+    cfg = unified_config.load_config()["detective"]
+    schedule = args.schedule or cfg["schedule"]
+    deliver = args.deliver or cfg["deliver"]
+
+    scripts_dir = paths.get_hermes_home() / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    shim_src = Path(__file__).resolve().parents[1] / "scripts" / JIRA_SYNC_SHIM
+    shim_dst = scripts_dir / JIRA_SYNC_SHIM
+    shutil.copyfile(shim_src, shim_dst)
+    try:
+        import os
+
+        os.chmod(shim_dst, 0o700)
+    except OSError:
+        pass
+    print(f"installed shim: {shim_dst} (mode 0700)")
+
+    printable = (f"hermes cron create {shlex.quote(schedule)} --no-agent "
+                 f"--script {JIRA_SYNC_SHIM} --deliver {shlex.quote(deliver)} "
+                 f"--name {JIRA_SYNC_JOB}")
+    if getattr(args, "no_create", False):
+        print("skipping jira-sync job creation (--no-create). To create it later, run:")
+        print(f"  {printable}")
+        return 0
+    cron_cmd = ["hermes", "cron", "create", schedule, "--no-agent",
+                "--script", JIRA_SYNC_SHIM, "--deliver", deliver,
+                "--name", JIRA_SYNC_JOB]
+    try:
+        result = subprocess.run(cron_cmd, capture_output=True, text=True)
+    except (FileNotFoundError, OSError) as exc:
+        print(f"could not run the hermes CLI ({exc}). To create the job, run:")
+        print(f"  {printable}")
+        return 0
+    if result.returncode == 0:
+        print(f"created cron job '{JIRA_SYNC_JOB}' (verify with `hermes cron list`).")
+        return 0
+    detail = (result.stderr or result.stdout or "").strip()
+    if detail:
+        print(detail)
+    print("could not create the jira-sync job automatically. To create it, run:")
+    print(f"  {printable}")
+    return 0
+
+
+_STATUS_TABLES = (
+    "flaky_verdicts", "scan_runs", "triage_patterns", "healer_runs", "recipes",
+    "audit", "incidents", "links", "meta", "pipeline_runs",
+)
+
+
 def status_text() -> str:
-    """Human-readable state summary. Never prints secret values."""
+    """Human-readable state summary (plan Phase 7): DB paths, schema versions,
+    per-table counts, config summary, credential presence — booleans only,
+    never token values."""
+    import json as _json
+    import os
+
     from . import config, paths
     from .storage import state
 
     lines = [f"hermes-flaky-stabilization @ {paths.get_data_dir()}"]
+
+    # -- state.db ---------------------------------------------------------
     db_path = state.state_db_path()
     if db_path.exists():
         try:
             with closing(state.connect(db_path)) as conn:
                 version = state.current_version(conn)
                 fts = state.fts_available(conn)
-            lines.append(f"state.db: {db_path} (schema v{version}, fts5={'yes' if fts else 'no'})")
+                counts = {
+                    table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in _STATUS_TABLES
+                }
+            lines.append(
+                f"state.db:   {db_path} (schema v{version}, "
+                f"fts5={'yes' if fts else 'no'})"
+            )
+            lines.append("counts:     " + ", ".join(
+                f"{table}={count}" for table, count in counts.items()))
         except sqlite3.Error as exc:
-            lines.append(f"state.db: {db_path} (unreadable: {exc})")
+            lines.append(f"state.db:   {db_path} (unreadable: {exc})")
     else:
-        lines.append(f"state.db: {db_path} (not created yet)")
+        lines.append(f"state.db:   {db_path} (not created yet)")
+
+    # -- history.db (the keystone public contract, D2) -----------------------
+    history_db = paths.get_hermes_home() / "test-history" / "history.db"
+    if history_db.exists():
+        try:
+            with closing(sqlite3.connect(f"file:{history_db}?mode=ro", uri=True)) as conn:
+                runs = conn.execute("SELECT COUNT(*) FROM test_runs").fetchone()[0]
+                cases = conn.execute("SELECT COUNT(*) FROM test_cases").fetchone()[0]
+                hv = conn.execute(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_version").fetchone()[0]
+            lines.append(f"history.db: {history_db} (schema v{hv}, "
+                         f"runs={runs}, cases={cases})")
+        except sqlite3.Error as exc:
+            lines.append(f"history.db: {history_db} (unreadable: {exc})")
+    else:
+        lines.append(f"history.db: {history_db} (not created yet)")
+
+    # -- config + credentials (presence booleans only) ------------------------
     cfg_path = config.config_path()
-    lines.append(f"config: {cfg_path} ({'present' if cfg_path.exists() else 'defaults'})")
+    lines.append(f"config:     {cfg_path} "
+                 f"({'present' if cfg_path.exists() else 'defaults'})")
+    cfg = config.load_config()
+    summary = {
+        "detective": {k: cfg["detective"][k] for k in ("window_days", "min_fails",
+                                                       "schedule")},
+        "pipeline": cfg["pipeline"],
+        "jira": {"base_url": cfg["jira"]["base_url"],
+                 "enable_write": cfg["jira"]["enable_write"]},
+        "incidents": cfg["incidents"],
+    }
+    lines.append("resolved config (summary):")
+    lines.append(_json.dumps(summary, indent=2, sort_keys=True))
+    lines.append(f"GITHUB_TOKEN set:   {bool(os.environ.get('GITHUB_TOKEN'))}")
+    lines.append(f"JIRA_API_TOKEN set: {bool(os.environ.get('JIRA_API_TOKEN'))}")
     return "\n".join(lines)
