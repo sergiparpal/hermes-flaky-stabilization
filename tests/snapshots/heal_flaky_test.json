@@ -1,0 +1,53 @@
+{
+  "schema": {
+    "description": "End-to-end healer for a flaky Playwright test: diagnose (trace/logs/recipes), apply a fix strategy to a copy of the repo inside an isolated sandbox, validate by burn-in (reproduce M runs, then require N/N green post-patch), and either return the diff (mode=suggest) or open a PR through the host's approval pipeline (mode=pr). Successful heals are persisted as reusable recipes.",
+    "name": "heal_flaky_test",
+    "parameters": {
+      "properties": {
+        "build_id": {
+          "description": "Optional GitHub Actions run id to pull failure logs from.",
+          "type": "string"
+        },
+        "mode": {
+          "description": "suggest (default): return diff + report only. pr: branch, commit, push and open a PR via the host's approval pipeline.",
+          "enum": [
+            "suggest",
+            "pr"
+          ],
+          "type": "string"
+        },
+        "repo": {
+          "description": "Repository 'owner/name' (required when build_id is given).",
+          "type": "string"
+        },
+        "repo_dir": {
+          "description": "Path to the local checkout whose Playwright project root contains playwright.config.*.",
+          "type": "string"
+        },
+        "strategy": {
+          "description": "Optional override of the automatically selected fix strategy.",
+          "enum": [
+            "bump_timeout",
+            "testid_selector",
+            "await_state"
+          ],
+          "type": "string"
+        },
+        "test_id": {
+          "description": "Spec path relative to repo_dir, e.g. 'tests/login.spec.ts'.",
+          "type": "string"
+        },
+        "trace_path": {
+          "description": "Optional path to a failing trace.zip for this test.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo_dir",
+        "test_id"
+      ],
+      "type": "object"
+    }
+  },
+  "toolset": "flaky_healer"
+}

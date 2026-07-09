@@ -1,0 +1,12 @@
+{
+  "name": "toy-shop",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Deliberately flaky Playwright fixture app for hermes-flaky-healer",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.60.0"
+  }
+}

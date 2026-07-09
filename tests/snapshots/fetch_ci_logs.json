@@ -1,0 +1,24 @@
+{
+  "schema": {
+    "description": "Download a failed GitHub Actions run's logs and locally pre-filter them to the failure-relevant fragment (~15 KB max) before anything reaches an LLM. Returns run metadata, the failed jobs/steps, and the filtered log. Requires GITHUB_TOKEN.",
+    "name": "fetch_ci_logs",
+    "parameters": {
+      "properties": {
+        "build_id": {
+          "description": "GitHub Actions run id (the numeric id in the run URL).",
+          "type": "string"
+        },
+        "repo": {
+          "description": "Repository in 'owner/name' form, e.g. 'acme/webshop'.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "build_id",
+        "repo"
+      ],
+      "type": "object"
+    }
+  },
+  "toolset": "flaky_healer"
+}

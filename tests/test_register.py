@@ -15,27 +15,34 @@ from _doubles import FakePluginContext, load_plugin_module
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Phase-3 surface: history + detective + triage + bugreport + pii tools,
-# the /improve-bug slash command, the unified CLI and the `test-history`
-# alias (kept public contract, plan D2).
+# Phase-4 surface: + the four healer tools, /heal, the flaky-healer skill and
+# the two approval audit observer hooks.
 EXPECTED_TOOLS: set[str] = {
     "test_failure_lookup",
     "module_failure_history",
     "is_flaky",
     "triage_pipeline_failure",
+    "fetch_ci_logs",
+    "analyze_playwright_trace",
+    "heal_flaky_test",
+    "list_healing_recipes",
     "improve_bug_report",
     "validate_no_pii",
 }
-EXPECTED_HOOKS: set[str] = set()
-EXPECTED_COMMANDS: set[str] = {"improve-bug"}
+EXPECTED_HOOKS: set[str] = {"pre_approval_request", "post_approval_response"}
+EXPECTED_COMMANDS: set[str] = {"improve-bug", "heal"}
 EXPECTED_CLI_COMMANDS = {"flaky-stab", "test-history"}
-EXPECTED_SKILLS: set[str] = set()
+EXPECTED_SKILLS: set[str] = {"flaky-healer"}
 
 EXPECTED_TOOLSETS = {
     "test_failure_lookup": "test_history",
     "module_failure_history": "test_history",
     "is_flaky": "flaky_detective",
     "triage_pipeline_failure": "ci_triage",
+    "fetch_ci_logs": "flaky_healer",
+    "analyze_playwright_trace": "flaky_healer",
+    "heal_flaky_test": "flaky_healer",
+    "list_healing_recipes": "flaky_healer",
     "improve_bug_report": "qa",
     "validate_no_pii": "qa_masking",
 }

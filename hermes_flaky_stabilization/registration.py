@@ -18,14 +18,17 @@ CLI_COMMAND = "flaky-stab"
 
 def register(ctx) -> None:
     """Wire the plugin surface onto *ctx* (a Hermes ``PluginContext``)."""
-    from . import bugreport, detective, history, pii, triage
+    from . import bugreport, detective, healer, history, pii, triage
 
     # Stage registrations (tool contracts preserved verbatim). history.register
     # also registers the `test-history` CLI alias — a kept public contract (D2);
-    # bugreport.register also registers the /improve-bug slash command.
+    # bugreport.register also registers the /improve-bug slash command;
+    # healer.register also registers /heal, the flaky-healer skill, and the two
+    # approval audit observer hooks.
     history.register(ctx)
     detective.register(ctx)
     triage.register(ctx)
+    healer.register(ctx)
     bugreport.register(ctx)
     pii.register(ctx)
 

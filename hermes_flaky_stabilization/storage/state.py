@@ -87,6 +87,16 @@ _V1_FTS = (
 
 def _migrate_to_v1(conn: sqlite3.Connection) -> None:
     for ddl in _V1_DDL:
+        if "idx_recipes_relaxed_key" in ddl:
+            # Tolerate a pre-existing legacy (healer v1) recipes table without
+            # the relaxed_key column: CREATE TABLE IF NOT EXISTS above no-ops
+            # on it, and creating the index would then fail. Adding the column
+            # (NULL — invisible to relaxed matching, the legacy semantics for
+            # un-backfilled rows) keeps the ladder idempotent; the real
+            # backfill belongs to the legacy-data importer (plan Phase 7).
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(recipes)")]
+            if cols and "relaxed_key" not in cols:
+                conn.execute("ALTER TABLE recipes ADD COLUMN relaxed_key TEXT")
         conn.execute(ddl)
     for ddl in _V1_FTS:
         try:

@@ -23,10 +23,11 @@ PACKAGE = Path(__file__).resolve().parent.parent / "hermes_flaky_stabilization"
 SUBPROCESS_ALLOWLIST = {
     "detective/cli.py": "install-cron's sanctioned `hermes cron create` call",
     "cli.py": "mounts install-cron (same sanctioned subprocess)",
-    "healer/sandbox/subproc.py": "subprocess sandbox backend",
-    "healer/sandbox/docker.py": "docker CLI invocation",
-    "healer/sandbox/base.py": "shared sandbox runner types",
-    "healer/gitflow.py": "documents the dispatch-only git flow",
+    "healer/flaky_healer/sandbox/subproc.py": "subprocess sandbox backend",
+    "healer/flaky_healer/sandbox/docker.py": "docker CLI invocation",
+    "healer/flaky_healer/sandbox/base.py": "sandbox probes (docker availability)",
+    "healer/flaky_healer/gitflow.py": "local `git apply --check` preflight; "
+                                      "pushes/PRs still go through dispatch_tool",
 }
 
 # Import-level detection: actually *using* subprocess requires importing it;

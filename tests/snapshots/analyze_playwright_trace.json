@@ -1,0 +1,19 @@
+{
+  "schema": {
+    "description": "Parse a Playwright trace.zip, extract the failing action, selector, error and timing/network context, and return a structured flakiness diagnosis (cause, evidence, recommended fix strategy, confidence).",
+    "name": "analyze_playwright_trace",
+    "parameters": {
+      "properties": {
+        "trace_path": {
+          "description": "Filesystem path to a Playwright trace.zip file.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "trace_path"
+      ],
+      "type": "object"
+    }
+  },
+  "toolset": "flaky_healer"
+}

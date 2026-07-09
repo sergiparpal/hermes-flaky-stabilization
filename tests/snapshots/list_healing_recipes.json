@@ -1,0 +1,11 @@
+{
+  "schema": {
+    "description": "List learned healing recipes (failure signature → fix procedure) with their hit/success/failure statistics.",
+    "name": "list_healing_recipes",
+    "parameters": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  "toolset": "flaky_healer"
+}

@@ -1,0 +1,35 @@
+
+Running 1 test using 1 worker
+
+  ✘  1 tests/flaky-selector.spec.ts:3:5 › submits the order form (2.3s)
+
+
+  1) tests/flaky-selector.spec.ts:3:5 › submits the order form ─────────────────────────────────────
+
+    TimeoutError: locator.click: Timeout 2000ms exceeded.
+    Call log:
+    [2m  - waiting for locator('#btn-1f9c')[22m
+
+
+      3 | test('submits the order form', async ({ page }) => {
+      4 |   await page.goto('/');
+    > 5 |   await page.locator('#btn-1f9c').click({ timeout: 2000 });
+        |                                   ^
+      6 |   await expect(page.locator('#submit-result')).toHaveText('submitted');
+      7 | });
+      8 |
+        at /home/sergi/hermes-flaky-healer/fixtures/toy-app/tests/flaky-selector.spec.ts:5:35
+
+    Error Context: test-results/flaky-selector-submits-the-order-form/error-context.md
+
+    attachment #2: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/flaky-selector-submits-the-order-form/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/flaky-selector-submits-the-order-form/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    tests/flaky-selector.spec.ts:3:5 › submits the order form ──────────────────────────────────────
+
