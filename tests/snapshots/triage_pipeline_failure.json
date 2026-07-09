@@ -1,0 +1,23 @@
+{
+  "schema": {
+    "description": "Triage a failed CI/CD pipeline run. Use this when you have a build, test, or deploy log (a local file path or an https:// URL to the raw log) and need to know WHY it failed. It pre-filters the log to the failure-relevant lines, classifies the root cause into one fixed category — broken_test, environment, data, timeout, flaky, or infra — and learns the pattern per project so repeat failures are recognised. Returns a JSON object with: category, confidence (0-1), a one-line summary, supporting evidence lines, a suggested next action, whether this signature was seen before (prior_seen / prior_occurrences), and log_stats. On failure it returns {success:false, error, remediation}. Local-file triage needs no credentials; fetching protected remote logs reads a token from the environment.",
+    "name": "triage_pipeline_failure",
+    "parameters": {
+      "properties": {
+        "log_url_or_path": {
+          "description": "Local filesystem path to a CI log file, OR an https:// URL to the raw log. Plain http and non-file schemes are rejected.",
+          "type": "string"
+        },
+        "project": {
+          "description": "Optional project key to scope pattern learning. Defaults to the current working directory's name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "log_url_or_path"
+      ],
+      "type": "object"
+    }
+  },
+  "toolset": "ci_triage"
+}

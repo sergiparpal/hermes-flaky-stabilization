@@ -15,11 +15,19 @@ from _doubles import FakePluginContext, load_plugin_module
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Phase-2 surface: history + detective tools, the unified CLI and the
-# `test-history` alias (kept public contract, plan D2).
-EXPECTED_TOOLS: set[str] = {"test_failure_lookup", "module_failure_history", "is_flaky"}
+# Phase-3 surface: history + detective + triage + bugreport + pii tools,
+# the /improve-bug slash command, the unified CLI and the `test-history`
+# alias (kept public contract, plan D2).
+EXPECTED_TOOLS: set[str] = {
+    "test_failure_lookup",
+    "module_failure_history",
+    "is_flaky",
+    "triage_pipeline_failure",
+    "improve_bug_report",
+    "validate_no_pii",
+}
 EXPECTED_HOOKS: set[str] = set()
-EXPECTED_COMMANDS: set[str] = set()
+EXPECTED_COMMANDS: set[str] = {"improve-bug"}
 EXPECTED_CLI_COMMANDS = {"flaky-stab", "test-history"}
 EXPECTED_SKILLS: set[str] = set()
 
@@ -27,6 +35,9 @@ EXPECTED_TOOLSETS = {
     "test_failure_lookup": "test_history",
     "module_failure_history": "test_history",
     "is_flaky": "flaky_detective",
+    "triage_pipeline_failure": "ci_triage",
+    "improve_bug_report": "qa",
+    "validate_no_pii": "qa_masking",
 }
 
 

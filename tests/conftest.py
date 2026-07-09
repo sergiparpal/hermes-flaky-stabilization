@@ -49,7 +49,21 @@ def _isolated_env(tmp_path, monkeypatch):
     home = tmp_path / "hermes-home"
     home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
-    return home
+    _reset_history_singletons()
+    yield home
+    _reset_history_singletons()
+
+
+def _reset_history_singletons():
+    """The history stage keeps a module-level connection/config cache; a stale
+    one would leak a previous test's tmp HERMES_HOME into the next test (e.g.
+    via triage enrichment, which opens history lazily)."""
+    try:
+        from hermes_flaky_stabilization.history import storage
+
+        storage.reset_for_tests()
+    except Exception:
+        pass
 
 
 @pytest.fixture

@@ -1,0 +1,33 @@
+{
+  "schema": {
+    "description": "Takes a poorly written or incomplete bug report and returns a structured version with title, reproduction steps, expected and actual behavior, suggested severity, and a list of missing evidence. Does not invent missing facts.",
+    "name": "improve_bug_report",
+    "parameters": {
+      "properties": {
+        "context": {
+          "default": "",
+          "description": "Optional additional environment or context info (versions, OS, browser, build number, etc.).",
+          "type": "string"
+        },
+        "format": {
+          "default": "markdown",
+          "description": "Output format. 'markdown' for human consumption, 'json' for downstream tooling.",
+          "enum": [
+            "markdown",
+            "json"
+          ],
+          "type": "string"
+        },
+        "raw_text": {
+          "description": "The original, unstructured bug report text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "raw_text"
+      ],
+      "type": "object"
+    }
+  },
+  "toolset": "qa"
+}

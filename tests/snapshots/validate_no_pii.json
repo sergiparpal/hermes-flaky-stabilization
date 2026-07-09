@@ -1,0 +1,40 @@
+{
+  "schema": {
+    "description": "Scan a file or directory of QA evidence for residual PII (personal data) before attaching it to an external ticket (Jira, Bugzilla, etc.). Returns findings with masked previews (e.g. '************1234'); never returns raw PII. Read-only: it does not modify, redact, or write anything. Use this as a verification gate right before uploading logs/screenshots to a public tracker.",
+    "name": "validate_no_pii",
+    "parameters": {
+      "properties": {
+        "max_files": {
+          "description": "Optional cap on the number of files scanned (safety bound).",
+          "type": "integer"
+        },
+        "target": {
+          "description": "Absolute or relative path to a file or directory to scan.",
+          "type": "string"
+        },
+        "types": {
+          "description": "Optional subset of detector names to run (e.g. ['email', 'credit_card']). Defaults to all configured detectors.",
+          "items": {
+            "enum": [
+              "email",
+              "credit_card",
+              "iban",
+              "spanish_dni_nie",
+              "phone",
+              "us_ssn",
+              "us_itin",
+              "passport"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    }
+  },
+  "toolset": "qa_masking"
+}
