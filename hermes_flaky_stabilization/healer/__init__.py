@@ -87,7 +87,10 @@ def register(ctx) -> None:
 
     skill_path = Path(__file__).resolve().parents[2] / "skills" / "flaky-healer" / "SKILL.md"
     try:
-        ctx.register_skill("flaky-healer", str(skill_path))
+        # A real Path, not str: the host's register_skill calls path.exists()
+        # on the argument (an integration bug the legacy plugin's str silently
+        # tripped — caught by the Phase-8 real-loader tests).
+        ctx.register_skill("flaky-healer", skill_path)
     except Exception as exc:  # noqa: BLE001 — older hosts may lack register_skill
         log.debug("register_skill unavailable or failed: %s", exc)
 
