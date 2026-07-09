@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuite name="pytest" tests="3" failures="0" errors="0" skipped="0" time="0.123" timestamp="2026-05-01T10:00:00">
+  <testcase classname="tests.test_math" name="test_add" file="tests/test_math.py" line="4" time="0.001"/>
+  <testcase classname="tests.test_math" name="test_sub" file="tests/test_math.py" line="9" time="0.002"/>
+  <testcase classname="tests.test_str" name="test_upper" file="tests/test_str.py" line="3" time="0.0005"/>
+</testsuite>

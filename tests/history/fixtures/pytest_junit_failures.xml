@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuite name="pytest" tests="5" failures="2" errors="1" skipped="1" time="1.5" timestamp="2026-05-18T14:22:01">
+  <testcase classname="src.auth.test_oauth" name="test_oauth_login" file="src/auth/test_oauth.py" line="10" time="0.5">
+    <failure message="AssertionError: token expired" type="AssertionError">Traceback (most recent call last):
+  File "src/auth/test_oauth.py", line 12, in test_oauth_login
+    assert token.valid
+AssertionError: token expired</failure>
+  </testcase>
+  <testcase classname="src.auth.test_oauth" name="test_oauth_token_refresh" file="src/auth/test_oauth.py" line="25" time="0.3">
+    <failure message="TimeoutError: refresh timed out" type="TimeoutError">Traceback (most recent call last):
+  File "src/auth/test_oauth.py", line 27, in test_oauth_token_refresh
+    refresh(token)
+TimeoutError: refresh timed out</failure>
+  </testcase>
+  <testcase classname="src.auth.test_oauth" name="test_oauth_logout" file="src/auth/test_oauth.py" line="40" time="0.1">
+    <error message="ConnectionError: cannot reach IdP" type="ConnectionError">Traceback (most recent call last):
+  File "src/auth/test_oauth.py", line 42, in test_oauth_logout
+    logout(session)
+ConnectionError: cannot reach IdP</error>
+  </testcase>
+  <testcase classname="src.auth.test_oauth" name="test_oauth_skipme" file="src/auth/test_oauth.py" line="55" time="0.0">
+    <skipped message="needs a live IdP" type="pytest.skip"/>
+  </testcase>
+  <testcase classname="src.auth.test_oauth" name="test_oauth_ok" file="src/auth/test_oauth.py" line="60" time="0.2"/>
+</testsuite>

@@ -18,6 +18,13 @@ CLI_COMMAND = "flaky-stab"
 
 def register(ctx) -> None:
     """Wire the plugin surface onto *ctx* (a Hermes ``PluginContext``)."""
+    from . import detective, history
+
+    # Stage registrations (tool contracts preserved verbatim). history.register
+    # also registers the `test-history` CLI alias — a kept public contract (D2).
+    history.register(ctx)
+    detective.register(ctx)
+
     _register_cli(ctx)
 
 

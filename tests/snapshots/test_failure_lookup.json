@@ -1,0 +1,26 @@
+{
+  "schema": {
+    "description": "Look up the failure history of a specific test by its identifier. Returns recent failure events, error messages, and stack traces. Use when the user mentions a specific test name or when triaging a single failing test.",
+    "name": "test_failure_lookup",
+    "parameters": {
+      "properties": {
+        "limit": {
+          "default": 10,
+          "description": "Maximum number of failure events to return.",
+          "maximum": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "test_id": {
+          "description": "Test identifier in 'classname::name' or 'file_path::name' format. FTS-style queries also accepted (e.g. 'test_login AND oauth').",
+          "type": "string"
+        }
+      },
+      "required": [
+        "test_id"
+      ],
+      "type": "object"
+    }
+  },
+  "toolset": "test_history"
+}

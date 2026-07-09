@@ -1,0 +1,19 @@
+{
+  "schema": {
+    "description": "Check whether a test is known to be flaky (fails intermittently rather than consistently) based on the latest detection sweep over recent test history. Returns a verdict — flaky, consistently_failing, stable, or unknown — with the pass/fail counts behind it. Use when triaging a single failing test to decide whether it is a known flaky test (safe to retry) versus a real regression, or before quarantining/retrying a test.",
+    "name": "is_flaky",
+    "parameters": {
+      "properties": {
+        "test_id": {
+          "description": "Test identifier: a bare test name, or 'classname::name', or 'file_path::name'. Matched against the latest verdicts.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "test_id"
+      ],
+      "type": "object"
+    }
+  },
+  "toolset": "flaky_detective"
+}

@@ -1,0 +1,122 @@
+"""Shared domain vocabulary — the rules and tunable defaults that more than one
+module must agree on, gathered here so they have a single owner and cannot drift.
+
+Mirrors the discipline of the sibling ``hermes-test-history`` plugin's
+``domain.py``: only things with more than one caller live here (status names, the
+tunable defaults echoed by both the tool schema and the config layer, and the
+shared "effective timestamp" SQL fragment). It is kept import-free so importing
+it at Hermes startup (``__init__`` references it at module scope) costs nothing.
+
+GPL note: the ``effective_time`` expression below is re-implemented locally on
+purpose. ``hermes-test-history`` is GPL-3.0; this plugin only reads its SQLite
+*data file* (not a derivative work) and never *imports* its Python modules, so it
+stays under its own license. See README's "GPL / data-only boundary".
+"""
+
+# ---------------------------------------------------------------------------
+# Per-case outcome vocabulary (the ``status`` values stored by test-history)
+# ---------------------------------------------------------------------------
+
+STATUS_PASSED = "passed"
+STATUS_FAILED = "failed"
+STATUS_ERROR = "error"
+STATUS_SKIPPED = "skipped"
+
+
+def fail_statuses(include_errors: bool) -> tuple[str, ...]:
+    """Per-case statuses that count as a *failure* for flakiness.
+
+    ``failed`` always counts; ``error`` counts only when ``include_errors`` is
+    set (Phase 0 question 2, default yes). ``skipped`` never counts (it is
+    excluded from both the pass and fail tallies), and an ``error`` that is *not*
+    counted as a failure is likewise excluded from both — it is neither a pass
+    nor a fail, so it does not inflate ``runs``.
+    """
+    return (STATUS_FAILED, STATUS_ERROR) if include_errors else (STATUS_FAILED,)
+
+
+# ---------------------------------------------------------------------------
+# Verdict vocabulary (this plugin's own classification of a test)
+# ---------------------------------------------------------------------------
+
+# A test that fails intermittently: enough failures to matter, but also passes.
+VERDICT_FLAKY = "flaky"
+# A test that fails (>= threshold) and never passes in the window: broken, not flaky.
+VERDICT_CONSISTENTLY_FAILING = "consistently_failing"
+# Anything below the failure threshold.
+VERDICT_STABLE = "stable"
+# Returned by the ``is_flaky`` tool when a test has no verdict on record.
+VERDICT_UNKNOWN = "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Tunable defaults (mirrored in config.DEFAULT_CONFIG and the tool/CLI layers)
+# ---------------------------------------------------------------------------
+
+DEFAULT_WINDOW_DAYS = 14        # detection look-back window
+DEFAULT_MIN_FAILS = 3           # minimum failures in the window to be non-stable
+DEFAULT_INCLUDE_ERRORS = True   # count `error` status as a failure
+DEFAULT_DELIVER = "local"       # cron delivery channel
+DEFAULT_SCHEDULE = "0 9 * * *"  # cron schedule (daily 09:00)
+DEFAULT_REPORT_SCOPE = "changes-only"  # nightly report scope
+
+# We read another plugin's schema, so we pin to the version we were built against
+# and warn if the installed test-history DB reports something different (§3.1).
+EXPECTED_SOURCE_SCHEMA_VERSION = 1
+
+
+def validate_tunables(window_days: int, min_fails: int) -> None:
+    """Reject nonsensical detection tunables before they produce wrong verdicts.
+
+    This is a domain invariant, not a CLI concern, so it lives next to the
+    defaults it guards: every caller that sets these tunables (the ``scan``
+    use-case, ``install-cron``, any future trigger) enforces the same rule.
+
+    ``min_fails`` must be ``>= 1``: with ``min_fails <= 0`` the ``fails >=
+    min_fails`` test is always true, so every all-passing (perfectly stable) test
+    would be mislabeled *flaky*. ``window_days`` must be ``>= 1``: a zero/negative
+    window selects no runs. Raises :class:`ValueError` with a one-line, joined
+    message (the tunable labels are kept neutral so the message reads the same
+    whether the value came from a flag or from ``config.json``).
+    """
+    problems = []
+    if window_days < 1:
+        problems.append(f"window must be >= 1 (got {window_days})")
+    if min_fails < 1:
+        problems.append(f"min-fails must be >= 1 (got {min_fails})")
+    if problems:
+        raise ValueError("; ".join(problems))
+
+
+# ---------------------------------------------------------------------------
+# Test identity
+# ---------------------------------------------------------------------------
+
+
+def make_test_key(classname, name) -> str:
+    """Canonical identity for a test: ``"{classname}::{name}"``.
+
+    When ``classname`` is NULL/empty (some emitters, e.g. jest, omit it) the key
+    is ``"::{name}"`` so the test is still uniquely addressable by name. ``name``
+    is required by the test-history schema, so it is never empty.
+    """
+    cls = (classname or "").strip()
+    nm = (name or "").strip()
+    return f"{cls}::{nm}"
+
+
+# ---------------------------------------------------------------------------
+# Shared SQL fragments (static text only — never caller input)
+# ---------------------------------------------------------------------------
+
+
+def effective_time(alias: str = "") -> str:
+    """SQL for a run's effective timestamp: ``run_timestamp`` else ``ingested_at``.
+
+    ``alias`` is an optional table qualifier *including the trailing dot* (e.g.
+    ``"tr."``). The returned text is a static column expression containing no
+    caller-supplied values, so callers concatenate it into SQL safely; every
+    actual value still binds through ``?``. Re-implemented locally (not imported
+    from test-history) to keep the GPL boundary intact.
+    """
+    return f"COALESCE({alias}run_timestamp, {alias}ingested_at)"

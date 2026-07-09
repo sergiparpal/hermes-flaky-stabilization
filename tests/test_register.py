@@ -15,12 +15,19 @@ from _doubles import FakePluginContext, load_plugin_module
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Phase-1 surface: nothing but the CLI command.
-EXPECTED_TOOLS: set[str] = set()
+# Phase-2 surface: history + detective tools, the unified CLI and the
+# `test-history` alias (kept public contract, plan D2).
+EXPECTED_TOOLS: set[str] = {"test_failure_lookup", "module_failure_history", "is_flaky"}
 EXPECTED_HOOKS: set[str] = set()
 EXPECTED_COMMANDS: set[str] = set()
-EXPECTED_CLI_COMMANDS = {"flaky-stab"}
+EXPECTED_CLI_COMMANDS = {"flaky-stab", "test-history"}
 EXPECTED_SKILLS: set[str] = set()
+
+EXPECTED_TOOLSETS = {
+    "test_failure_lookup": "test_history",
+    "module_failure_history": "test_history",
+    "is_flaky": "flaky_detective",
+}
 
 
 def _register(ctx=None):
@@ -38,6 +45,12 @@ def test_register_completes_and_matches_snapshot():
     assert set(ctx.commands) == EXPECTED_COMMANDS
     assert set(ctx.cli_commands) == EXPECTED_CLI_COMMANDS
     assert set(ctx.skills) == EXPECTED_SKILLS
+
+
+def test_tools_keep_their_original_toolsets():
+    ctx = _register()
+    for name, toolset in EXPECTED_TOOLSETS.items():
+        assert ctx.tools[name]["toolset"] == toolset, name
 
 
 def test_register_twice_on_fresh_contexts_is_idempotent():
@@ -98,23 +111,25 @@ mod = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = mod
 spec.loader.exec_module(mod)
 
-captured = {}
+cli, tools = {}, set()
 class Ctx:
     llm = None
-    def register_cli_command(self, **kw):
-        captured.update(kw)
-    def register_tool(self, **kw):
-        pass
+    def register_cli_command(self, *a, **kw):
+        name = kw.get("name", a[0] if a else None)
+        cli[name] = kw.get("setup_fn", a[2] if len(a) > 2 else None)
+    def register_tool(self, *a, **kw):
+        tools.add(kw.get("name", a[0] if a else None))
     def register_hook(self, *a, **kw):
         pass
-    def register_command(self, **kw):
+    def register_command(self, *a, **kw):
         pass
     def register_skill(self, *a, **kw):
         pass
 
 mod.register(Ctx())
-assert captured.get("name") == "flaky-stab", captured
-assert callable(captured.get("setup_fn")), captured
+assert {"flaky-stab", "test-history"} <= set(cli), cli
+assert callable(cli["flaky-stab"]), cli
+assert {"test_failure_lookup", "module_failure_history", "is_flaky"} <= tools, tools
 print("SHIM_OK")
 """
 

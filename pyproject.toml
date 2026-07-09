@@ -25,3 +25,11 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Ported legacy code and test suites are kept verbatim (plan §6.1 porting
+# rule); style findings inside them are not ours to fix.
+"hermes_flaky_stabilization/history/*" = ["E501"]
+"hermes_flaky_stabilization/detective/*" = ["E501"]
+"tests/history/*" = ["E501"]
+"tests/detective/*" = ["E501", "B018"]

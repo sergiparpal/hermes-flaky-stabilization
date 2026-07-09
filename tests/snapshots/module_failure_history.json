@@ -1,0 +1,30 @@
+{
+  "schema": {
+    "description": "Aggregate failures across all tests in a module or directory over a time window. Use when the user asks about stability of a code area, before doing a release readiness check, or when scoping a regression test subset.",
+    "name": "module_failure_history",
+    "parameters": {
+      "properties": {
+        "min_failures": {
+          "default": 1,
+          "description": "Only include tests that failed at least this many times in the window.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "path": {
+          "description": "File path prefix to match (e.g. 'src/auth/' or 'tests/integration/oauth/'). Matched as LIKE 'prefix%' on test_cases.file_path.",
+          "type": "string"
+        },
+        "since": {
+          "description": "ISO-8601 date/time. Only include test runs from this point forward. Defaults to 30 days ago.",
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    }
+  },
+  "toolset": "test_history"
+}

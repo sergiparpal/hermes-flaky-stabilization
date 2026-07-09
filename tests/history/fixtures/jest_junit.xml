@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites name="jest tests" tests="3" failures="1" errors="0" time="2.5">
+  <testsuite name="OAuth flow" tests="3" failures="1" errors="0" skipped="0" timestamp="2026-05-10T08:00:00" time="2.5">
+    <testcase classname="OAuth flow" name="refreshes the token" time="0.4"/>
+    <testcase classname="OAuth flow" name="rejects an expired token" time="0.6">
+      <failure message="Expected 401 but got 200">Error: Expected 401 but got 200
+    at Object.&lt;anonymous&gt; (oauth.test.js:22:5)</failure>
+    </testcase>
+    <testcase classname="OAuth flow" name="logs out cleanly" time="0.2"/>
+  </testsuite>
+</testsuites>
