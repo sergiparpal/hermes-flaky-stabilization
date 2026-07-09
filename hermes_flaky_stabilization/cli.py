@@ -88,6 +88,12 @@ def setup_cli(parser) -> None:
                         help="Only write the shim + config; print the command instead "
                              "of creating the job")
 
+    # -- incidents-owned (argument definitions from incidents.cli) --
+    from .incidents import cli as incidents_cli
+
+    p_jira = subs.add_parser("jira", help="Manage the local Jira incident index")
+    incidents_cli.register_cli(p_jira)
+
 
 def run_cli(args) -> int:
     command = getattr(args, SUBCOMMAND_DEST, None)
@@ -102,6 +108,11 @@ def run_cli(args) -> int:
         from .detective import cli as detective_cli
 
         return getattr(detective_cli, _DETECTIVE_COMMANDS[command])(args)
+    if command == "jira":
+        from .incidents import cli as incidents_cli
+
+        incidents_cli.hermes_jira_incidents_command(args)
+        return 0
     print(f"flaky-stab: unknown subcommand {command!r}")  # unreachable via argparse
     return 2
 

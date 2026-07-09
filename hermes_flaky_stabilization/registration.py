@@ -18,7 +18,7 @@ CLI_COMMAND = "flaky-stab"
 
 def register(ctx) -> None:
     """Wire the plugin surface onto *ctx* (a Hermes ``PluginContext``)."""
-    from . import bugreport, detective, healer, history, pii, triage
+    from . import bugreport, detective, healer, history, incidents, pii, triage
 
     # Stage registrations (tool contracts preserved verbatim). history.register
     # also registers the `test-history` CLI alias — a kept public contract (D2);
@@ -31,6 +31,12 @@ def register(ctx) -> None:
     healer.register(ctx)
     bugreport.register(ctx)
     pii.register(ctx)
+    incidents_service = incidents.register(ctx)
+
+    # Lifecycle hooks (incident context injection + session-start sync).
+    from .orchestrator import hooks as orchestrator_hooks
+
+    orchestrator_hooks.register(ctx, incidents_service=incidents_service)
 
     # The triage pattern store connects lazily inside tool calls; resolving the
     # data dir here guarantees its 0700 permissions exist before any handler

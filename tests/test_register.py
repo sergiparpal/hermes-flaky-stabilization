@@ -15,8 +15,8 @@ from _doubles import FakePluginContext, load_plugin_module
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Phase-4 surface: + the four healer tools, /heal, the flaky-healer skill and
-# the two approval audit observer hooks.
+# Phase-5 surface: + the three incident read tools (plain tools now — the
+# exclusive memory slot stays free, plan D1) and the two lifecycle hooks.
 EXPECTED_TOOLS: set[str] = {
     "test_failure_lookup",
     "module_failure_history",
@@ -28,8 +28,16 @@ EXPECTED_TOOLS: set[str] = {
     "list_healing_recipes",
     "improve_bug_report",
     "validate_no_pii",
+    "jira_search_incident",
+    "jira_get_root_cause",
+    "jira_link_session",
 }
-EXPECTED_HOOKS: set[str] = {"pre_approval_request", "post_approval_response"}
+EXPECTED_HOOKS: set[str] = {
+    "pre_approval_request",
+    "post_approval_response",
+    "pre_llm_call",
+    "on_session_start",
+}
 EXPECTED_COMMANDS: set[str] = {"improve-bug", "heal"}
 EXPECTED_CLI_COMMANDS = {"flaky-stab", "test-history"}
 EXPECTED_SKILLS: set[str] = {"flaky-healer"}
@@ -45,6 +53,9 @@ EXPECTED_TOOLSETS = {
     "list_healing_recipes": "flaky_healer",
     "improve_bug_report": "qa",
     "validate_no_pii": "qa_masking",
+    "jira_search_incident": "jira_incidents",
+    "jira_get_root_cause": "jira_incidents",
+    "jira_link_session": "jira_incidents",
 }
 
 

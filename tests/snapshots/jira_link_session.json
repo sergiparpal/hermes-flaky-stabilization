@@ -1,0 +1,23 @@
+{
+  "schema": {
+    "description": "Record a link between the current session and an incident for traceability.",
+    "name": "jira_link_session",
+    "parameters": {
+      "properties": {
+        "incident_key": {
+          "description": "e.g. INC-1234",
+          "type": "string"
+        },
+        "note": {
+          "description": "Optional context for the link.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "incident_key"
+      ],
+      "type": "object"
+    }
+  },
+  "toolset": "jira_incidents"
+}
