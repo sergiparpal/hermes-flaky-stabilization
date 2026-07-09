@@ -1,0 +1,33 @@
+name: hermes-flaky-stabilization
+version: 0.1.0
+description: "Unified flaky-test stabilization pipeline: failure history, flaky detection,
+  CI triage, sandboxed healing with PR flow, bug-report structuring, PII gating, and a local
+  Jira incident index — one plugin, one state store."
+author: "sergiparpal"
+kind: standalone
+manifest_version: 1
+# requires_env intentionally omitted: GITHUB_TOKEN and JIRA_API_TOKEN are optional and gate
+# individual tools via check_fn; a missing token must never disable the whole plugin.
+provides_tools:
+  - test_failure_lookup
+  - module_failure_history
+  - is_flaky
+  - triage_pipeline_failure
+  - fetch_ci_logs
+  - analyze_playwright_trace
+  - heal_flaky_test
+  - list_healing_recipes
+  - improve_bug_report
+  - validate_no_pii
+  - jira_search_incident
+  - jira_get_root_cause
+  - jira_link_session
+  - jira_create_incident
+  - find_duplicate_incidents
+  - stabilize_test_failure
+provides_hooks:
+  - pre_tool_call
+  - pre_llm_call
+  - on_session_start
+  - pre_approval_request
+  - post_approval_response

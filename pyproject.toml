@@ -1,0 +1,27 @@
+[project]
+name = "hermes-flaky-stabilization"
+version = "0.1.0"
+description = "Unified Hermes Agent plugin: failure history, flaky detection, CI triage, sandboxed healing with PR flow, bug-report structuring, PII gating, and a local Jira incident index."
+requires-python = ">=3.11,<3.14"
+license = { text = "GPL-3.0-only" }
+authors = [{ name = "sergiparpal" }]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "pytest-cov>=4", "ruff>=0.5"]
+# OCR extras for the PII scanner are runtime-probed, never imported at module
+# load: see requirements-ocr.txt.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib -m 'not docker and not live'"
+markers = [
+    "docker: requires a reachable Docker daemon (skipped when unavailable)",
+    "live: requires network and credentials (opt-in only, off by default)",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]

@@ -1,0 +1,129 @@
+"""state.db creation, migration ladder, permissions (plan Appendix A)."""
+
+from __future__ import annotations
+
+import sqlite3
+import stat
+from contextlib import closing
+
+import pytest
+
+from hermes_flaky_stabilization import paths
+from hermes_flaky_stabilization.storage import state
+
+EXPECTED_TABLES = {
+    "flaky_verdicts",
+    "scan_runs",
+    "triage_patterns",
+    "healer_runs",
+    "recipes",
+    "audit",
+    "incidents",
+    "links",
+    "meta",
+    "pipeline_runs",
+    "schema_version",
+}
+
+
+def _fts5_compiled() -> bool:
+    with closing(sqlite3.connect(":memory:")) as conn:
+        try:
+            conn.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
+            return True
+        except sqlite3.OperationalError:
+            return False
+
+
+def _table_names(conn) -> set[str]:
+    rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    return {r["name"] for r in rows}
+
+
+def test_fresh_db_reaches_schema_version(profile_env):
+    with closing(state.connect()) as conn:
+        assert state.current_version(conn) == state.SCHEMA_VERSION
+        assert EXPECTED_TABLES <= _table_names(conn)
+
+
+def test_reopen_is_idempotent(profile_env):
+    with closing(state.connect()) as conn:
+        conn.execute("INSERT INTO meta(key, value) VALUES ('probe', 'x')")
+        conn.commit()
+    with closing(state.connect()) as conn:
+        assert state.current_version(conn) == state.SCHEMA_VERSION
+        row = conn.execute("SELECT value FROM meta WHERE key='probe'").fetchone()
+        assert row["value"] == "x"
+        # exactly one ladder row per version — the step did not re-run
+        count = conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
+        assert count == state.SCHEMA_VERSION
+
+
+def test_fts_tables_when_available(profile_env):
+    with closing(state.connect()) as conn:
+        if _fts5_compiled():
+            assert state.fts_available(conn)
+            assert {"triage_patterns_fts", "incidents_fts"} <= _table_names(conn)
+        else:
+            assert not state.fts_available(conn)
+
+
+def test_wal_mode(profile_env):
+    with closing(state.connect()) as conn:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        assert mode == "wal"
+
+
+def test_permissions(profile_env):
+    db_path = state.state_db_path()
+    with closing(state.connect()):
+        pass
+    dir_mode = stat.S_IMODE(db_path.parent.stat().st_mode)
+    file_mode = stat.S_IMODE(db_path.stat().st_mode)
+    assert dir_mode == 0o700, f"data dir mode {oct(dir_mode)}"
+    assert file_mode == 0o600, f"db file mode {oct(file_mode)}"
+
+
+def test_db_lives_under_hermes_home(profile_env):
+    assert state.state_db_path().parent == profile_env / "flaky-stabilization"
+    assert paths.get_data_dir() == profile_env / "flaky-stabilization"
+
+
+def test_appendix_a_legacy_column_sets(profile_env):
+    """Migration is a plain INSERT..SELECT only if legacy column sets survive
+    verbatim — pin the ones the Phase-7 importer relies on."""
+    with closing(state.connect()) as conn:
+        def cols(table):
+            return [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+
+        assert cols("recipes") == [
+            "signature", "created_ts", "diagnosis_json", "strategy", "patch_ops_json",
+            "hits", "successes", "failures", "last_used_ts", "relaxed_key",
+        ]
+        assert cols("triage_patterns") == [
+            "project", "signature", "category", "occurrences", "first_seen", "last_seen", "sample",
+        ]
+        assert cols("incidents") == [
+            "key", "summary", "status", "root_cause", "reporter", "assignee",
+            "created", "updated", "body", "raw_json", "indexed_at",
+        ]
+        assert cols("flaky_verdicts") == [
+            "test_key", "classname", "name", "file_path", "passes", "fails", "runs",
+            "window_days", "first_seen", "last_seen", "last_failure", "status", "computed_at",
+        ]
+
+
+def test_future_version_short_circuits(profile_env):
+    """A DB stamped at a future version is left alone (no downgrade attempts)."""
+    with closing(state.connect()) as conn:
+        conn.execute("INSERT OR IGNORE INTO schema_version(version) VALUES (99)")
+        conn.commit()
+    with closing(state.connect()) as conn:
+        assert state.current_version(conn) == 99
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+def test_connect_with_explicit_path(profile_env, tmp_path, explicit):
+    target = tmp_path / "elsewhere" / "state.db" if explicit else None
+    with closing(state.connect(target)) as conn:
+        assert state.current_version(conn) == state.SCHEMA_VERSION
