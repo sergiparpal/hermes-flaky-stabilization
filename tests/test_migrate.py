@@ -420,6 +420,16 @@ def test_install_cron_with_jira_sync(profile_env, monkeypatch, capsys):
     assert "flaky-stab-scan.sh" in out and "flaky-stab-jira-sync.sh" in out
     names = [cmd[cmd.index("--name") + 1] for cmd in created]
     assert names == ["flaky-stabilization", "flaky-stabilization-jira-sync"]
+
+    # The scripts dir holds executables the gateway runs on a schedule: owner-only.
+    # (In this flow the detection job's installer runs first and already sets 0700,
+    # so this asserts the end state, not the jira installer's own chmod — that is
+    # pinned directly on the shared helper in tests/test_cronjobs.py.)
+    import os as _os
+    import stat as _stat
+    scripts_dir = profile_env / "scripts"
+    assert _stat.S_IMODE(_os.stat(scripts_dir).st_mode) == 0o700
+
     shim = profile_env / "scripts" / "flaky-stab-jira-sync.sh"
     assert shim.exists()
     content = shim.read_text(encoding="utf-8")
@@ -427,3 +437,35 @@ def test_install_cron_with_jira_sync(profile_env, monkeypatch, capsys):
     # exec propagates the sync's exit code so failures still alert.
     assert "exec hermes flaky-stab jira sync --quiet" in content
     assert "set -euo pipefail" in content
+
+
+def test_install_cron_with_jira_sync_missing_shim_is_a_clean_error(
+    profile_env, monkeypatch, capsys
+):
+    """A site-packages install has no checkout scripts/ dir.
+
+    The jira-sync installer used to `shutil.copyfile` with neither an existence
+    check nor an OSError guard, so it raised an uncaught FileNotFoundError out of
+    run_cli. It must now report a one-line error and exit non-zero, exactly like
+    the detection job's installer already did.
+    """
+    import argparse
+    from types import SimpleNamespace
+
+    from hermes_flaky_stabilization import cli
+
+    def fake_run(cmd, capture_output=False, text=False):
+        return SimpleNamespace(returncode=0, stdout="created", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(cli, "JIRA_SYNC_SHIM", "no-such-jira-shim.sh")
+
+    parser = argparse.ArgumentParser(prog="flaky-stab")
+    cli.setup_cli(parser)
+    rc = cli.run_cli(parser.parse_args(
+        ["install-cron", "--deliver", "local", "--with-jira-sync"]))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "error:" in captured.err and "no-such-jira-shim.sh" in captured.err
+    assert "Traceback" not in captured.err

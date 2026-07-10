@@ -21,8 +21,9 @@ PACKAGE = Path(__file__).resolve().parent.parent / "hermes_flaky_stabilization"
 
 # module path (relative to the package) -> why it may spawn processes
 SUBPROCESS_ALLOWLIST = {
-    "detective/cli.py": "install-cron's sanctioned `hermes cron create` call",
-    "cli.py": "mounts install-cron (same sanctioned subprocess)",
+    "cronjobs.py": "install-cron's sanctioned `hermes cron create` call — the ONLY "
+                   "process spawn on the CLI path; detective/cli.py and cli.py both "
+                   "delegate here rather than each running their own",
     "healer/flaky_healer/sandbox/subproc.py": "subprocess sandbox backend",
     "healer/flaky_healer/sandbox/docker.py": "docker CLI invocation",
     "healer/flaky_healer/sandbox/base.py": "sandbox probes (docker availability)",
@@ -66,3 +67,18 @@ def test_allowlist_entries_exist():
     """
     for rel in SUBPROCESS_ALLOWLIST:
         assert (PACKAGE / rel).exists(), f"allowlisted module missing: {rel}"
+
+
+def test_allowlist_has_no_dead_entries():
+    """An entry that no longer spawns processes must be removed, not left behind.
+
+    Existence alone is a weak check: a module can keep its permission to spawn
+    long after the call moved elsewhere, silently widening the sanctioned
+    surface. Pin the allowlist to modules that *actually* import subprocess.
+    """
+    for rel in SUBPROCESS_ALLOWLIST:
+        src = (PACKAGE / rel).read_text(encoding="utf-8")
+        assert any(token in src for token in _SUBPROCESS), (
+            f"{rel} is allowlisted for subprocess but no longer imports it — "
+            "remove the entry so the allowlist keeps meaning what it says"
+        )

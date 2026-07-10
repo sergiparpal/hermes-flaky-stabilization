@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import closing
-from pathlib import Path
+
+from . import cronjobs
 
 SUBCOMMAND_DEST = "flaky_stab_cmd"
 
@@ -144,15 +145,23 @@ JIRA_SYNC_SHIM = "flaky-stab-jira-sync.sh"
 JIRA_SYNC_JOB = "flaky-stabilization-jira-sync"
 
 
+def _jira_sync_job() -> cronjobs.CronJob:
+    """This job's identity, read from the globals at CALL time (mirrors
+    ``detective.cli._scan_job``, which tests monkeypatch)."""
+    return cronjobs.CronJob(JIRA_SYNC_SHIM, JIRA_SYNC_JOB, "jira-sync job")
+
+
 def _install_jira_sync_job(args) -> int:
-    """Optionally install the second no-agent job (plan D10 --with-jira-sync)."""
-    import shlex
-    import shutil
-    import subprocess
+    """Optionally install the second no-agent job (plan D10 --with-jira-sync).
+
+    Shares ``cronjobs`` with the detection job's installer. This function used to
+    re-inline that recipe and had drifted: it never chmod'd ``scripts/`` to 0700,
+    and it copied the shim with neither an existence check nor an ``OSError``
+    guard — so a site-packages install raised an uncaught FileNotFoundError.
+    """
     import sys
 
     from . import config as unified_config
-    from . import paths
     from .detective import domain
 
     cfg = unified_config.load_config()["detective"]
@@ -168,44 +177,24 @@ def _install_jira_sync_job(args) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    scripts_dir = paths.get_hermes_home() / "scripts"
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-    shim_src = Path(__file__).resolve().parents[1] / "scripts" / JIRA_SYNC_SHIM
-    shim_dst = scripts_dir / JIRA_SYNC_SHIM
-    shutil.copyfile(shim_src, shim_dst)
+    job = _jira_sync_job()
+    problem = cronjobs.missing_shim_error(job.shim_name)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return 1
     try:
-        import os
-
-        os.chmod(shim_dst, 0o700)
-    except OSError:
-        pass
+        shim_dst = cronjobs.install_shim(job.shim_name)
+    except OSError as exc:
+        print(f"error: could not install the cron shim into <hermes_home>/scripts/: {exc}",
+              file=sys.stderr)
+        return 1
     print(f"installed shim: {shim_dst} (mode 0700)")
 
-    printable = (f"hermes cron create {shlex.quote(schedule)} --no-agent "
-                 f"--script {JIRA_SYNC_SHIM} --deliver {shlex.quote(deliver)} "
-                 f"--name {JIRA_SYNC_JOB}")
     if getattr(args, "no_create", False):
-        print("skipping jira-sync job creation (--no-create). To create it later, run:")
-        print(f"  {printable}")
+        print(f"skipping {job.description} creation (--no-create). To create it later, run:")
+        cronjobs.print_manual_command(cronjobs.printable_command(job, schedule, deliver))
         return 0
-    cron_cmd = ["hermes", "cron", "create", schedule, "--no-agent",
-                "--script", JIRA_SYNC_SHIM, "--deliver", deliver,
-                "--name", JIRA_SYNC_JOB]
-    try:
-        result = subprocess.run(cron_cmd, capture_output=True, text=True)
-    except (FileNotFoundError, OSError) as exc:
-        print(f"could not run the hermes CLI ({exc}). To create the job, run:")
-        print(f"  {printable}")
-        return 0
-    if result.returncode == 0:
-        print(f"created cron job '{JIRA_SYNC_JOB}' (verify with `hermes cron list`).")
-        return 0
-    detail = (result.stderr or result.stdout or "").strip()
-    if detail:
-        print(detail)
-    print("could not create the jira-sync job automatically. To create it, run:")
-    print(f"  {printable}")
-    return 0
+    return cronjobs.create_job(job, schedule, deliver)
 
 
 _STATUS_TABLES = (

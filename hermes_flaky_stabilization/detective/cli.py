@@ -12,11 +12,11 @@ paths + last scan), ``list`` (the stored verdicts), and ``install-cron`` (Phase 
 import argparse
 import json
 import logging
-import os
-import shlex
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+
+from .. import cronjobs
 
 logger = logging.getLogger(__name__)
 
@@ -261,51 +261,25 @@ SHIM_NAME = "flaky-stab-scan.sh"
 CRON_JOB_NAME = "flaky-stabilization"
 
 
+def _scan_job() -> cronjobs.CronJob:
+    """This module's job identity, read from the globals at CALL time (tests
+    monkeypatch ``SHIM_NAME`` to simulate a missing shim source)."""
+    return cronjobs.CronJob(SHIM_NAME, CRON_JOB_NAME, "cron job")
+
+
+# Thin bindings over the shared installer: the mechanics (0700 dir + script, the
+# `hermes cron create` subprocess and its print-the-command fallback) live in
+# ``cronjobs``, which the unified CLI's jira-sync installer shares.
 def _printable_cron_command(schedule: str, deliver: str) -> str:
-    # shlex.quote the user-supplied parts so the printed copy-paste command stays a
-    # single valid shell command even if a schedule or delivery channel contains
-    # spaces or other shell metacharacters. (The real job creation uses argv, so it
-    # was never injectable; this only hardens the human-facing fallback string.)
-    return (f'hermes cron create {shlex.quote(schedule)} --no-agent --script {SHIM_NAME} '
-            f'--deliver {shlex.quote(deliver)} --name {CRON_JOB_NAME}')
-
-
-def _gateway_note() -> str:
-    return ("Note: the gateway daemon must be running for the job to fire "
-            "(`hermes gateway install`, then `hermes gateway`).")
-
-
-def _print_manual_command(printable: str) -> None:
-    """Print the manual ``hermes cron create`` command plus the gateway note."""
-    print(f"  {printable}")
-    print(_gateway_note())
+    return cronjobs.printable_command(_scan_job(), schedule, deliver)
 
 
 def _shim_source() -> Path:
-    """Path to the shim script shipped in the plugin checkout's ``scripts/`` dir."""
-    return Path(__file__).resolve().parents[2] / "scripts" / SHIM_NAME
+    return cronjobs.shim_source(SHIM_NAME)
 
 
 def _install_shim() -> Path:
-    """Copy the shim into ``<hermes_home>/scripts/`` with mode 0700; return its path."""
-    import shutil
-
-    from . import storage
-
-    scripts_dir = storage.get_hermes_home() / "scripts"   # scripts must live here (§1.3)
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(scripts_dir, 0o700)
-    except OSError:
-        pass
-    shim_src = _shim_source()
-    shim_dst = scripts_dir / SHIM_NAME
-    shutil.copyfile(shim_src, shim_dst)
-    try:
-        os.chmod(shim_dst, 0o700)
-    except OSError:
-        pass
-    return shim_dst
+    return cronjobs.install_shim(SHIM_NAME)
 
 
 def _cmd_install_cron(args) -> int:
@@ -339,13 +313,13 @@ def _cmd_install_cron(args) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    job = _scan_job()
+
     # (0) verify the shim source BEFORE persisting anything: a missing source
     # must not leave config.json already mutated for a job that never installs.
-    shim_src = _shim_source()
-    if not shim_src.exists():
-        print(f"error: cron shim source not found at {shim_src}; reinstall the "
-              f"plugin from a checkout that ships scripts/{SHIM_NAME}, or copy that "
-              "script into <hermes_home>/scripts/ yourself.", file=sys.stderr)
+    problem = cronjobs.missing_shim_error(job.shim_name)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
         return 1
 
     # (1) persist resolved options so the scheduled `scan` uses them.
@@ -356,45 +330,18 @@ def _cmd_install_cron(args) -> int:
 
     # (2) install the shim.
     try:
-        shim_dst = _install_shim()
+        shim_dst = cronjobs.install_shim(job.shim_name)
     except OSError as exc:
         print(f"error: could not install the cron shim into <hermes_home>/scripts/: {exc}",
               file=sys.stderr)
         return 1
     print(f"installed shim: {shim_dst} (mode 0700)")
 
-    printable = _printable_cron_command(schedule, deliver)
-
     # honor --no-create: shim + config written; just print the command.
     if args.no_create:
-        print("skipping job creation (--no-create). To create it later, run:")
-        _print_manual_command(printable)
+        print(f"skipping {job.description} creation (--no-create). To create it later, run:")
+        cronjobs.print_manual_command(cronjobs.printable_command(job, schedule, deliver))
         return 0
 
-    # (3) the one sanctioned subprocess: create the job once. A cron-run session
-    # cannot create cron jobs, so this is only ever reached from the standalone CLI.
-    import subprocess
-
-    cron_cmd = ["hermes", "cron", "create", schedule, "--no-agent",
-                "--script", SHIM_NAME, "--deliver", deliver, "--name", CRON_JOB_NAME]
-    try:
-        result = subprocess.run(cron_cmd, capture_output=True, text=True)
-    except (FileNotFoundError, OSError) as exc:
-        print(f"could not run the hermes CLI ({exc}). To create the job, run:")
-        _print_manual_command(printable)
-        return 0
-
-    if result.returncode == 0:
-        out = (result.stdout or "").strip()
-        if out:
-            print(out)
-        print(f"created cron job '{CRON_JOB_NAME}' (verify with `hermes cron list`).")
-        return 0
-
-    # Non-zero (e.g. gateway not configured): fall back to printing the command.
-    detail = (result.stderr or result.stdout or "").strip()
-    if detail:
-        print(detail)
-    print("could not create the cron job automatically. To create it, run:")
-    _print_manual_command(printable)
-    return 0
+    # (3) the one sanctioned subprocess.
+    return cronjobs.create_job(job, schedule, deliver)
