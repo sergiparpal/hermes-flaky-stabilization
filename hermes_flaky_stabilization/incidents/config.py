@@ -228,18 +228,19 @@ class IncidentsConfig:
 # -- config / path resolution ------------------------------------------------
 
 def resolve_hermes_home() -> str:
-    """Resolve the active Hermes home directory.
+    """Resolve the active Hermes home directory (delegates to the unified resolver).
 
-    Prefers Hermes' own ``get_hermes_home()`` when importable; otherwise falls
-    back to ``$HERMES_HOME`` and finally ``~/.hermes``. Used only outside the
-    normal ``initialize(hermes_home=...)`` path (the CLI and ``is_available``).
+    Used only outside the normal ``initialize(hermes_home=...)`` path (the CLI
+    and ``is_available``). ``paths`` imports Hermes lazily *inside* the call, so
+    importing it here does not break this module's "safe to load from the
+    lightweight CLI path" constraint.
+
+    The local lookup chain this replaced skipped ``$HERMES_HOME`` expansion, so
+    ``HERMES_HOME=~/hermes-data`` indexed incidents under a literal ``./~``.
     """
-    try:
-        from hermes_constants import get_hermes_home
-        return str(get_hermes_home())
-    except Exception:
-        return os.environ.get("HERMES_HOME") or os.path.join(
-            os.path.expanduser("~"), ".hermes")
+    from .. import paths
+
+    return str(paths.get_hermes_home())
 
 
 def load_config(hermes_home: str) -> dict[str, Any]:

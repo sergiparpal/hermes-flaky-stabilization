@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-from pathlib import Path
 from typing import Any
 
 from . import handlers
@@ -122,21 +120,13 @@ def _check_version() -> None:
 def _resolve_home() -> str:
     """Resolve the Hermes home directory — the one place that may touch Hermes.
 
-    Prefers the host's profile-aware ``hermes_constants.get_hermes_home()`` and
-    falls back to ``$HERMES_HOME`` / ``~/.hermes``. Resolved once at
-    registration (when the active profile is known) and injected into the
-    handler, so every pipeline module stays free of Hermes imports.
+    Delegates to the unified :func:`paths.get_hermes_home` resolver. Resolved
+    once at registration (when the active profile is known) and injected into
+    the handler, so every pipeline module stays free of Hermes imports.
     """
-    try:
-        from hermes_constants import get_hermes_home  # type: ignore
-        return str(get_hermes_home())
-    except Exception:
-        logger.debug(
-            "hermes_constants unavailable; resolving HERMES_HOME from env",
-            exc_info=True,
-        )
-        val = (os.environ.get("HERMES_HOME") or "").strip()
-        return str(Path(val).resolve() if val else (Path.home() / ".hermes").resolve())
+    from .. import paths
+
+    return str(paths.get_hermes_home())
 
 
 def register(ctx: Any) -> None:

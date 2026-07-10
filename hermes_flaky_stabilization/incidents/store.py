@@ -40,6 +40,8 @@ import threading
 import time
 from typing import Any
 
+from .. import paths
+
 logger = logging.getLogger(__name__)
 
 # Columns persisted on the incidents table (besides the JSON blob/timestamps).
@@ -75,7 +77,6 @@ class IncidentStore:
         # The index holds the FULL, unredacted incident record (emails, names,
         # IPs, and any secret pasted into a ticket). It is sensitive data at
         # rest, so it must never be group/world-readable on a shared host.
-        self._is_file_db = bool(self.db_path) and self.db_path != ":memory:"
         parent = os.path.dirname(self.db_path)
         if parent:
             # mode applies only when the directory is newly created; we do not
@@ -83,7 +84,7 @@ class IncidentStore:
             os.makedirs(parent, mode=0o700, exist_ok=True)
         # Create the DB file owner-only *before* SQLite opens it, so incident
         # PII is never briefly exposed at the default umask.
-        self._precreate_private()
+        paths.precreate_private(self.db_path)
         # check_same_thread=False because ingest/prefetch run on daemon
         # threads; all access is guarded by self._lock.
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -101,7 +102,7 @@ class IncidentStore:
         # Enforce 0600 on the db and any sidecar files SQLite may have created.
         # Runs after _init_schema so the WAL/-shm files (created by the first
         # write transaction in WAL mode) are locked down too.
-        self._harden_permissions()
+        paths.harden_db_files(self.db_path)
 
     # -- connection tuning ---------------------------------------------------
 
@@ -120,28 +121,9 @@ class IncidentStore:
         except sqlite3.Error as e:
             logger.debug("store: could not apply performance pragmas: %s", e)
 
-    # -- at-rest hardening ---------------------------------------------------
-
-    def _precreate_private(self) -> None:
-        if not self._is_file_db or os.path.exists(self.db_path):
-            return
-        try:
-            fd = os.open(self.db_path, os.O_CREAT | os.O_WRONLY, 0o600)
-            os.close(fd)
-        except OSError:
-            # Best-effort; _harden_permissions() chmods after connect too.
-            pass
-
-    def _harden_permissions(self) -> None:
-        if not self._is_file_db:
-            return
-        for suffix in ("", "-wal", "-shm", "-journal"):
-            path = self.db_path + suffix
-            try:
-                if os.path.exists(path):
-                    os.chmod(path, 0o600)
-            except OSError:
-                pass
+    # At-rest hardening lives in ``paths`` (precreate_private / harden_db_files)
+    # so the ``0600``-before-connect and WAL/-shm/-journal sidecar rules have one
+    # owner; this store used to carry its own copies of both.
 
     # -- schema --------------------------------------------------------------
 

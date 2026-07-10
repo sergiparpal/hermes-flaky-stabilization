@@ -65,11 +65,17 @@ def _resolve_hermes_home(hermes_home: str | None) -> Path:
     once in ``__init__.register`` and injected as ``hermes_home``; this keeps the
     orchestrator Hermes-free. The env fallback only serves the direct-call path
     (tests, or a caller that does not inject a home).
+
+    It borrows ``paths.env_home``/``default_home`` rather than the full
+    :func:`paths.get_hermes_home` chain: those two are pure stdlib, so the
+    ``$HERMES_HOME`` expansion stays shared with every other stage while this
+    module keeps its no-Hermes-imports property.
     """
     if hermes_home:
         return Path(hermes_home)
-    val = (os.environ.get("HERMES_HOME") or "").strip()
-    return Path(val).resolve() if val else (Path.home() / ".hermes").resolve()
+    from .. import paths
+
+    return (paths.env_home() or paths.default_home()).resolve()
 
 
 def _db_path(hermes_home: str | None) -> Path:

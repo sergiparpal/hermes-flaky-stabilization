@@ -18,16 +18,43 @@ from pathlib import Path
 DATA_DIR_NAME = "flaky-stabilization"
 
 
+def env_home() -> Path | None:
+    """``$HERMES_HOME``, expanded, or ``None`` when unset/empty.
+
+    ``expandvars`` + ``expanduser`` are applied because sources like a systemd
+    ``EnvironmentFile`` or a crontab set ``HERMES_HOME=~/hermes-data`` with no
+    shell expansion, and a literal ``~/...`` would otherwise become a *relative*
+    path that ``get_data_dir`` mkdirs as ``./~`` under the CWD.
+
+    Pure stdlib and Hermes-free, so modules that must not import Hermes even
+    lazily (``triage.handlers``) can share this expansion instead of re-deriving
+    it — the drift that let three resolvers disagree on the same env value.
+    """
+    raw = (os.environ.get("HERMES_HOME") or "").strip()
+    if not raw:
+        return None
+    return Path(os.path.expanduser(os.path.expandvars(raw)))
+
+
+def default_home() -> Path:
+    """The last-resort home when Hermes is absent and ``$HERMES_HOME`` is unset."""
+    return Path.home() / ".hermes"
+
+
 def get_hermes_home() -> Path:
-    """Return the profile-aware Hermes home.
+    """Return the profile-aware Hermes home — the ONE resolver.
 
     Prefer the official helpers when Hermes is importable; otherwise fall back
     to the ``HERMES_HOME`` env var, then ``~/.hermes``. Never hardcoded.
 
-    The env value gets ``expandvars`` + ``expanduser`` applied: sources like a
-    systemd ``EnvironmentFile`` or crontab set ``HERMES_HOME=~/hermes-data``
-    with no shell expansion, and a literal ``~/...`` would otherwise become a
-    *relative* path that ``get_data_dir`` mkdirs as ``./~`` under the CWD.
+    Every stage delegates here (``history.storage``, ``detective.storage``,
+    ``incidents.config``, ``triage``). Do not re-implement this chain: the
+    copies that used to exist each tried a different subset of the lookups and
+    skipped :func:`env_home`'s expansion, so the same ``HERMES_HOME`` resolved
+    to different directories depending on which module asked.
+
+    The Hermes imports are lazy (call time, not import time) so this module
+    stays safe to import from the lightweight CLI path.
     """
     try:
         from hermes_constants import get_hermes_home as _core_home  # type: ignore
@@ -41,10 +68,7 @@ def get_hermes_home() -> Path:
         return Path(display_hermes_home())
     except Exception:
         pass
-    env_home = os.environ.get("HERMES_HOME")
-    if env_home:
-        return Path(os.path.expanduser(os.path.expandvars(env_home)))
-    return Path.home() / ".hermes"
+    return env_home() or default_home()
 
 
 def get_data_dir() -> Path:

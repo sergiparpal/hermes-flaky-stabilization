@@ -34,18 +34,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 
 def get_hermes_home() -> Path:
-    """Return the profile-aware Hermes home.
+    """Return the profile-aware Hermes home (delegates to the unified resolver).
 
-    Prefer the official helper if Hermes is importable; otherwise fall back to
-    the ``HERMES_HOME`` env var, then ``~/.hermes``. Never hardcoded.
+    This used to carry its own lookup chain, which omitted ``hermes_constants``
+    and — the bug — the ``expanduser``/``expandvars`` of ``$HERMES_HOME``, so
+    ``HERMES_HOME=~/hermes-data`` put ``history.db`` under a literal ``./~``
+    directory while ``state.db`` (via ``paths``) went to the real home.
     """
-    try:
-        from hermes_cli.utils import display_hermes_home  # type: ignore
+    from .. import paths
 
-        return Path(display_hermes_home())
-    except Exception:
-        # Hermes not importable (e.g. standalone dev/test) or helper moved.
-        return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+    return paths.get_hermes_home()
 
 
 def get_storage_dir() -> Path:
@@ -168,17 +166,13 @@ def get_connection() -> sqlite3.Connection:
     """
     global _connection
     if _connection is None:
+        from .. import paths
         from .schema import apply_schema  # lazy import (hard-constraint #2)
 
         db_path = get_db_path()
         # Own the file 0600 *before* SQLite opens it, closing the create-at-umask
         # → chmod window during which captured test output would be exposed.
-        if str(db_path) != ":memory:" and not os.path.exists(db_path):
-            try:
-                fd = os.open(str(db_path), os.O_CREAT | os.O_WRONLY, 0o600)
-                os.close(fd)
-            except OSError:
-                pass
+        paths.precreate_private(db_path)
         conn = sqlite3.connect(str(db_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
@@ -188,14 +182,8 @@ def get_connection() -> sqlite3.Connection:
         apply_schema(conn)
         # Owner-only: the DB can hold sensitive captured test output. Harden the
         # DB *and* its WAL/-shm/-journal sidecars — created by the first write in
-        # WAL mode, so this runs after apply_schema. Best-effort on non-POSIX.
-        for _suffix in ("", "-wal", "-shm", "-journal"):
-            _p = str(db_path) + _suffix
-            try:
-                if os.path.exists(_p):
-                    os.chmod(_p, 0o600)
-            except OSError:
-                pass
+        # WAL mode, so this runs after apply_schema.
+        paths.harden_db_files(db_path)
         _connection = conn
     return _connection
 

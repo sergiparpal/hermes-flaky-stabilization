@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import stat
 from contextlib import closing
+from pathlib import Path
 
 import pytest
 
@@ -102,6 +103,56 @@ def test_hermes_home_env_value_is_expanded(monkeypatch, tmp_path):
     monkeypatch.setenv("DATA_ROOT", str(tmp_path / "root"))
     monkeypatch.setenv("HERMES_HOME", "$DATA_ROOT/hermes")
     assert paths.get_hermes_home() == tmp_path / "root" / "hermes"
+
+
+def _every_stage_resolver() -> dict[str, str]:
+    """Every module-level "where is Hermes home?" answer, keyed by owner."""
+    from hermes_flaky_stabilization import triage as triage_pkg
+    from hermes_flaky_stabilization.detective import storage as detective_storage
+    from hermes_flaky_stabilization.history import storage as history_storage
+    from hermes_flaky_stabilization.incidents import config as incidents_config
+    from hermes_flaky_stabilization.triage import handlers as triage_handlers
+
+    return {
+        "paths": str(paths.get_hermes_home()),
+        "history.storage": str(history_storage.get_hermes_home()),
+        "detective.storage": str(detective_storage.get_hermes_home()),
+        "incidents.config": str(incidents_config.resolve_hermes_home()),
+        "triage": str(triage_pkg._resolve_home()),
+        "triage.handlers": str(triage_handlers._resolve_hermes_home(None)),
+    }
+
+
+@pytest.mark.parametrize(
+    ("env_value", "expected_parts"),
+    [
+        ("~/hermes-data", ("userhome", "hermes-data")),
+        ("$DATA_ROOT/hermes", ("root", "hermes")),
+    ],
+)
+def test_all_stage_resolvers_agree_on_hermes_home(
+    monkeypatch, tmp_path, env_value, expected_parts
+):
+    """Every stage must resolve the SAME home from the same env value.
+
+    Five modules used to answer this question with five different lookup
+    chains; the three that skipped ``expanduser``/``expandvars`` put history.db
+    and the incident index under a literal ``./~`` directory while state.db went
+    to the real home — the plugin silently split its data across two roots.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path / "root"))
+    monkeypatch.setenv("HERMES_HOME", env_value)
+
+    expected = tmp_path.joinpath(*expected_parts).resolve()
+    resolved = _every_stage_resolver()
+
+    for owner, value in resolved.items():
+        assert Path(value).is_absolute(), f"{owner} returned a relative path: {value!r}"
+        assert Path(value).resolve() == expected, (
+            f"{owner} resolved to {value!r}, expected {str(expected)!r}"
+        )
+    assert len({Path(v).resolve() for v in resolved.values()}) == 1
 
 
 def test_appendix_a_legacy_column_sets(profile_env):
