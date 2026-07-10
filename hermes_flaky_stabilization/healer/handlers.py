@@ -107,18 +107,16 @@ def _scrub_ci_secrets(text: str) -> str:
     …"``) exactly at/around the failures it keeps. The triage pipeline redacts
     log excerpts at its chokepoint; the healer's ``fetch_ci_logs`` /
     ``heal_flaky_test`` diagnosis paths must do the same rather than hand raw
-    secrets to the LLM. Prefer the shared triage-grade CI-log redactor; fall
-    back to the local token-shape scrub if it cannot be imported."""
+    secrets to the LLM. Use the shared secret scrubber (the same shapes triage
+    uses — no cross-stage import); fall back to the healer's own token-shape
+    mask if the kernel cannot be imported."""
     if not text:
         return text
     try:
-        from ..triage.redact import redact as _redact_secrets
+        from hermes_flaky_stabilization.common import secretscrub
     except Exception:  # pragma: no cover - flat/path-loaded import fallback
-        try:
-            from triage.redact import redact as _redact_secrets
-        except Exception:
-            return redact_mod.mask_tokens(text)
-    return _redact_secrets(text)
+        return redact_mod.mask_tokens(text)
+    return secretscrub.scrub_text(text)
 
 
 _STORE_CACHE: dict[str, HealerStore] = {}
@@ -406,6 +404,17 @@ def _pr_flow(ctx, report: healer.HealReport, repo_dir: str) -> dict:
 
 @_json_safe
 def heal_flaky_test(params, ctx=None, sandbox=None, store=None, transport=None, **kwargs) -> str:
+    # Bind config resolution to ctx's profile home for the whole run, so the
+    # healer config section and the data dir resolve on ONE profile (fixing the
+    # home divergence) and the section is read once (bind_run installs a per-run
+    # memo). Every config.*() below runs inside this scope.
+    with config.bind_run(ctx):
+        return _run_heal(
+            params, ctx=ctx, sandbox=sandbox, store=store, transport=transport, **kwargs
+        )
+
+
+def _run_heal(params, ctx=None, sandbox=None, store=None, transport=None, **kwargs) -> str:
     p = _params(params)
     repo_dir = str(p.get("repo_dir") or "").strip()
     test_id = str(p.get("test_id") or "").strip()

@@ -1,23 +1,30 @@
 """Credential masking for anything the healer writes to the audit log.
 
-A leaf module: it imports nothing but the standard library, so both
-``healer.handlers`` and ``flaky_healer.recipes.store`` can depend on it. That
-is the point — ``handlers`` imports ``recipes.store``, so the two cannot import
-each other, and the token pattern used to be *copy-pasted* between them with a
-comment noting the cycle. A credential format added to one copy and not the
-other would have leaked through the other path.
-
 Two complementary rules, applied together by :func:`redact`:
 
 * by key name  — a key that looks like a credential masks its whole value;
 * by value shape — a token-shaped substring is masked wherever it appears,
   including under an innocent key or embedded in free-form text (e.g. a token
   pasted into a dispatched ``command``), which the key-name check alone misses.
+
+The credential *shapes* (``TOKEN_VALUE_RE``) and the sensitive-key matcher live
+once in :mod:`hermes_flaky_stabilization.common.secretscrub`, shared with the
+triage log scrubber and the incidents PII redactor — the three used to keep
+divergent copies, so a format fixed in one leaked through the others. This
+module keeps only the healer conventions: the ``***`` mask, the recursive walk,
+and the audit ``repr`` fallback. Still a leaf for the intra-healer graph
+(``handlers`` imports ``recipes.store``, so the two must not import each other,
+and ``secretscrub`` imports nothing from the plugin — no cycle).
 """
 
 from __future__ import annotations
 
-import re
+# Absolute import (not relative): the healer core is loaded both as the unified
+# ``hermes_flaky_stabilization.healer.flaky_healer`` package and, via the stage
+# shim, as a flat ``flaky_healer`` — an absolute import resolves in both, the
+# same pattern ``config.py`` uses for the unified config. ``secretscrub`` is
+# stdlib-only and imports nothing from the plugin, so there is no cycle.
+from hermes_flaky_stabilization.common import secretscrub
 
 MASK = "***"
 
@@ -25,24 +32,14 @@ MASK = "***"
 # huge non-serializable payload cannot bloat the audit table.
 AUDIT_REPR_LIMIT = 2000
 
-SENSITIVE_KEY_RE = re.compile(
-    r"(token|secret|password|passwd|authorization|api[_-]?key|access[_-]?key|bearer)", re.I
-)
-
-TOKEN_VALUE_RE = re.compile(
-    r"(?:gh[poursa]_[A-Za-z0-9]{20,}"
-    r"|github_pat_[A-Za-z0-9_]{20,}"
-    r"|xox[baprs]-[A-Za-z0-9-]{10,}"
-    r"|AKIA[0-9A-Z]{16}"
-    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
-    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}"
-    r"|[Bb]earer\s+[A-Za-z0-9._\-]{12,})"
-)
+# Shared with the triage scrubber and the PII redactor (one owner of the shapes).
+SENSITIVE_KEY_RE = secretscrub.SENSITIVE_KEY_RE
+TOKEN_VALUE_RE = secretscrub.TOKEN_VALUE_RE
 
 
 def mask_tokens(text: str) -> str:
     """Mask every token-shaped substring in *text*."""
-    return TOKEN_VALUE_RE.sub(MASK, text)
+    return secretscrub.mask_token_shapes(text, MASK)
 
 
 def redact(obj):

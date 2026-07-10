@@ -41,6 +41,7 @@ import time
 from typing import Any
 
 from .. import paths
+from ..storage import state
 
 logger = logging.getLogger(__name__)
 
@@ -145,43 +146,17 @@ class IncidentStore:
 
     def _init_schema(self) -> None:
         with self._lock:
-            self._conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS incidents (
-                    key        TEXT PRIMARY KEY,
-                    summary    TEXT,
-                    status     TEXT,
-                    root_cause TEXT,
-                    reporter   TEXT,
-                    assignee   TEXT,
-                    created    TEXT,
-                    updated    TEXT,
-                    body       TEXT,
-                    raw_json   TEXT,
-                    indexed_at TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS links (
-                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id   TEXT,
-                    incident_key TEXT,
-                    note         TEXT,
-                    created_at   TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS meta (
-                    key   TEXT PRIMARY KEY,
-                    value TEXT
-                );
-
-                -- Supports the retention sweep's `updated < cutoff` range scan
-                -- (prune_older_than), which otherwise walks the whole table.
-                CREATE INDEX IF NOT EXISTS idx_incidents_updated
-                    ON incidents(updated);
-                """
-            )
-            # FTS mirror is best-effort (state.py creates the same table the
-            # same way): an FTS5-less SQLite must not take down the whole
+            # Base tables (incidents/links/meta + index + the FTS mirror) and
+            # the migration ladder are owned by the shared state layer; the DDL
+            # used to be duplicated here, so a future ``state`` migration never
+            # reached a DB opened through this store. ``ensure_schema`` is
+            # idempotent and records ``schema_version`` on this connection so
+            # later migrations apply.
+            state.ensure_schema(self._conn)
+            # The FTS mirror decides this store's search path; probe it through
+            # our own ``_create_fts`` seam (idempotent — ensure_schema already
+            # created the table on an FTS5 build) so tests can still simulate an
+            # FTS5-less SQLite. An FTS5-less build must not take down the whole
             # incidents stage — search() falls back to LIKE instead.
             try:
                 self._create_fts()

@@ -9,10 +9,53 @@ to the historical env-only resolution.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import os
 from pathlib import Path
 
 PLUGIN_NAME = "hermes-flaky-healer"
+
+# The profile home to resolve config.json from, scoped to the current heal run.
+# Bound at the handler boundary (where ``ctx`` is known) so the config section
+# is read from the SAME home as ``data_dir(ctx)`` — see :func:`bind_run`. Unset
+# (the default) means "resolve the home the ctx-free way" (env/host helpers),
+# which preserves the historical behavior for CLI and direct/test callers.
+# A ``ContextVar`` (not a module global) so concurrent heals in one async pool
+# cannot clobber each other's home.
+_run_home: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "flaky_healer_run_home", default=None
+)
+# Per-run memo of the loaded ``healer`` section, so building one PR does not
+# re-read config.json three times. ``None`` outside a bound run ⇒ no caching
+# (each call reads fresh, which is what tests that repoint HERMES_HOME rely on).
+_run_cfg_cache: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "flaky_healer_run_cfg_cache", default=None
+)
+
+
+@contextlib.contextmanager
+def bind_run(ctx=None):
+    """Scope healer config resolution to *ctx*'s profile home for one run.
+
+    Fixes the home divergence where ``data_dir(ctx)`` honored
+    ``ctx.hermes_home`` but ``_unified_healer_config()`` read the ``healer``
+    section from the ctx-free ``paths.get_hermes_home()`` — so under a profile
+    whose ``ctx.hermes_home`` differed from the host default, patches/state
+    landed under one home while ``sandbox``/``burnin``/``base_branch``/
+    ``allow_subprocess_pr`` were read from another. Binding the same home the
+    data dir uses keeps policy and storage on one profile. Also installs a
+    fresh per-run config memo. A falsy ``ctx.hermes_home`` binds ``None`` (the
+    ctx-free fallback), so behavior is unchanged when the two already agree.
+    """
+    home = getattr(ctx, "hermes_home", None) if ctx is not None else None
+    home_token = _run_home.set(Path(home) if home else None)
+    cache_token = _run_cfg_cache.set({})
+    try:
+        yield
+    finally:
+        _run_cfg_cache.reset(cache_token)
+        _run_home.reset(home_token)
 
 ENV_DATA_DIR = "FLAKY_HEALER_DATA_DIR"
 ENV_BURNIN = "FLAKY_HEALER_BURNIN"
@@ -54,19 +97,29 @@ def _unified_healer_config() -> dict:
     unreadable/absent file — degrades to ``{}`` so env-only behavior is
     preserved exactly when the section is unset.
     """
+    cache = _run_cfg_cache.get()
+    if cache is not None and "section" in cache:
+        return cache["section"]
     try:
         from hermes_flaky_stabilization import config as unified_config
         from hermes_flaky_stabilization import paths as unified_paths
     except Exception:  # pragma: no cover — flat import context without the package
         return {}
     try:
-        # get_hermes_home()/<dir> rather than get_data_dir(): reading config
-        # must not create the data directory as a side effect.
-        section_dir = unified_paths.get_hermes_home() / unified_paths.DATA_DIR_NAME
+        # The run-scoped home (bound from ctx.hermes_home) when set, else the
+        # ctx-free host resolution — the same home data_dir(ctx) resolves, so
+        # config and storage stay on one profile. get_hermes_home()/<dir>
+        # rather than get_data_dir(): reading config must not create the data
+        # directory as a side effect.
+        home = _run_home.get() or unified_paths.get_hermes_home()
+        section_dir = Path(home) / unified_paths.DATA_DIR_NAME
         section = unified_config.load_config(section_dir).get("healer")
     except Exception:  # noqa: BLE001 — config lookup must never break the healer
         return {}
-    return section if isinstance(section, dict) else {}
+    result = section if isinstance(section, dict) else {}
+    if cache is not None:
+        cache["section"] = result
+    return result
 
 
 def _cfg_str(key: str) -> str | None:

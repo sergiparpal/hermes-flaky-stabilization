@@ -27,6 +27,7 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
+from ..common import secretscrub
 from . import _patterns
 
 # Hard cap on the amount of text a single redaction pass will scan. Incident
@@ -98,6 +99,12 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
      r"\1" + URL_CRED_TOKEN + "@"),
 
     # --- Secrets / tokens / keys ----------------------------------------
+    # Standalone credential shapes owned by the shared secret scrubber (GitHub,
+    # Slack, Google, sk-, JWT, AWS, Atlassian, Bearer, PEM). Sourced here so the
+    # outbound Jira path catches the same formats as the triage/healer scrubbers
+    # — the incidents redactor previously missed GitHub/Slack/Google/sk-/JWT, so
+    # those leaked into tickets in the clear.
+    (secretscrub.TOKEN_VALUE_RE, SECRET_TOKEN),
     # Atlassian API tokens (current "ATATT…" and legacy "ATCTT…" prefixes).
     (_compile(r"\bAT[A-Z]TT[A-Za-z0-9_\-=.]{8,}"), SECRET_TOKEN),
     # Atlassian OAuth / connect JWT-ish and generic Bearer tokens.

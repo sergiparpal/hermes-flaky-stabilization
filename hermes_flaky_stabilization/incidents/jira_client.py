@@ -31,6 +31,8 @@ import urllib.request
 from collections.abc import Callable
 from typing import Any
 
+from ..common import nethttp
+
 # A transport takes (method, url, headers, body_bytes_or_None, timeout) and
 # returns (status_code, response_bytes).
 Transport = Callable[[str, str, dict[str, str], bytes | None, float], tuple[int, bytes]]
@@ -54,9 +56,10 @@ class JiraError(Exception):
 
 def _urllib_transport(method: str, url: str, headers: dict[str, str],
                       body: bytes | None, timeout: float) -> tuple[int, bytes]:
-    req = urllib.request.Request(url=url, data=body, method=method)
-    for k, v in headers.items():
-        req.add_header(k, v)
+    # Build via the shared helper so the Basic/Bearer credential is attached
+    # UNREDIRECTED — urllib must never replay it to a redirect target (a proxy
+    # bounce or http→https upgrade would otherwise leak it in cleartext).
+    req = nethttp.build_request(method, url, headers, body)
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:
             return resp.getcode(), resp.read()

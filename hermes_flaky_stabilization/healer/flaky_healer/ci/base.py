@@ -6,6 +6,10 @@ import urllib.error
 import urllib.request
 from typing import Protocol, runtime_checkable
 
+# Absolute import (the healer core loads both unified and via a flat shim); the
+# shared builder owns the "credential headers are unredirected on redirect" rule.
+from hermes_flaky_stabilization.common import nethttp
+
 
 class CIError(RuntimeError):
     """HTTP/protocol failure talking to a CI provider."""
@@ -53,18 +57,14 @@ class Transport(Protocol):
 class UrllibTransport:
     """Default stdlib transport. Follows redirects (GitHub log downloads 302).
 
-    The ``Authorization`` header is attached as an *unredirected* header so the
-    stdlib redirect handler does NOT replay it to the cross-host target of the
-    run-logs 302 (short-lived blob storage), which would leak the token.
+    The ``Authorization`` header is attached as an *unredirected* header (via the
+    shared :func:`nethttp.build_request`) so the stdlib redirect handler does NOT
+    replay it to the cross-host target of the run-logs 302 (short-lived blob
+    storage), which would leak the token.
     """
 
     def request(self, method, url, headers=None, body=None, timeout=30):
-        req = urllib.request.Request(url, data=body, method=method.upper())
-        for key, value in dict(headers or {}).items():
-            if key.lower() == "authorization":
-                req.add_unredirected_header(key, value)
-            else:
-                req.add_header(key, value)
+        req = nethttp.build_request(method, url, headers, body)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
                 return resp.status, dict(resp.headers), _read_capped(resp, url)

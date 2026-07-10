@@ -19,9 +19,13 @@ tokens collapse to one signature.
 FTS5 is used for fuzzy lookup when available and falls back to ``LIKE``
 otherwise — detected at open time, never assumed.
 
-Pure standard library (``sqlite3``, ``hashlib``, ``re``, ``datetime``); the
-caller supplies the DB path so the module stays decoupled from Hermes and
-unit-testable.
+The base-table schema (``triage_patterns`` + its FTS mirror) and the migration
+ladder are owned by :mod:`hermes_flaky_stabilization.storage.state`, the single
+schema owner for ``state.db``; this module used to re-declare that DDL, which
+meant a future ``state`` migration would never reach a DB opened here. It now
+delegates schema creation to ``state.ensure_schema``. Hermes-free at import
+time (``state`` reaches the host only lazily), so the store stays unit-testable
+with any DB path the caller supplies.
 """
 
 from __future__ import annotations
@@ -31,6 +35,8 @@ import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+from ..storage import state
 
 DEFAULT_RETENTION_DAYS = 180
 DEFAULT_MAX_ROWS_PER_PROJECT = 500
@@ -186,33 +192,19 @@ class PatternStore:
             self.conn.execute("PRAGMA journal_mode=WAL")
         except sqlite3.Error:
             pass
-        self.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS triage_patterns (
-                project     TEXT NOT NULL,
-                signature   TEXT NOT NULL,
-                category    TEXT NOT NULL,
-                occurrences INTEGER NOT NULL DEFAULT 1,
-                first_seen  TEXT NOT NULL,
-                last_seen   TEXT NOT NULL,
-                sample      TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (project, signature)
-            )
-            """
-        )
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_triage_patterns_last_seen "
-            "ON triage_patterns(project, last_seen)"
-        )
+        # Base tables (``triage_patterns`` + index + the FTS mirror) and the
+        # migration ladder are owned by the shared state layer; the DDL used to
+        # be duplicated here, so a future ``state`` migration never reached a DB
+        # opened through this store. ``ensure_schema`` is idempotent and records
+        # ``schema_version`` on this connection so later migrations apply.
+        state.ensure_schema(self.conn)
         if self.fts:
             try:
-                self.conn.execute(
-                    "CREATE VIRTUAL TABLE IF NOT EXISTS triage_patterns_fts USING fts5("
-                    "sample, project UNINDEXED, signature UNINDEXED)"
-                )
-                # Backfill rows missing from the index — e.g. a DB previously
-                # written with FTS disabled, or created before this table existed.
-                # Without this, those priors stay invisible to fuzzy lookup.
+                # The table itself is created by ``ensure_schema``; this
+                # backfills rows missing from the index — e.g. a DB previously
+                # written with FTS disabled — which otherwise stay invisible to
+                # fuzzy lookup. A raise here means FTS5 vanished between the
+                # open-time probe and now; degrade to the LIKE path.
                 self.conn.execute(
                     "INSERT INTO triage_patterns_fts (sample, project, signature) "
                     "SELECT sample, project, signature FROM triage_patterns p "
@@ -220,7 +212,6 @@ class PatternStore:
                     "WHERE f.project = p.project AND f.signature = p.signature)"
                 )
             except sqlite3.Error:
-                # FTS5 vanished between probe and create — degrade gracefully.
                 self.fts = False
         self.conn.commit()
 
