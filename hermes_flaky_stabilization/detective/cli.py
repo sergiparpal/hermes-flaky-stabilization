@@ -96,7 +96,8 @@ def handle(args) -> int:
     sub = getattr(args, "flaky_command", None)
     fn = command_handlers().get(sub)
     if fn is None:
-        print("error: no subcommand given (try `hermes flaky-stab --help`)")
+        print("error: no subcommand given (try `hermes flaky-stab --help`)",
+              file=sys.stderr)
         return 2
     return fn(args)
 

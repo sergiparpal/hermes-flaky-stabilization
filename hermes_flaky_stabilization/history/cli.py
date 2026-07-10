@@ -7,6 +7,7 @@ Registered as a single top-level command via ``ctx.register_cli_command`` (see
 
 import json
 import os
+import sys
 from pathlib import Path
 
 from . import domain
@@ -66,10 +67,8 @@ def handle(args) -> int:
     sub = getattr(args, "test_history_command", None)
     fn = command_handlers().get(sub)
     if fn is None:
-        # NOTE: stdout, not stderr — the four CLIs disagree on this and the cron
-        # shim keys on their output. Unifying it is a behavior change, not a
-        # refactor; left as-is deliberately.
-        print("error: no subcommand given (try `hermes test-history --help`)")
+        print("error: no subcommand given (try `hermes test-history --help`)",
+              file=sys.stderr)
         return 2
     return fn(args)
 
@@ -84,7 +83,7 @@ def _cmd_ingest(args) -> int:
 
     target = Path(os.path.realpath(args.path))         # hard-constraint #10
     if not target.exists():
-        print(f"error: path not found: {target}")
+        print(f"error: path not found: {target}", file=sys.stderr)
         return 1
     conn = get_connection()
     if target.is_dir():
@@ -95,7 +94,7 @@ def _cmd_ingest(args) -> int:
         try:
             run_id = ingest_file(conn, target)
         except Exception as exc:  # noqa: BLE001 — friendly CLI error, no traceback
-            print(f"error: could not ingest {target}: {exc}")
+            print(f"error: could not ingest {target}: {exc}", file=sys.stderr)
             return 1
         print(f"ingested run_id={run_id} from {target}")
     return 0
@@ -130,7 +129,7 @@ def _cmd_prune(args) -> int:
     try:
         cutoff = parse_iso_window(args.before, "--before")
     except ValueError as exc:
-        print(f"error: {exc}")
+        print(f"error: {exc}", file=sys.stderr)
         return 1
 
     conn = get_connection()

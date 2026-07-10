@@ -44,7 +44,8 @@ def test_ingest_directory(profile_env, capsys):
 
 def test_ingest_missing_path(profile_env, capsys):
     assert _run(["ingest", str(FIXTURES / "does_not_exist.xml")]) == 1
-    assert "path not found" in capsys.readouterr().out
+    # Errors go to stderr: the cron shim delivers stdout verbatim as the report.
+    assert "path not found" in capsys.readouterr().err
 
 
 def test_prune_noop(profile_env, capsys):
@@ -56,7 +57,7 @@ def test_prune_noop(profile_env, capsys):
 
 def test_prune_bad_date_exit_1(profile_env, capsys):
     assert _run(["prune", "--before", "garbage"]) == 1
-    assert "error" in capsys.readouterr().out
+    assert "error" in capsys.readouterr().err
 
 
 def test_prune_deletes_and_keeps_fts_consistent(profile_env):

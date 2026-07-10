@@ -18,6 +18,7 @@ unified ``status``. ``setup_cli`` receives an argparse subparser from the host;
 from __future__ import annotations
 
 import sqlite3
+import sys
 from contextlib import closing
 
 from . import cronjobs
@@ -105,7 +106,9 @@ def run_cli(args) -> int:
         return 0 if rc is None else rc
     if command == "migrate":
         return _cmd_migrate(args)
-    print(f"flaky-stab: unknown subcommand {command!r}")  # unreachable via argparse
+    # Unreachable via argparse. stderr, like every other error: stdout is the
+    # nightly cron job's delivery payload (see _cmd_migrate).
+    print(f"flaky-stab: unknown subcommand {command!r}", file=sys.stderr)
     return 2
 
 
@@ -122,7 +125,14 @@ def _cmd_migrate(args) -> int:
     except migrate_legacy.MigrationError as exc:
         # e.g. a read-only ATTACH the SQLite build refused — abort loudly
         # rather than risk touching a legacy source (D4 rollback promise).
-        print(f"migration aborted: {exc}")
+        #
+        # stderr, not stdout: a no-agent cron job delivers the shim's stdout
+        # VERBATIM as its report (`exec hermes flaky-stab scan --format cron`),
+        # so an error printed there is delivered as though it were the report.
+        # Every CLI in this plugin now sends `error:`/abort lines to stderr and
+        # signals failure through the exit code, which is what makes the job
+        # alert. Errors -> stderr, reports -> stdout.
+        print(f"migration aborted: {exc}", file=sys.stderr)
         return 1
     for report in reports:
         if not report.found:
@@ -159,8 +169,6 @@ def _install_jira_sync_job(args) -> int:
     and it copied the shim with neither an existence check nor an ``OSError``
     guard — so a site-packages install raised an uncaught FileNotFoundError.
     """
-    import sys
-
     from . import config as unified_config
     from .detective import domain
 

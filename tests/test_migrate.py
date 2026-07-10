@@ -370,7 +370,9 @@ def test_cli_migrate_reports_migration_error_as_failure(profile_env, monkeypatch
     parser = argparse.ArgumentParser(prog="flaky-stab")
     cli.setup_cli(parser)
     assert cli.run_cli(parser.parse_args(["migrate"])) == 1
-    assert "migration aborted" in capsys.readouterr().out
+    # Errors go to stderr: a no-agent cron job delivers stdout verbatim as its
+    # report, so an abort on stdout would be delivered as though it were one.
+    assert "migration aborted" in capsys.readouterr().err
 
 
 def test_cli_migrate_and_status(legacy_home, capsys):

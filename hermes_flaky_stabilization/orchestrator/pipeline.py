@@ -50,6 +50,10 @@ STAGE_KEYS = (
     "healer", "bugreport", "dedup", "pii", "tracker",
 )
 
+# The stages only the bug branch runs. Named once: the heal branch marks exactly
+# these as skipped, and so does the "nothing to act on" fall-through.
+_BUG_BRANCH_STAGES = ("bugreport", "dedup", "pii", "tracker")
+
 OUTCOME_HEALED = "healed"
 OUTCOME_PR_OPENED = "pr_opened"
 OUTCOME_TICKET_CREATED = "ticket_created"
@@ -85,6 +89,7 @@ def _internal_error_envelope(exc: Exception) -> str:
         "error": f"internal error ({type(exc).__name__})",
         "remediation": "See the agent log for details.",
     })
+
 
 STABILIZE_SCHEMA = {
     "name": "stabilize_test_failure",
@@ -161,6 +166,43 @@ class Stages:
     incident_search: Callable[[str], list] | None = None
 
 
+def _fresh_results() -> dict[str, Any]:
+    return {key: {"skipped": "not reached"} for key in STAGE_KEYS}
+
+
+@dataclass
+class RunContext:
+    """One run's state: the arguments in, the stage results and notes out.
+
+    Every stage step used to take ``(args, results, notes)`` positionally and
+    untyped, mutating two bare accumulators in place. One named object makes the
+    signatures typed and gives the skip / note / error idioms a single spelling,
+    so a stage cannot invent its own shape for "I was skipped".
+    """
+
+    args: dict[str, Any]
+    results: dict[str, Any] = field(default_factory=_fresh_results)
+    notes: list[str] = field(default_factory=list)
+
+    def arg(self, name: str) -> str:
+        """A trimmed string argument; ``""`` when absent or non-string."""
+        return str(self.args.get(name) or "").strip()
+
+    def note(self, message: str) -> None:
+        """Leave an operator-visible note on the run."""
+        self.notes.append(message)
+
+    def skip(self, *keys: str, reason: str) -> None:
+        """Mark one or more stages as not taken, with the reason why."""
+        for key in keys:
+            self.results[key] = {"skipped": reason}
+
+    def fail(self, key: str, label: str, exc: Exception) -> None:
+        """Record a stage error. Reports the exception TYPE, never its message:
+        a third-party client's error string can carry a token or a path."""
+        self.results[key] = _stage_error(label, exc)
+
+
 @dataclass
 class Pipeline:
     """The orchestrator; construct via :func:`build_pipeline` for real wiring."""
@@ -178,21 +220,19 @@ class Pipeline:
 
     def run(self, args: dict[str, Any]) -> dict[str, Any]:
         started = time.monotonic()
-        args = args if isinstance(args, dict) else {}
-        results: dict[str, Any] = {key: {"skipped": "not reached"} for key in STAGE_KEYS}
-        notes: list[str] = []
+        ctx = RunContext(args=args if isinstance(args, dict) else {})
 
         heal_categories = self._pipeline_cfg.get("heal_categories") or ["flaky", "timeout"]
 
-        log_path = self._evidence(args, results, notes)
-        test_id = str(args.get("test_id") or "").strip()
-        self._history(test_id, results)
-        category = self._triage(args, log_path, test_id, results, notes)
+        log_path = self._evidence(ctx)
+        test_id = ctx.arg("test_id")
+        self._history(test_id, ctx)
+        category = self._triage(ctx, log_path, test_id)
 
         outcome = OUTCOME_NEEDS_ATTENTION
-        if category is None and self._verdict_is_flaky(results["detective"]):
+        if category is None and self._verdict_is_flaky(ctx.results["detective"]):
             category = "flaky"
-            notes.append("no triage category; forked on the detective verdict")
+            ctx.note("no triage category; forked on the detective verdict")
 
         # The branch is decided HERE, at the fork, and recorded as such — the
         # ledger must not reverse-engineer it from stage-result shapes (a heal
@@ -200,42 +240,40 @@ class Pipeline:
         branch: str | None = None
         if category in heal_categories:
             branch = "heal"
-            for key in ("bugreport", "dedup", "pii", "tracker"):
-                results[key] = {"skipped": f"heal branch taken (category {category!r})"}
-            outcome = self._heal_branch(args, test_id, results, notes)
+            ctx.skip(*_BUG_BRANCH_STAGES, reason=f"heal branch taken (category {category!r})")
+            outcome = self._heal_branch(ctx, test_id)
         elif category is not None:
             branch = "bug"
-            results["healer"] = {"skipped": f"bug branch taken (category {category!r})"}
-            outcome = self._bug_branch(args, log_path, test_id, results, notes)
+            ctx.skip("healer", reason=f"bug branch taken (category {category!r})")
+            outcome = self._bug_branch(ctx, log_path, test_id)
         else:
-            results["healer"] = {"skipped": "no category and no flaky verdict"}
-            for key in ("bugreport", "dedup", "pii", "tracker"):
-                results[key] = {"skipped": "no category and no flaky verdict"}
-            notes.append("nothing to act on: supply a log and/or a known test_id")
+            ctx.skip("healer", *_BUG_BRANCH_STAGES,
+                     reason="no category and no flaky verdict")
+            ctx.note("nothing to act on: supply a log and/or a known test_id")
 
         envelope = {
             "success": True,
             "outcome": outcome,
-            "stage_results": results,
-            "notes": notes,
+            "stage_results": ctx.results,
+            "notes": ctx.notes,
         }
-        self._ledger(args, category, branch, outcome, results, time.monotonic() - started)
+        self._ledger(ctx, category, branch, outcome, time.monotonic() - started)
         return envelope
 
     # -- stage steps --------------------------------------------------------
 
-    def _evidence(self, args, results, notes) -> str | None:
-        log = str(args.get("log_url_or_path") or "").strip()
+    def _evidence(self, ctx: RunContext) -> str | None:
+        log = ctx.arg("log_url_or_path")
         if log:
-            results["evidence"] = {"source": "given_log", "log": log}
+            ctx.results["evidence"] = {"source": "given_log", "log": log}
             return log
-        build_id = str(args.get("build_id") or "").strip()
-        repo = str(args.get("repo") or "").strip()
+        build_id = ctx.arg("build_id")
+        repo = ctx.arg("repo")
         if build_id and repo and self.stages.fetch_ci_logs is not None:
             try:
                 data = _as_dict(self.stages.fetch_ci_logs({"build_id": build_id, "repo": repo}))
             except Exception as exc:
-                results["evidence"] = _stage_error("fetch_ci_logs", exc)
+                ctx.fail("evidence", "fetch_ci_logs", exc)
                 return None
             if isinstance(data, dict) and data.get("filtered_log"):
                 try:
@@ -244,19 +282,19 @@ class Pipeline:
                     # not a run abort that loses every result and the ledger row.
                     path = self._spool_log(data["filtered_log"], build_id)
                 except Exception as exc:
-                    results["evidence"] = _stage_error("evidence spool", exc)
+                    ctx.fail("evidence", "evidence spool", exc)
                     return None
-                results["evidence"] = {
+                ctx.results["evidence"] = {
                     "source": "fetch_ci_logs", "log": str(path),
                     "bytes_filtered": data.get("bytes_filtered"),
                 }
                 return str(path)
-            results["evidence"] = {
+            ctx.results["evidence"] = {
                 "error": (data or {}).get("error", "fetch_ci_logs returned no log")
                 if isinstance(data, dict) else "fetch_ci_logs returned no log",
             }
             return None
-        results["evidence"] = {"skipped": "no log given (and no build_id+repo+token)"}
+        ctx.skip("evidence", reason="no log given (and no build_id+repo+token)")
         return None
 
     def _spool_log(self, text: str, build_id: str) -> Path:
@@ -274,32 +312,31 @@ class Pipeline:
         paths.restrict_file(path)
         return path
 
-    def _history(self, test_id: str, results) -> None:
+    def _history(self, test_id: str, ctx: RunContext) -> None:
         if not test_id:
-            results["history"] = {"skipped": "no test_id given"}
-            results["detective"] = {"skipped": "no test_id given"}
+            ctx.skip("history", "detective", reason="no test_id given")
             return
         if self.stages.history_lookup is not None:
             try:
-                results["history"] = self.stages.history_lookup(test_id)
+                ctx.results["history"] = self.stages.history_lookup(test_id)
             except Exception as exc:
-                results["history"] = _stage_error("history lookup", exc)
+                ctx.fail("history", "history lookup", exc)
         else:
-            results["history"] = {"skipped": "history stage unavailable"}
+            ctx.skip("history", reason="history stage unavailable")
         if self.stages.is_flaky is not None:
             try:
-                results["detective"] = self.stages.is_flaky(test_id)
+                ctx.results["detective"] = self.stages.is_flaky(test_id)
             except Exception as exc:
-                results["detective"] = _stage_error("is_flaky", exc)
+                ctx.fail("detective", "is_flaky", exc)
         else:
-            results["detective"] = {"skipped": "detective stage unavailable"}
+            ctx.skip("detective", reason="detective stage unavailable")
 
     @staticmethod
     def _verdict_is_flaky(detective_result) -> bool:
         return isinstance(detective_result, dict) and detective_result.get("is_flaky") is True
 
     def _incident_context(self, log_path: str | None, test_id: str,
-                          notes: list[str]) -> list | None:
+                          ctx: RunContext) -> list | None:
         """The NET-NEW incidents→triage feedback seed (redacted, local-only).
 
         Failures here must never be silent: an errored lookup is otherwise
@@ -319,7 +356,7 @@ class Pipeline:
                 query = triage_enrichment.top_signal_line(excerpt) or query
             except Exception as exc:
                 logger.warning("incident-context query derivation failed", exc_info=True)
-                notes.append(
+                ctx.note(
                     f"incident-context query derivation failed "
                     f"({type(exc).__name__}) — fell back to the bare test id"
                 )
@@ -329,68 +366,69 @@ class Pipeline:
             rows = self.stages.incident_search(query)
         except Exception as exc:
             logger.warning("incident-context lookup failed", exc_info=True)
-            notes.append(
+            ctx.note(
                 f"incident-context lookup failed ({type(exc).__name__}) — "
                 f"triage ran without incident hints"
             )
             return None
         return rows or None
 
-    def _triage(self, args, log_path, test_id, results, notes) -> str | None:
+    def _triage(self, ctx: RunContext, log_path, test_id) -> str | None:
         if not log_path:
-            results["triage"] = {"skipped": "no log evidence to triage"}
+            ctx.skip("triage", reason="no log evidence to triage")
             return None
         if self.stages.triage is None:
-            results["triage"] = {"skipped": "triage stage unavailable"}
+            ctx.skip("triage", reason="triage stage unavailable")
             return None
-        incident_context = self._incident_context(log_path, test_id, notes)
+        incident_context = self._incident_context(log_path, test_id, ctx)
         call: dict[str, Any] = {"log_url_or_path": log_path}
-        if args.get("project"):
-            call["project"] = args["project"]
+        if ctx.args.get("project"):
+            call["project"] = ctx.args["project"]
         try:
             data = _as_dict(self.stages.triage(call, incident_context=incident_context))
         except Exception as exc:
-            results["triage"] = _stage_error("triage", exc)
+            ctx.fail("triage", "triage", exc)
             return None
-        results["triage"] = data
+        ctx.results["triage"] = data
         if not isinstance(data, dict) or not data.get("success"):
             return None
         return data.get("category")
 
     # -- heal branch ---------------------------------------------------------
 
-    def _heal_branch(self, args, test_id, results, notes) -> str:
-        repo_dir = str(args.get("repo_dir") or "").strip()
+    def _heal_branch(self, ctx: RunContext, test_id) -> str:
+        repo_dir = ctx.arg("repo_dir")
         if not repo_dir or not test_id:
-            results["healer"] = {"skipped": "healer needs repo_dir and test_id"}
-            notes.append("flaky category but no repo_dir/test_id — cannot heal")
+            ctx.skip("healer", reason="healer needs repo_dir and test_id")
+            ctx.note("flaky category but no repo_dir/test_id — cannot heal")
             return OUTCOME_NEEDS_ATTENTION
         if self.stages.heal is None:
-            results["healer"] = {"skipped": "healer stage unavailable"}
+            ctx.skip("healer", reason="healer stage unavailable")
             return OUTCOME_NEEDS_ATTENTION
-        mode = str(args.get("mode") or self._pipeline_cfg.get("default_heal_mode") or "suggest")
+        mode = str(ctx.args.get("mode") or self._pipeline_cfg.get("default_heal_mode")
+                   or "suggest")
         call = {"repo_dir": repo_dir, "test_id": test_id, "mode": mode}
         for optional in ("trace_path", "build_id", "repo"):
-            if args.get(optional):
-                call[optional] = args[optional]
+            if ctx.args.get(optional):
+                call[optional] = ctx.args[optional]
         try:
             data = _as_dict(self.stages.heal(call))
         except Exception as exc:
-            results["healer"] = _stage_error("heal", exc)
+            ctx.fail("healer", "heal", exc)
             return OUTCOME_NEEDS_ATTENTION
-        results["healer"] = data
+        ctx.results["healer"] = data
         if not isinstance(data, dict):
             return OUTCOME_NEEDS_ATTENTION
         report = data.get("report") or {}
         if report.get("stable"):
-            self._feed_back_burnin(test_id, report, results, notes)
+            self._feed_back_burnin(test_id, report, ctx)
             if data.get("pr"):
                 return OUTCOME_PR_OPENED
             return OUTCOME_HEALED
-        notes.append("heal did not reach a stable burn-in")
+        ctx.note("heal did not reach a stable burn-in")
         return OUTCOME_NEEDS_ATTENTION
 
-    def _feed_back_burnin(self, test_id, report, results, notes) -> None:
+    def _feed_back_burnin(self, test_id, report, ctx: RunContext) -> None:
         """Loop 1 (plan D9): a stable heal writes its burn-in outcome back into
         history.db as a synthetic run, so the next detective scan sees the
         recovery."""
@@ -413,63 +451,53 @@ class Pipeline:
         }] * max(1, repeats)
         try:
             run_id = self.stages.ingest_synthetic(cases=cases)
-            notes.append(
+            ctx.note(
                 f"burn-in outcome fed back into test history (run_id={run_id}, "
                 f"{len(cases)} green case row(s))"
             )
         except Exception as exc:
-            notes.append(f"burn-in feedback failed ({type(exc).__name__})")
+            ctx.note(f"burn-in feedback failed ({type(exc).__name__})")
 
     # -- bug branch ------------------------------------------------------------
 
-    def _bug_branch(self, args, log_path, test_id, results, notes) -> str:
-        report = self._bugreport(args, log_path, test_id, results)
+    def _bug_branch(self, ctx: RunContext, log_path, test_id) -> str:
+        report = self._bugreport(ctx, log_path, test_id)
         if report is None:
             return OUTCOME_NEEDS_ATTENTION
 
-        summary_query = f"{report.get('title', '')} {report.get('summary', '')}".strip()
-        if self.stages.dedup is not None and summary_query:
-            try:
-                results["dedup"] = self.stages.dedup(summary_query)
-            except Exception as exc:
-                results["dedup"] = _stage_error("dedup", exc)
-        else:
-            results["dedup"] = {"skipped": "no dedup stage or empty summary"}
+        self._dedup(ctx, report)
 
-        evidence_paths = self._coerce_evidence_paths(args.get("evidence_paths"),
-                                                     results, notes)
+        evidence_paths = self._coerce_evidence_paths(ctx)
         if evidence_paths is None:
             return OUTCOME_NEEDS_ATTENTION
         if log_path and not str(log_path).startswith("http"):
             evidence_paths.append(str(log_path))
 
-        if self._pipeline_cfg.get("require_pii_gate", True):
-            if self.stages.gate is None:
-                # Fail CLOSED, mirroring assert_evidence_clean's scan-error
-                # policy: a required gate that cannot run must block the
-                # tracker, not wave the evidence through.
-                results["pii"] = {
-                    "ok": False,
-                    "error": "pii gate required by config but unavailable (fail closed)",
-                }
-                results["tracker"] = {"skipped": "pii_gate_unavailable — nothing sent"}
-                notes.append("PII gate required but unavailable — failing closed")
-                return OUTCOME_NEEDS_ATTENTION
-            gate_result = self.stages.gate(evidence_paths)
-            gate_dict = gate_result.to_dict() if hasattr(gate_result, "to_dict") else gate_result
-            results["pii"] = gate_dict
-            if not gate_dict.get("ok"):
-                results["tracker"] = {"skipped": "pii_gate_failed — nothing sent"}
-                notes.append("PII gate failed: scrub or drop the flagged evidence")
-                return OUTCOME_NEEDS_ATTENTION
+        if not self._pii_gate(ctx, evidence_paths):
+            return OUTCOME_NEEDS_ATTENTION
+
+        return self._tracker(ctx, report, evidence_paths)
+
+    def _dedup(self, ctx: RunContext, report: dict) -> None:
+        summary_query = f"{report.get('title', '')} {report.get('summary', '')}".strip()
+        if self.stages.dedup is not None and summary_query:
+            try:
+                ctx.results["dedup"] = self.stages.dedup(summary_query)
+            except Exception as exc:
+                ctx.fail("dedup", "dedup", exc)
         else:
+            ctx.skip("dedup", reason="no dedup stage or empty summary")
+
+    def _pii_gate(self, ctx: RunContext, evidence_paths: list[str]) -> bool:
+        """Run (or knowingly skip) the PII gate. ``False`` blocks the tracker."""
+        if not self._pipeline_cfg.get("require_pii_gate", True):
             # An explicit operator opt-out (require_pii_gate=false, default true)
             # sends the ticket with no PII gate — exactly the decision that should
             # be auditable, so surface it in notes and log a warning like the
             # fail paths around it, rather than passing silently.
-            results["pii"] = {"skipped": "gate disabled by config",
-                              "require_pii_gate": False}
-            notes.append(
+            ctx.results["pii"] = {"skipped": "gate disabled by config",
+                                  "require_pii_gate": False}
+            ctx.note(
                 "PII gate DISABLED by config (require_pii_gate=false) — evidence "
                 "sent without a PII scan"
             )
@@ -477,11 +505,31 @@ class Pipeline:
                 "pipeline: PII gate disabled by config (require_pii_gate=false); "
                 "tracker evidence bypassed the PII scan"
             )
+            return True
 
-        return self._tracker(report, evidence_paths, results, notes)
+        if self.stages.gate is None:
+            # Fail CLOSED, mirroring assert_evidence_clean's scan-error
+            # policy: a required gate that cannot run must block the
+            # tracker, not wave the evidence through.
+            ctx.results["pii"] = {
+                "ok": False,
+                "error": "pii gate required by config but unavailable (fail closed)",
+            }
+            ctx.skip("tracker", reason="pii_gate_unavailable — nothing sent")
+            ctx.note("PII gate required but unavailable — failing closed")
+            return False
+
+        gate_result = self.stages.gate(evidence_paths)
+        gate_dict = gate_result.to_dict() if hasattr(gate_result, "to_dict") else gate_result
+        ctx.results["pii"] = gate_dict
+        if not gate_dict.get("ok"):
+            ctx.skip("tracker", reason="pii_gate_failed — nothing sent")
+            ctx.note("PII gate failed: scrub or drop the flagged evidence")
+            return False
+        return True
 
     @staticmethod
-    def _coerce_evidence_paths(raw: Any, results, notes) -> list[str] | None:
+    def _coerce_evidence_paths(ctx: RunContext) -> list[str] | None:
         """Validate the untrusted ``evidence_paths`` argument.
 
         The slash command (and models) routinely pass a lone string — iterating
@@ -491,38 +539,40 @@ class Pipeline:
         any other non-list shape is a clean stage error (``None`` return —
         the caller ends the run as ``needs_attention`` with the row written).
         """
+        raw = ctx.args.get("evidence_paths")
         if raw is None:
             return []
         if isinstance(raw, str):
             return [raw] if raw.strip() else []
         if isinstance(raw, (list, tuple)):
             return [str(p) for p in raw]
-        results["pii"] = {
+        ctx.results["pii"] = {
             "ok": False,
             "error": (f"invalid evidence_paths type ({type(raw).__name__}); "
                       "expected a list of path strings"),
         }
-        results["tracker"] = {"skipped": "invalid evidence_paths — nothing sent"}
-        notes.append("evidence_paths must be a list of file paths (or one path string)")
+        ctx.skip("tracker", reason="invalid evidence_paths — nothing sent")
+        ctx.note("evidence_paths must be a list of file paths (or one path string)")
         return None
 
-    def _bugreport(self, args, log_path, test_id, results) -> dict | None:
+    def _bugreport(self, ctx: RunContext, log_path, test_id) -> dict | None:
         if self.stages.bugreport is None:
-            results["bugreport"] = {"skipped": "bugreport stage unavailable"}
+            ctx.skip("bugreport", reason="bugreport stage unavailable")
             return None
-        raw_text = self._raw_evidence_text(args, log_path, test_id, results)
+        raw_text = self._raw_evidence_text(log_path, test_id, ctx.results)
         try:
             data = _as_dict(self.stages.bugreport({"raw_text": raw_text, "format": "json"}))
         except Exception as exc:
-            results["bugreport"] = _stage_error("bug report", exc)
+            ctx.fail("bugreport", "bug report", exc)
             return None
         if not isinstance(data, dict) or data.get("error"):
-            results["bugreport"] = data if isinstance(data, dict) else {"error": "bad report"}
+            ctx.results["bugreport"] = data if isinstance(data, dict) else {"error": "bad report"}
             return None
-        results["bugreport"] = data
+        ctx.results["bugreport"] = data
         return data
 
-    def _raw_evidence_text(self, args, log_path, test_id, results) -> str:
+    @staticmethod
+    def _raw_evidence_text(log_path, test_id, results) -> str:
         parts: list[str] = []
         triage_result = results.get("triage")
         if isinstance(triage_result, dict) and triage_result.get("success"):
@@ -561,7 +611,7 @@ class Pipeline:
         masked = mask_pii(text)
         return masked, masked != text
 
-    def _tracker(self, report, evidence_paths, results, notes) -> str:
+    def _tracker(self, ctx: RunContext, report, evidence_paths) -> str:
         from ..pii import redaction
 
         # D7: the TITLE is outbound text exactly like the body — redact it on
@@ -572,7 +622,7 @@ class Pipeline:
         body, body_fired = self._egress_mask(self._ticket_body(report))
         egress_fired = title_fired or body_fired
         if egress_fired:
-            notes.append(
+            ctx.note(
                 "egress canary fired: PII remained after redaction and was "
                 "masked in the outbound ticket text"
             )
@@ -581,11 +631,11 @@ class Pipeline:
             ticket: dict[str, Any] = {"title": title, "body": body}
             if egress_fired:
                 ticket["egress_masked"] = True
-            results["tracker"] = {
+            ctx.results["tracker"] = {
                 "skipped": "jira.enable_write is off",
                 "ticket": ticket,
             }
-            notes.append("tracker write disabled — returning the ticket body to file manually")
+            ctx.note("tracker write disabled — returning the ticket body to file manually")
             return OUTCOME_TICKET_READY
         try:
             data = _as_dict(self.stages.tracker({
@@ -595,12 +645,12 @@ class Pipeline:
                 "evidence_paths": evidence_paths,
             }))
         except Exception as exc:
-            results["tracker"] = _stage_error("tracker write", exc)
+            ctx.fail("tracker", "tracker write", exc)
             return OUTCOME_NEEDS_ATTENTION
-        results["tracker"] = data
+        ctx.results["tracker"] = data
         if isinstance(data, dict) and data.get("created"):
             return OUTCOME_TICKET_CREATED
-        notes.append("tracker write did not create an issue")
+        ctx.note("tracker write did not create an issue")
         return OUTCOME_NEEDS_ATTENTION
 
     @staticmethod
@@ -627,7 +677,7 @@ class Pipeline:
 
     # -- ledger -----------------------------------------------------------------
 
-    def _ledger(self, args, category, branch, outcome, results, duration_s) -> None:
+    def _ledger(self, ctx: RunContext, category, branch, outcome, duration_s) -> None:
         """Record the run; *branch* is the fork decision made in :meth:`run`
         (never reverse-engineered from stage-result shapes, which would record
         NULL for exactly the failed runs one queries the ledger for)."""
@@ -636,12 +686,12 @@ class Pipeline:
         try:
             self.record_run({
                 "trigger": "tool",
-                "test_id": args.get("test_id"),
-                "project": args.get("project"),
+                "test_id": ctx.args.get("test_id"),
+                "project": ctx.args.get("project"),
                 "triage_category": category,
                 "branch": branch,
                 "outcome": outcome,
-                "stage_results_json": json.dumps(results, ensure_ascii=False, default=str),
+                "stage_results_json": json.dumps(ctx.results, ensure_ascii=False, default=str),
                 "duration_s": round(duration_s, 3),
             })
         except Exception:
