@@ -2,3 +2,13 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .coverage
+
+# Runtime artifacts left by the burgess knowledge-graph tooling when run in this
+# folder — not part of this plugin. The .ckpt was committed by accident in the
+# Phase 1 scaffolding; the rest are already in .git/info/exclude.
+.kg-ground-audit.jsonl.ckpt
+.kg-ground-audit.jsonl
+.kg-reconcile-state.json
+.kg-session-lock
+canon/
+.tmp-*
