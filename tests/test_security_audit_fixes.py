@@ -58,14 +58,14 @@ class TestTriageRedactBypasses:
 
 class TestHealerLogScrub:
     def test_ci_log_secrets_scrubbed_signal_kept(self):
-        from hermes_flaky_stabilization.healer import handlers
+        from hermes_flaky_stabilization.healer.flaky_healer import ci_logs
         log = (
             "AssertionError: expected 200 got 500\n"
             '+ curl -H "Authorization: Bearer ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"\n'
             "DATABASE_URL=postgres://svc:sup3rs3cret@db.internal:5432/app\n"
             'env {"api_key": "AKIAIOSFODNN7EXAMPLE"}\n'
         )
-        out = handlers._scrub_ci_secrets(log)
+        out = ci_logs.scrub_ci_secrets(log)
         for secret in ("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
                        "sup3rs3cret", "AKIAIOSFODNN7EXAMPLE"):
             assert secret not in out

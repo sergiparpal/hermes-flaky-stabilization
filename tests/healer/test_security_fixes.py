@@ -11,7 +11,7 @@ import zipfile
 import handlers
 import pytest
 from conftest import FIXTURES, TOY_APP, FakeSandbox, FakeTransport, make_run_report
-from flaky_healer import config, redact, zipsafe
+from flaky_healer import ci_logs, config, redact, zipsafe
 from flaky_healer.ci.base import CIError
 from flaky_healer.ci.github_actions import GitHubActionsCI
 from flaky_healer.sandbox.docker import DockerSandbox
@@ -124,10 +124,10 @@ class TestZipBomb:
             zf.writestr("0_job/1_step.txt", "Z" * 60_000)
         orig = zipsafe.ZipBudget  # capture before patching the shared module attr
         monkeypatch.setattr(
-            handlers.zipsafe, "ZipBudget", lambda: orig(max_total=5_000, max_entry=5_000)
+            ci_logs.zipsafe, "ZipBudget", lambda: orig(max_total=5_000, max_entry=5_000)
         )
         with pytest.raises(zipsafe.ZipLimitError):
-            handlers._logs_zip_to_text(buf.getvalue())
+            ci_logs.logs_zip_to_text(buf.getvalue())
 
 
 class TestZipBudgetStreaming:

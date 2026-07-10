@@ -38,6 +38,7 @@ from typing import Any, NamedTuple
 
 from ..pii import redaction
 from . import config as config_mod
+from . import egress
 from . import ingest as ingest_mod
 from .config import ENV_TOKEN, NAME, IncidentsConfig  # noqa: F401 — ENV_TOKEN re-exported
 from .prefetch import PrefetchCache
@@ -47,10 +48,6 @@ from .sync import SyncScheduler
 
 logger = logging.getLogger(__name__)
 
-# Defense-in-depth egress canary: when this env var is truthy, model-facing
-# output is re-scanned for residual PII and a warning is logged on a hit. Off
-# by default (zero cost on the hot path); intended for staging / CI.
-STRICT_REDACTION_ENV = "HERMES_JIRA_STRICT_REDACTION"
 SYNC_JOIN_TIMEOUT = 5.0         # seconds — bound on joining the prior sync thread
 SEARCH_LIMIT_MAX = 50           # hard cap on tool-requested result counts
 
@@ -430,42 +427,13 @@ class IncidentsService:
         if self._sync is not None:
             self._sync.join(timeout)
 
-    # -- egress safety ---------------------------------------------------------
-
-    @staticmethod
-    def _strict_egress_enabled() -> bool:
-        return os.environ.get(STRICT_REDACTION_ENV, "").strip().lower() in (
-            "1", "true", "yes", "on")
+    # -- egress safety (logic in egress.py; these delegate) --------------------
 
     def _egress_guard(self, text: str, where: str) -> str:
-        """Defense-in-depth canary on every model-facing string.
-
-        When strict mode is enabled, re-scan already-redacted output and log a
-        warning if anything still looks like PII *or* like un-neutralised
-        injection residue (a control char / forged role marker) — both signs a
-        redactor or the neutraliser missed a case. Never raises and never
-        mutates the payload — redaction already ran; this only surfaces gaps so
-        they can be fixed.
-        """
-        try:
-            if text and self._strict_egress_enabled() and (
-                    redaction.contains_pii(text)
-                    or redaction.neutralization_needed(text)):
-                logger.warning(
-                    "%s: possible residual PII or injection marker on egress "
-                    "path '%s'", NAME, where)
-        except Exception:
-            pass
-        return text
+        return egress.guard(text, where)
 
     def _json_egress(self, payload: dict[str, Any], where: str) -> str:
-        """Serialise a tool-result payload and run it through the egress canary.
-
-        One funnel for every tool result so they all share the same JSON
-        encoding (``ensure_ascii=False``) and the same PII re-scan — a new tool
-        can't silently skip the guard or drop the flag.
-        """
-        return self._egress_guard(json.dumps(payload, ensure_ascii=False), where)
+        return egress.json_result(payload, where)
 
     # -- per-turn recall (pre_llm_call payload) ---------------------------------
 
