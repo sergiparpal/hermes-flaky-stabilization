@@ -108,7 +108,9 @@ def test_network_error_is_converted_to_cierror():
 
 def test_fetch_ci_logs_returns_json_on_network_failure(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "tok")
-    monkeypatch.setenv("FLAKY_HEALER_GITHUB_API", "http://127.0.0.1:9")
+    # https:// (the base is now https-only) at a dead port → a network failure
+    # surfaced as a JSON error object, not a raised exception.
+    monkeypatch.setenv("FLAKY_HEALER_GITHUB_API", "https://127.0.0.1:9")
     data = json.loads(handlers.fetch_ci_logs({"build_id": "1", "repo": "a/b"}))
     assert "error" in data  # a JSON error object, not a raised exception
 

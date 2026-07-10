@@ -257,6 +257,21 @@ def test_dirty_evidence_stops_pipeline_with_no_tracker_call(tmp_path):
     _assert_all_stage_keys(out)
 
 
+def test_gate_disabled_by_config_is_audited(tmp_path):
+    """SECURITY (audit): require_pii_gate=false must not send silently. The run
+    surfaces the disabled-gate decision in notes and in the pii stage result, so
+    an operator opt-out is observable rather than a quiet bypass."""
+    calls = []
+    p, _ = _pipeline(calls, category="broken_test",
+                     config={"pipeline": {"require_pii_gate": False,
+                                          "heal_categories": ["flaky", "timeout"],
+                                          "default_heal_mode": "suggest"},
+                             "jira": {"enable_write": False}})
+    out = p.run({"log_url_or_path": _log(tmp_path)})
+    assert out["stage_results"]["pii"]["require_pii_gate"] is False
+    assert any("DISABLED" in n for n in out["notes"])
+
+
 def test_enable_write_false_returns_redacted_ticket_body(tmp_path):
     calls = []
     p, _ = _pipeline(calls, category="broken_test",

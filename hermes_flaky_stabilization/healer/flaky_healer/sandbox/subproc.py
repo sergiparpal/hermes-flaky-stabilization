@@ -110,7 +110,9 @@ class SubprocessSandbox:
         return env
 
     def _run_once(self, work: Path, home: Path, test_id: str, timeout_s: int) -> RunResult:
-        cmd = [*_netns_prefix(), "npx", "playwright", "test", test_id, *PLAYWRIGHT_ARGS]
+        # `--` after the flags terminates option parsing so a flag-shaped
+        # test_id (`--reporter=…`) is treated as a positional spec, not an option.
+        cmd = [*_netns_prefix(), "npx", "playwright", "test", *PLAYWRIGHT_ARGS, "--", test_id]
         start = time.monotonic()
         try:
             proc = subprocess.Popen(

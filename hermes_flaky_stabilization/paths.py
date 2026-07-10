@@ -56,7 +56,11 @@ def get_data_dir() -> Path:
     filesystem that cannot represent POSIX modes must not break the plugin.
     """
     data_dir = get_hermes_home() / DATA_DIR_NAME
-    data_dir.mkdir(parents=True, exist_ok=True)
+    # mode=0o700 on creation closes the window between mkdir (default 0755) and
+    # the chmod below during which the dir — and any sidecar written into it — is
+    # world-listable. 0o700 is umask-safe (no group/other bits to mask off). The
+    # chmod stays as belt-and-suspenders for a dir that already exists 0755.
+    data_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
     try:
         os.chmod(data_dir, 0o700)
     except OSError:
@@ -64,8 +68,53 @@ def get_data_dir() -> Path:
     return data_dir
 
 
+def _is_real_file_path(path: Path | str) -> bool:
+    """False for the sentinel/URI paths SQLite accepts (``:memory:``, ``file:``)
+    that have no on-disk file to permission-harden."""
+    s = str(path)
+    return bool(s) and s != ":memory:" and not s.startswith("file:")
+
+
+def precreate_private(path: Path | str) -> None:
+    """Create *path* ``0600`` *before* SQLite opens it, so a DB holding PII is
+    never briefly exposed at the process umask (e.g. 0644). No-op if the file
+    already exists or cannot be created; :func:`harden_db_files` chmods after
+    connect regardless. Best-effort on non-POSIX mounts."""
+    if not _is_real_file_path(path) or os.path.exists(path):
+        return
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_WRONLY, 0o600)
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def harden_db_files(path: Path | str) -> None:
+    """Best-effort ``0600`` on a SQLite DB *and* its WAL/-shm/-journal sidecars.
+
+    The sidecars are created by the first write transaction in WAL mode and hold
+    the same recently-written rows as the main DB, so restricting only the main
+    file leaves incident PII / captured test output group- or world-readable in
+    the sidecars. Call after the schema is applied so the sidecars already exist.
+    """
+    if not _is_real_file_path(path):
+        return
+    base = str(path)
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        p = base + suffix
+        try:
+            if os.path.exists(p):
+                os.chmod(p, 0o600)
+        except OSError:
+            pass
+
+
 def restrict_file(path: Path | str) -> None:
-    """Best-effort ``0600`` on a data file (DB, config)."""
+    """Best-effort ``0600`` on a data file (DB, config).
+
+    For a live SQLite DB prefer :func:`harden_db_files`, which also covers the
+    WAL/-shm/-journal sidecars.
+    """
     try:
         os.chmod(path, 0o600)
     except OSError:

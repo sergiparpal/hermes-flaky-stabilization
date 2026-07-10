@@ -181,13 +181,24 @@ def _install_jira_sync_job(args) -> int:
     import shlex
     import shutil
     import subprocess
+    import sys
 
     from . import config as unified_config
     from . import paths
+    from .detective import domain
 
     cfg = unified_config.load_config()["detective"]
     schedule = args.schedule or cfg["schedule"]
     deliver = args.deliver or cfg["deliver"]
+
+    # The schedule is passed positionally to `hermes cron create`; reject a
+    # leading-dash / malformed value that could be parsed as an option (argument
+    # injection) before it is baked into the job.
+    try:
+        domain.validate_cron_schedule(schedule)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     scripts_dir = paths.get_hermes_home() / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)

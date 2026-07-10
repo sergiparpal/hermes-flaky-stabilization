@@ -78,8 +78,13 @@ class DockerSandbox:
             "npx",
             "playwright",
             "test",
-            test_id,
             *PLAYWRIGHT_ARGS,
+            # `--` terminates option parsing (all our flags precede it) so a
+            # test_id shaped like a flag (e.g. `--reporter=…`) is treated as a
+            # positional spec, not an option. test_id is already confined to an
+            # existing repo file by the healer, so this is belt-and-suspenders.
+            "--",
+            test_id,
         ]
         return cmd
 

@@ -113,11 +113,14 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
          ), lambda m: _label_replace(m, SECRET_TOKEN)),
 
     # --- Email addresses -------------------------------------------------
-    (_re(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"), EMAIL_TOKEN),
+    # Local class is `\w` (Unicode) + specials, length-bounded to keep the sweep
+    # linear, so internationalized local parts (josé@…, иван@…) are redacted too.
+    (_re(r"\b[\w.%+\-]{1,64}@[\w.\-]{1,255}\.[A-Za-z]{2,}\b"), EMAIL_TOKEN),
 
     # --- Government / financial identifiers -----------------------------
-    # US SSN.
-    (_re(r"\b\d{3}-\d{2}-\d{4}\b"), SSN_TOKEN),
+    # US SSN. Space- and dash-separated (env dumps and prose use either); the
+    # separator class is [ \t\-] so the match cannot span a newline.
+    (_re(r"\b\d{3}[ \t\-]\d{2}[ \t\-]\d{4}\b"), SSN_TOKEN),
     # Credit-card-like 13–16 digit groups (with optional spaces/dashes).
     # Anchored to start and end on a digit so a trailing separator (and the
     # following word) is not swallowed into the match.
@@ -125,6 +128,24 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
 
     # --- IPv4 addresses --------------------------------------------------
     (_re(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b"), IP_TOKEN),
+
+    # --- IPv6 addresses --------------------------------------------------
+    # Full and every `::`-compressed form. All quantifiers are bounded ({1,7}),
+    # so there is no catastrophic backtracking. Lookarounds (not \b, which does
+    # not assert cleanly next to a leading/trailing ':') keep it from splicing a
+    # match out of an adjacent hex run; a `HH:MM:SS` timestamp (3 groups, single
+    # colons) and a MAC (6 groups, no `::`) do not match.
+    (_re(r"(?<![\w:.])(?:"
+         r"(?:[A-Fa-f0-9]{1,4}:){7}[A-Fa-f0-9]{1,4}"
+         r"|(?:[A-Fa-f0-9]{1,4}:){1,7}:"
+         r"|(?:[A-Fa-f0-9]{1,4}:){1,6}:[A-Fa-f0-9]{1,4}"
+         r"|(?:[A-Fa-f0-9]{1,4}:){1,5}(?::[A-Fa-f0-9]{1,4}){1,2}"
+         r"|(?:[A-Fa-f0-9]{1,4}:){1,4}(?::[A-Fa-f0-9]{1,4}){1,3}"
+         r"|(?:[A-Fa-f0-9]{1,4}:){1,3}(?::[A-Fa-f0-9]{1,4}){1,4}"
+         r"|(?:[A-Fa-f0-9]{1,4}:){1,2}(?::[A-Fa-f0-9]{1,4}){1,5}"
+         r"|[A-Fa-f0-9]{1,4}:(?::[A-Fa-f0-9]{1,4}){1,6}"
+         r"|:(?:(?::[A-Fa-f0-9]{1,4}){1,7}|:)"
+         r")(?![\w:.])"), IP_TOKEN),
 
     # --- Phone numbers ---------------------------------------------------
     # International (+CC ...) and separated domestic forms with 7–15 digits.

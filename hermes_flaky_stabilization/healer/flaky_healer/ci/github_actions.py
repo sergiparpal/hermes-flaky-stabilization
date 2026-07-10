@@ -49,10 +49,15 @@ class GitHubActionsCI:
         self._token = token
         self._transport = transport or UrllibTransport()
         base = api_base.rstrip("/")
-        # Reject non-http(s) bases: the bearer token rides on this URL, so a
-        # file://, gopher:// etc. base must never receive it.
-        if urlparse(base).scheme.lower() not in ("http", "https"):
-            raise CIError(f"unsupported API base {api_base!r}: expected an http(s) URL")
+        # HTTPS-only: the bearer token rides on this URL, so a plain-http (or
+        # file://, gopher:// …) base would leak it in cleartext. GitHub.com and
+        # GitHub Enterprise both serve the API over https, so this costs no real
+        # setup. Matches the jira_client transport's https-only stance.
+        if urlparse(base).scheme.lower() != "https":
+            raise CIError(
+                f"unsupported API base {api_base!r}: expected an https:// URL "
+                "(the API bearer token must not travel over plain http)"
+            )
         self._base = base
 
     def _headers(self) -> dict:

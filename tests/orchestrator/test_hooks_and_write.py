@@ -133,6 +133,45 @@ def test_stabilize_escalates_when_config_read_fails(monkeypatch):
     assert directive["rule_key"] == "flaky_stab_stabilize_pipeline"
 
 
+def _write_unified_pipeline_cfg(home, **pipeline):
+    from hermes_flaky_stabilization import config as unified_config
+
+    unified_config.write_config({"pipeline": pipeline}, home / "flaky-stabilization")
+
+
+def test_stabilize_pr_via_config_default_escalates(_isolated_env):
+    """SECURITY (approval-gate bypass): a mode-less stabilize call resolves the
+    heal mode from pipeline.default_heal_mode, exactly as the pipeline does. With
+    the default set to 'pr' the run would open a PR, so the hook must escalate —
+    previously it inspected args['mode'] only and stayed silent (no approval)."""
+    _write_unified_pipeline_cfg(_isolated_env, default_heal_mode="pr")
+    directive = hooks.pre_tool_call(
+        tool_name="stabilize_test_failure",
+        args={"repo_dir": ".", "test_id": "t"},  # NOTE: no explicit mode
+    )
+    assert directive is not None and directive["action"] == "approve"
+    assert directive["rule_key"] == "flaky_stab_stabilize_pipeline"
+    assert "pull request" in directive["message"]
+
+
+def test_stabilize_suggest_config_default_stays_silent(_isolated_env):
+    # The safe default (suggest) with no write reachable escalates nothing.
+    _write_unified_pipeline_cfg(_isolated_env, default_heal_mode="suggest")
+    assert hooks.pre_tool_call(
+        tool_name="stabilize_test_failure",
+        args={"repo_dir": ".", "test_id": "t"},
+    ) is None
+
+
+def test_explicit_suggest_overrides_pr_config_default(_isolated_env):
+    # An explicit mode argument wins over the config default (both directions).
+    _write_unified_pipeline_cfg(_isolated_env, default_heal_mode="pr")
+    assert hooks.pre_tool_call(
+        tool_name="stabilize_test_failure",
+        args={"repo_dir": ".", "test_id": "t", "mode": "suggest"},
+    ) is None
+
+
 # --- PII gate (D6.4) -----------------------------------------------------------------
 
 

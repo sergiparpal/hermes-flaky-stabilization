@@ -74,6 +74,28 @@ _ZIP_READ_ERRORS = (
 )
 
 
+def _scrub_ci_secrets(text: str) -> str:
+    """Redact credentials from CI-log text before it reaches the model.
+
+    ``logfilter.filter_log`` is a failure-anchor prefilter, not a redactor, and
+    CI logs cluster secrets (``set -x``, env dumps, ``curl -H "Authorization:
+    …"``) exactly at/around the failures it keeps. The triage pipeline redacts
+    log excerpts at its chokepoint; the healer's ``fetch_ci_logs`` /
+    ``heal_flaky_test`` diagnosis paths must do the same rather than hand raw
+    secrets to the LLM. Prefer the shared triage-grade CI-log redactor; fall
+    back to the local token-shape scrub if it cannot be imported."""
+    if not text:
+        return text
+    try:
+        from ..triage.redact import redact as _redact_secrets
+    except Exception:  # pragma: no cover - flat/path-loaded import fallback
+        try:
+            from triage.redact import redact as _redact_secrets
+        except Exception:
+            return _TOKEN_VALUE_RE.sub("***", text)
+    return _redact_secrets(text)
+
+
 _STORE_CACHE: dict[str, HealerStore] = {}
 
 
@@ -191,7 +213,7 @@ def fetch_ci_logs(params, ctx=None, transport=None, **kwargs) -> str:
                 "html_url": run.get("html_url"),
             },
             "failed_jobs": failed_jobs,
-            "filtered_log": filtered.text,
+            "filtered_log": _scrub_ci_secrets(filtered.text),
             "bytes_raw": filtered.bytes_raw,
             "bytes_filtered": filtered.bytes_filtered,
             "anchor_count": filtered.anchor_count,
@@ -255,7 +277,7 @@ def _pull_ci_log(build_id: str, repo: str, transport) -> tuple[str | None, list[
     try:
         blob = adapter.download_logs_zip(repo, build_id)
         text = _logs_zip_to_text(blob)
-        return logfilter.filter_log(text).text, warnings
+        return _scrub_ci_secrets(logfilter.filter_log(text).text), warnings
     except (ci_base.CIError, *_ZIP_READ_ERRORS) as exc:
         warnings.append(f"could not fetch CI logs for run {build_id}: {exc}")
         return None, warnings

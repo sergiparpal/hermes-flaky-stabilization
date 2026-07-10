@@ -167,12 +167,17 @@ def connect(db_path: Path | str | None = None, *, uri: bool = False) -> sqlite3.
     """
     path = Path(db_path) if db_path is not None else state_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Own the file 0600 before SQLite opens it, so state.db (incidents, triage
+    # samples, healer audit — all sensitive) is never exposed at the umask.
+    paths.precreate_private(path)
     conn = sqlite3.connect(str(path), timeout=15, check_same_thread=False, uri=uri)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA journal_mode=WAL")
     except sqlite3.OperationalError:
         pass
-    paths.restrict_file(path)
     ensure_schema(conn)
+    # After schema init the WAL/-shm sidecars exist; lock the db and all sidecars
+    # to 0600 (restrict_file alone missed the sidecars).
+    paths.harden_db_files(path)
     return conn

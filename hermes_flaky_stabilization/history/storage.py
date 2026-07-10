@@ -50,7 +50,9 @@ def get_hermes_home() -> Path:
 
 def get_storage_dir() -> Path:
     storage_dir = get_hermes_home() / "test-history"
-    storage_dir.mkdir(parents=True, exist_ok=True)
+    # mode=0o700 on creation closes the mkdir(0755)→chmod window; 0o700 is
+    # umask-safe. The chmod below stays for an already-existing 0755 dir.
+    storage_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
     # The DB holds captured test output (stack traces / failure messages) that
     # can contain sensitive data; keep the directory owner-only so other local
     # users cannot read it (or the WAL/-shm sidecars). Best-effort: a filesystem
@@ -169,20 +171,31 @@ def get_connection() -> sqlite3.Connection:
         from .schema import apply_schema  # lazy import (hard-constraint #2)
 
         db_path = get_db_path()
+        # Own the file 0600 *before* SQLite opens it, closing the create-at-umask
+        # → chmod window during which captured test output would be exposed.
+        if str(db_path) != ":memory:" and not os.path.exists(db_path):
+            try:
+                fd = os.open(str(db_path), os.O_CREAT | os.O_WRONLY, 0o600)
+                os.close(fd)
+            except OSError:
+                pass
         conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        # Owner-only: the DB can hold sensitive captured test output. The 0o700
-        # directory is the primary guard (it also covers the -wal/-shm sidecars);
-        # this narrows the DB file itself too. Best-effort on non-POSIX mounts.
-        try:
-            os.chmod(db_path, 0o600)
-        except OSError:
-            pass
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA recursive_triggers = ON")
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA case_sensitive_like = ON")
         apply_schema(conn)
+        # Owner-only: the DB can hold sensitive captured test output. Harden the
+        # DB *and* its WAL/-shm/-journal sidecars — created by the first write in
+        # WAL mode, so this runs after apply_schema. Best-effort on non-POSIX.
+        for _suffix in ("", "-wal", "-shm", "-journal"):
+            _p = str(db_path) + _suffix
+            try:
+                if os.path.exists(_p):
+                    os.chmod(_p, 0o600)
+            except OSError:
+                pass
         _connection = conn
     return _connection
 

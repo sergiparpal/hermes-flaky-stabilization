@@ -438,7 +438,20 @@ class Pipeline:
                 notes.append("PII gate failed: scrub or drop the flagged evidence")
                 return OUTCOME_NEEDS_ATTENTION
         else:
-            results["pii"] = {"skipped": "gate disabled by config"}
+            # An explicit operator opt-out (require_pii_gate=false, default true)
+            # sends the ticket with no PII gate — exactly the decision that should
+            # be auditable, so surface it in notes and log a warning like the
+            # fail paths around it, rather than passing silently.
+            results["pii"] = {"skipped": "gate disabled by config",
+                              "require_pii_gate": False}
+            notes.append(
+                "PII gate DISABLED by config (require_pii_gate=false) — evidence "
+                "sent without a PII scan"
+            )
+            logger.warning(
+                "pipeline: PII gate disabled by config (require_pii_gate=false); "
+                "tracker evidence bypassed the PII scan"
+            )
 
         return self._tracker(report, evidence_paths, results, notes)
 

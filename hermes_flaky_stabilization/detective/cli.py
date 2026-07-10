@@ -301,9 +301,12 @@ def _cmd_install_cron(args) -> int:
     min_fails = _arg_or_cfg(args.min_fails, cfg, "min_fails", int)
 
     # Validate before persisting/installing anything, so a bad value is never
-    # written into config.json nor baked into the scheduled job.
+    # written into config.json nor baked into the scheduled job. The schedule is
+    # validated too: it is passed as a positional argv to `hermes cron create`,
+    # so a leading-dash value would be argument-injected as an option.
     try:
         domain.validate_tunables(window_days, min_fails)
+        domain.validate_cron_schedule(schedule)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

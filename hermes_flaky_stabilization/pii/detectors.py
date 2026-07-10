@@ -7,6 +7,20 @@ rules) cut false positives so a "clean" scan is trustworthy.
 Raw PII values live only inside this module: ``run_detectors`` returns
 ``Finding`` objects that carry a **masked** preview and never the raw value, so
 callers (the scanner, the tool result, logs) cannot leak personal data.
+
+Known, deliberate blind spots (a ``clean`` verdict is high-precision, not
+exhaustive — do not treat it as "no personal data whatsoever"):
+
+* **IP addresses** are not detected here. CI evidence is dense with service/
+  loopback IPs, so flagging them would fail the PII gate on most legitimate
+  evidence and push operators to disable the gate — a net loss. The *outbound*
+  redactor (:mod:`..pii.redaction`) does mask IPv4/IPv6 on the ticket path,
+  which is where the disclosure risk actually is.
+* **Personal names** are only caught behind an explicit label in free text
+  (``redaction.redact_incident``); free-form name detection needs an NLP model.
+* **Dot-separated phone numbers** (``415.555.0132``) are intentionally not
+  matched: ``.`` collides with versions/IPs/decimals far more than it helps
+  (see ``_PHONE_RE``). The redactor's phone pass is the wider net.
 """
 import re
 from collections.abc import Callable
@@ -127,7 +141,10 @@ def _card_ok(raw: str) -> bool:
 # long run of local-part characters with no '@' cannot trigger quadratic
 # backtracking — an unbounded `[...]+@` is O(n^2) on such input and hangs the
 # scan on ordinary blobs (base64url, JWTs, tokens all sit in the local class).
-_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,255}\.[A-Za-z]{2,24}")
+# The local class is `\w` (Unicode word chars — `str` patterns are Unicode by
+# default) plus the RFC specials, so an internationalized (EAI/IDN) local part
+# such as `josé@…` or `иван@…` is not silently treated as clean by the gate.
+_EMAIL_RE = re.compile(r"[\w.%+\-]{1,64}@[\w.\-]{1,255}\.[A-Za-z]{2,24}")
 _CARD_RE = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
 _IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]){11,30}\b")
 # Both the NIE prefix and the control letter accept either case; ``dni_nie_ok``

@@ -40,29 +40,49 @@ _TOKEN_PATTERNS = [
     ),
 ]
 
+# Credentials embedded in a URL / connection string: scheme://user:pass@host.
+# Only the password segment (between the ':' and the '@') is replaced; the
+# scheme, user, and host stay readable. The password class excludes '/' and '@'
+# so the match cannot run past the authority, and is length-bounded.
+_URL_CRED_PATTERN = re.compile(
+    r"(?P<pre>\b[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@]*:)(?P<pw>[^\s:/@]{1,256})(?P<at>@)"
+)
+
+
+def _url_cred_sub(m: re.Match) -> str:
+    return f"{m.group('pre')}{PLACEHOLDER}{m.group('at')}"
+
+
 # ``key = value`` / ``key: value`` assignments where the key names a secret.
 # Only the value is replaced; the key (and surrounding quotes, if any) are kept
 # so the line stays readable for triage. An explicit ':' or '=' separator is
 # required, so prose such as "token not found" (no separator) is left intact.
-# The value may be wrapped in matching single/double quotes — common in env
-# dumps and `set -x` output (``PASSWORD="secret"``) — which the value class
-# itself excludes, so they are matched explicitly via an optional quote whose
-# close is a backreference.
+#
+# The separator may absorb a closing quote on the key (``"password": …`` in
+# JSON/dict output), and the value is matched two ways:
+#   * quoted — capture everything up to the closing quote, so a multi-word
+#     secret (``password = "correct horse battery"``) is redacted whole;
+#   * unquoted — the whitespace/comma/semicolon-delimited token (>=4 chars).
+# Both branches are length-bounded so a hostile line cannot backtrack.
 _KV_PATTERN = re.compile(
     r"(?P<key>\b[\w.-]*?"
     r"(?:authorization|bearer|client[_-]?secret|private[_-]?key|access[_-]?key"
     r"|api[_-]?key|apikey|secret|password|passwd|pwd|token)\b)"
-    r"(?P<sep>\s*[:=]\s*)"
-    r"(?P<quote>[\"']?)"
+    r"(?P<sep>[\"']?\s*[:=]\s*)"
+    r"(?:"
+    r"(?P<q>[\"'])(?P<qval>(?:bearer\s+)?[^\"'\r\n]{1,4096})(?P=q)"
+    r"|"
     r"(?P<val>(?:bearer\s+)?[^\s\"',;]{4,})"
-    r"(?P=quote)",
+    r")",
     re.IGNORECASE,
 )
 
 
 def _kv_sub(m: re.Match) -> str:
-    quote = m.group("quote")
-    return f"{m.group('key')}{m.group('sep')}{quote}{PLACEHOLDER}{quote}"
+    if m.group("qval") is not None:
+        q = m.group("q")
+        return f"{m.group('key')}{m.group('sep')}{q}{PLACEHOLDER}{q}"
+    return f"{m.group('key')}{m.group('sep')}{PLACEHOLDER}"
 
 
 def redact(text: str) -> str:
@@ -72,6 +92,7 @@ def redact(text: str) -> str:
     out = text
     for pat in _TOKEN_PATTERNS:
         out = pat.sub(PLACEHOLDER, out)
+    out = _URL_CRED_PATTERN.sub(_url_cred_sub, out)
     out = _KV_PATTERN.sub(_kv_sub, out)
     return out
 

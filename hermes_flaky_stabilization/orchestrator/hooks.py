@@ -43,6 +43,34 @@ RULE_KEY_TRACKER_WRITE = "flaky_stab_tracker_write"
 RULE_KEY_STABILIZE = "flaky_stab_stabilize_pipeline"
 
 
+def _pipeline_heal_mode(args: dict | None) -> str:
+    """The heal mode a stabilize run will *actually* use.
+
+    Resolved exactly as ``Pipeline._heal_branch`` does — the explicit ``mode``
+    argument, else the configured ``pipeline.default_heal_mode``, else
+    ``"suggest"`` — so the escalation decision matches the run's real behaviour.
+    Without this the hook only saw ``args["mode"]`` and a config default of
+    ``"pr"`` would open a PR with no approval prompt (the pipeline calls the
+    heal stage as a plain function, so no per-tool escalation fires either).
+    A config-read failure fails closed (treated as ``"pr"``), mirroring
+    :func:`_jira_write_live`.
+    """
+    mode = str((args or {}).get("mode") or "").strip().lower()
+    if mode:
+        return mode
+    try:
+        from .. import config as unified_config
+
+        pipeline_cfg = unified_config.load_config().get("pipeline") or {}
+        return str(pipeline_cfg.get("default_heal_mode") or "suggest").strip().lower()
+    except Exception:
+        logger.warning(
+            "unified config read failed in pre_tool_call; treating stabilize "
+            "heal mode as 'pr' (fail closed)", exc_info=True,
+        )
+        return "pr"
+
+
 def _jira_write_live() -> bool:
     """True when a pipeline run could reach the live Jira tracker.
 
@@ -94,7 +122,7 @@ def pre_tool_call(tool_name: str = "", args: dict | None = None, **kwargs):
         # fire inside a pipeline run — this rule is the D6.3 gate for the
         # whole run whenever it could produce an external write.
         reasons = []
-        mode = str((args or {}).get("mode") or "").strip().lower()
+        mode = _pipeline_heal_mode(args)
         if mode == "pr":
             reasons.append("open a pull request for a healed test (mode='pr')")
         if _jira_write_live():

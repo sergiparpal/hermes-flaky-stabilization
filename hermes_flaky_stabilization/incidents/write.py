@@ -101,15 +101,29 @@ def create_incident(client, cfg, ticket: dict[str, Any]) -> dict[str, Any]:
     return {"created": True, "key": key, "url": url}
 
 
+def _egress_clean(text: str) -> str:
+    """redact_text then the scanner's mask_pii egress canary (D6.4b).
+
+    ``redact_text`` misses PII classes the plugin's own scanner detects
+    (validated cards/IBANs, space-separated SSNs, …). The pipeline's tracker
+    stage runs this same second pass; the direct ``jira_create_incident`` tool
+    must not be the weaker path, so it runs it here too. ``mask_pii`` never
+    raises on the model-facing path.
+    """
+    from ..pii.scanner import mask_pii
+
+    return mask_pii(redaction.redact_text(text))
+
+
 def build_ticket(args: dict[str, Any], jira_section: dict[str, Any]) -> dict[str, Any]:
     """Assemble the outbound ticket with every text field redacted (D6.4b)."""
-    title = redaction.redact_text(str(args.get("title") or "").strip())
-    body = redaction.redact_text(str(args.get("body") or "").strip())
+    title = _egress_clean(str(args.get("title") or "").strip())
+    body = _egress_clean(str(args.get("body") or "").strip())
     severity = str(args.get("severity") or "").strip()
     if severity:
-        body = f"{body}\n\nSeverity: {redaction.redact_text(severity)}"
+        body = f"{body}\n\nSeverity: {_egress_clean(severity)}"
     labels = [
-        redaction.redact_text(str(label)) for label in (args.get("labels") or [])
+        _egress_clean(str(label)) for label in (args.get("labels") or [])
         if str(label).strip()
     ]
     return {

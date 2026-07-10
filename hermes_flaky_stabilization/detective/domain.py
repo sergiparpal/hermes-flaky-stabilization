@@ -88,6 +88,51 @@ def validate_tunables(window_days: int, min_fails: int) -> None:
         raise ValueError("; ".join(problems))
 
 
+_CRON_MACROS = frozenset({
+    "@yearly", "@annually", "@monthly", "@weekly", "@daily",
+    "@midnight", "@hourly", "@reboot",
+})
+# A cron field is digits, the operators * / , - and (optionally) month/day names.
+# Deliberately no whitespace and no shell metacharacters.
+_CRON_FIELD_ALLOWED = frozenset(
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz*/,-"
+)
+
+
+def validate_cron_schedule(schedule: str) -> None:
+    """Reject a schedule that is not a plausible cron expression.
+
+    ``install-cron`` passes the schedule as a single *positional* argument to
+    ``hermes cron create``; a value beginning with ``-`` would be parsed as an
+    option by that CLI (argument injection), and a real cron field never contains
+    whitespace-within-a-field or shell metacharacters. Accepts the standard 5- or
+    6-field form and the ``@macro`` shorthands. Kept regex-free so this module
+    stays import-free (it is referenced at Hermes startup). Raises
+    :class:`ValueError`.
+    """
+    s = (schedule or "").strip()
+    if not s:
+        raise ValueError("cron schedule is empty")
+    if s.lower() in _CRON_MACROS:
+        return
+    if s.startswith("-"):
+        raise ValueError(
+            f"invalid cron schedule {schedule!r}: must not start with '-' "
+            "(it would be parsed as a command-line option)"
+        )
+    fields = s.split()
+    if len(fields) not in (5, 6):
+        raise ValueError(
+            f"invalid cron schedule {schedule!r}: expected 5 or 6 fields "
+            f"or an @macro, got {len(fields)}"
+        )
+    for field in fields:
+        if not set(field) <= _CRON_FIELD_ALLOWED:
+            raise ValueError(
+                f"invalid character in cron field {field!r} of schedule {schedule!r}"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Test identity
 # ---------------------------------------------------------------------------

@@ -297,7 +297,8 @@ def _fetch_remote(url: str, *, timeout: float = DEFAULT_TIMEOUT) -> tuple[str, b
     """:func:`fetch_remote`, also reporting whether the body was tail-truncated."""
     if not (url or "").strip().lower().startswith("https://"):
         raise LogFetchError(
-            f"Refusing non-HTTPS URL: {url}",
+            # scheme+host only — the full URL may carry a token/id in its query.
+            f"Refusing non-HTTPS URL: {safehttp.safe_url(url)}",
             "Use an https:// URL — plain http and other schemes are not "
             "allowed.",
         )
