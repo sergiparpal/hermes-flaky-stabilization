@@ -126,3 +126,33 @@ flaky-stabilization` (printing the copy-paste command when the CLI/gateway is un
 shim runs `hermes flaky-stab scan --format cron` (detective sweep; changes-only output; empty
 stdout = silent tick). Optionally the same subcommand can install a second job for Jira sync
 (`--with-jira-sync`, runs `hermes flaky-stab jira sync --quiet`).
+
+## Security-audit follow-up decisions (2026-07-10)
+
+Resolving [issue #1] — two judgment calls deferred from the audit hardening in
+`ec1bd84`. Both are resolved **option (a): leave as-is**. Recorded here so the choice reads as a
+conscious trade-off rather than an oversight in a future review.
+
+**S1 — No IP-address (or personal-name) detector in the PII gate.** The gate (`pii/detectors.py`,
+run over evidence files by `orchestrator/gate.py`) intentionally does not flag IP addresses.
+Rationale: CI evidence is dense with service/loopback IPs, so an IP detector would fail the gate on
+most legitimate evidence and push operators to disable it (`require_pii_gate: false`) — a net loss
+of protection. The actual disclosure surface is the **outbound** ticket, and the outbound redactor
+(`pii/redaction.py`) masks IPv4 and IPv6 (added in `ec1bd84`). Personal-name detection in free text
+needs an NLP model and is out of scope; structured name fields are still redacted wholesale, and
+labelled names in prose are caught by the redactor. These deliberate blind spots are documented in
+the `pii/detectors.py` module docstring so a `clean` verdict is not read as "no personal data
+whatsoever." Revisit only if a concrete need appears; the preferred stricter option would be
+public-IP-only detection (reusing `triage/safehttp.py`'s range logic), never a blanket IP match.
+
+**S2 — Healer GitHub API transport is HTTPS-only, without private-IP SSRF blocking.** `ec1bd84`
+made the healer's GitHub API base HTTPS-only (matching `jira_client`), which closes the material
+risk — the bearer token traveling in cleartext over a plain-`http` base. The transport
+(`healer/flaky_healer/ci/base.py`) is deliberately **not** given `safehttp.py`'s private-IP
+blocklist: GitHub **Enterprise** legitimately resolves to internal/RFC1918 addresses, so blocking
+private ranges would break every GHE deployment — the primary reason a team sets
+`FLAKY_HEALER_GITHUB_API`. The base is operator-config (an env var), not remote-attacker input, so
+the residual SSRF risk is low. If defense-in-depth here is ever wanted, the correct form is routing
+through `safehttp`'s guarded opener with RFC1918 **allowed** (keeping the loopback/link-local/
+cloud-metadata blocks and connect-time IP pinning), so GHE keeps working while
+`169.254.169.254`/loopback targets are still refused.

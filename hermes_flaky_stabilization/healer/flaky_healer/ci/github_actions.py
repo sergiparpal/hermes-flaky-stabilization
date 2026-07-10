@@ -53,6 +53,10 @@ class GitHubActionsCI:
         # file://, gopher:// …) base would leak it in cleartext. GitHub.com and
         # GitHub Enterprise both serve the API over https, so this costs no real
         # setup. Matches the jira_client transport's https-only stance.
+        # NOTE (decision S2, docs/DECISIONS.md): this transport intentionally has
+        # no private-IP SSRF blocklist like triage/safehttp.py — GitHub
+        # Enterprise resolves to internal/RFC1918 addresses, so blocking those
+        # would break GHE. The base is operator-config, not remote input.
         if urlparse(base).scheme.lower() != "https":
             raise CIError(
                 f"unsupported API base {api_base!r}: expected an https:// URL "
