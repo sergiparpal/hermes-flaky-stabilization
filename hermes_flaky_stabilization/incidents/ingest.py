@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -161,7 +162,6 @@ def map_issue(issue: dict[str, Any], root_cause_field: str | None = None) -> dic
     key = issue.get("key") or ""
     fields = issue.get("fields") or {}
 
-    status = ""
     status_field = fields.get("status")
     if isinstance(status_field, dict):
         status = status_field.get("name", "") or ""
@@ -317,6 +317,200 @@ def _is_client_error(exc: Exception) -> bool:
     return isinstance(status, int) and 400 <= status < 500
 
 
+@dataclass
+class _ResumeState:
+    """Where a sync run starts: which query, which page, what it already knew.
+
+    ``in_incremental`` is the mode switch. It is resolved once, here, rather
+    than re-derived at each decision point — the paging loop and the two
+    persistence tails all branch on this single field.
+    """
+
+    effective_jql: str
+    next_token: str | None
+    token_meta: str
+    pending_newest: str | None
+    in_incremental: bool
+    watermark: str | None
+    backfill_done: bool
+
+
+@dataclass
+class _PageSweep:
+    """What one :func:`_sweep_pages` call actually fetched.
+
+    ``exhausted`` means the result set ran out (no issues, or no next token) as
+    opposed to stopping at ``max_pages`` — the distinction that decides whether
+    the watermark may advance.
+    """
+
+    ingested: int = 0
+    pages: int = 0
+    newest: str | None = None
+    next_token: str | None = None
+    exhausted: bool = False
+    seen_keys: set[str] = field(default_factory=set)
+
+
+def _clear_tokens_if_query_changed(store: Any, jql: str) -> None:
+    """Drop persisted resume tokens when *jql* differs from the last sync's.
+
+    Resume tokens are query-bound; an edited ``jira.jql`` would otherwise make
+    every future run 400-fail on a dead token forever.
+    """
+    stored_jql = store.get_meta(_META_JQL) or ""
+    if stored_jql and stored_jql != jql:
+        if store.get_meta(_META_BACKFILL_TOKEN) or store.get_meta(_META_SYNC_TOKEN):
+            logger.warning(
+                "jira.jql changed since the last sync; clearing persisted "
+                "resume tokens and restarting pagination from the first page")
+        store.set_meta(_META_BACKFILL_TOKEN, "")
+        store.set_meta(_META_SYNC_TOKEN, "")
+        store.set_meta(_META_SYNC_NEWEST, "")
+    store.set_meta(_META_JQL, jql)
+
+
+def _resolve_resume_state(store: Any, jql: str, incremental: bool) -> _ResumeState:
+    """Decide which phase this run is in and where in the result set it resumes."""
+    watermark = store.get_watermark() if incremental else None
+    # Keyed solely on the explicit flag: a partial backfill also advances the
+    # watermark (to retain the global-newest timestamp across runs), so the
+    # watermark's presence must NOT by itself imply the backfill is complete.
+    backfill_done = store.get_meta(_META_BACKFILL_DONE) == "1"
+    in_incremental = incremental and backfill_done
+
+    if in_incremental:
+        # Resume a previously truncated incremental run from its token; the
+        # watermark filter is identical because the watermark did not advance.
+        return _ResumeState(
+            effective_jql=apply_watermark(jql, watermark),
+            next_token=store.get_meta(_META_SYNC_TOKEN) or None,
+            token_meta=_META_SYNC_TOKEN,
+            pending_newest=store.get_meta(_META_SYNC_NEWEST) or None,
+            in_incremental=True,
+            watermark=watermark,
+            backfill_done=backfill_done,
+        )
+    # Initial / resuming backfill: no watermark filter; resume from token.
+    return _ResumeState(
+        effective_jql=jql,
+        next_token=store.get_meta(_META_BACKFILL_TOKEN) or None,
+        token_meta=_META_BACKFILL_TOKEN,
+        pending_newest=None,
+        in_incremental=False,
+        watermark=watermark,
+        backfill_done=backfill_done,
+    )
+
+
+def _sweep_pages(
+    store: Any,
+    client: Any,
+    resume: _ResumeState,
+    *,
+    fields: list[str] | None,
+    root_cause_field: str | None,
+    page_size: int,
+    max_pages: int,
+) -> _PageSweep:
+    """Page through Jira from *resume* until exhaustion or ``max_pages``."""
+    sweep = _PageSweep(newest=resume.watermark, next_token=resume.next_token)
+    if resume.pending_newest and (sweep.newest is None or resume.pending_newest > sweep.newest):
+        sweep.newest = resume.pending_newest
+
+    resumed_from_persisted_token = sweep.next_token is not None
+
+    while sweep.pages < max_pages:
+        try:
+            resp = client.search(
+                resume.effective_jql, fields=fields, max_results=page_size,
+                next_page_token=sweep.next_token,
+            )
+        except Exception as e:
+            if resumed_from_persisted_token and sweep.pages == 0 and _is_client_error(e):
+                # The persisted resume token went stale (Jira expires them, and
+                # server-side query changes invalidate them). Clear it and
+                # restart this phase from the first page — otherwise every
+                # future run re-reads the same dead token and 400-fails before
+                # persisting anything.
+                logger.warning(
+                    "persisted Jira resume token rejected (%s); clearing it "
+                    "and restarting from the first page", e)
+                store.set_meta(resume.token_meta, "")
+                sweep.next_token = None
+                resumed_from_persisted_token = False
+                continue
+            raise
+        issues = resp.get("issues", []) if isinstance(resp, dict) else []
+        if not issues:
+            sweep.exhausted = True
+            break
+        mapped: list[dict[str, Any]] = []
+        for issue in issues:
+            try:
+                mapped.append(map_issue(issue, root_cause_field))
+            except Exception as e:
+                logger.debug("skipping unmappable issue: %s", e)
+        # upsert_many returns the count of rows that were actually new or
+        # changed (unchanged re-fetches are skipped), so "ingested" reflects
+        # real index change — not the boundary issues every incremental sync
+        # re-fetches and re-upserts idempotently.
+        sweep.ingested += store.upsert_many(mapped)
+        sweep.seen_keys.update(row["key"] for row in mapped if row.get("key"))
+        sweep.pages += 1
+
+        page_newest = _max_updated(mapped)
+        if page_newest and (sweep.newest is None or page_newest > sweep.newest):
+            sweep.newest = page_newest
+
+        sweep.next_token = resp.get("nextPageToken") if isinstance(resp, dict) else None
+        if not sweep.next_token:
+            sweep.exhausted = True
+            break
+    return sweep
+
+
+def _persist_incremental_progress(store: Any, sweep: _PageSweep, max_pages: int) -> None:
+    """Advance the watermark only if the run saw everything down to the old one.
+
+    Results arrive newest-first, so a run truncated at ``max_pages`` that moved
+    the watermark would skip its unfetched tail forever. Such a run persists its
+    resume token and the newest ``updated`` seen instead, and the next run picks
+    up from there under the same watermark filter.
+    """
+    if sweep.exhausted:
+        if sweep.newest:
+            store.set_watermark(sweep.newest)
+        store.set_meta(_META_SYNC_TOKEN, "")
+        store.set_meta(_META_SYNC_NEWEST, "")
+        return
+    store.set_meta(_META_SYNC_TOKEN, sweep.next_token or "")
+    store.set_meta(_META_SYNC_NEWEST, sweep.newest or "")
+    logger.info(
+        "incremental sync paused after %d page(s) (max_pages=%d); "
+        "watermark held back, will resume next sync", sweep.pages, max_pages,
+    )
+
+
+def _persist_backfill_progress(store: Any, sweep: _PageSweep, max_pages: int) -> None:
+    """Record backfill progress; mark the phase done only on full exhaustion.
+
+    Advancing the watermark early is safe here because it is not used for
+    filtering until the backfill is marked done.
+    """
+    if sweep.newest:
+        store.set_watermark(sweep.newest)
+    if sweep.exhausted:
+        store.set_meta(_META_BACKFILL_DONE, "1")
+        store.set_meta(_META_BACKFILL_TOKEN, "")
+        return
+    store.set_meta(_META_BACKFILL_TOKEN, sweep.next_token or "")
+    logger.info(
+        "backfill paused after %d page(s) (max_pages=%d); will resume "
+        "next sync", sweep.pages, max_pages,
+    )
+
+
 def run_sync(
     store: Any,
     client: Any,
@@ -363,135 +557,22 @@ def run_sync(
     to the caller (the provider's background thread, which logs and continues).
     """
     jql = (jql or "").strip()
-
-    # An edited jira.jql invalidates any persisted resume token (they are
-    # query-bound); clear them so the next phase restarts from page one instead
-    # of 400-failing on a dead token forever.
-    stored_jql = store.get_meta(_META_JQL) or ""
-    if stored_jql and stored_jql != jql:
-        if store.get_meta(_META_BACKFILL_TOKEN) or store.get_meta(_META_SYNC_TOKEN):
-            logger.warning(
-                "jira.jql changed since the last sync; clearing persisted "
-                "resume tokens and restarting pagination from the first page")
-        store.set_meta(_META_BACKFILL_TOKEN, "")
-        store.set_meta(_META_SYNC_TOKEN, "")
-        store.set_meta(_META_SYNC_NEWEST, "")
-    store.set_meta(_META_JQL, jql)
-
-    watermark = store.get_watermark() if incremental else None
-    # Keyed solely on the explicit flag: a partial backfill also advances the
-    # watermark (to retain the global-newest timestamp across runs), so the
-    # watermark's presence must NOT by itself imply the backfill is complete.
-    backfill_done = store.get_meta(_META_BACKFILL_DONE) == "1"
-    in_incremental = incremental and backfill_done
-
-    if in_incremental:
-        effective_jql = apply_watermark(jql, watermark)
-        # Resume a previously truncated incremental run from its token; the
-        # watermark filter is identical because the watermark did not advance.
-        next_token: str | None = store.get_meta(_META_SYNC_TOKEN) or None
-        token_meta = _META_SYNC_TOKEN
-        pending_newest = store.get_meta(_META_SYNC_NEWEST) or None
+    _clear_tokens_if_query_changed(store, jql)
+    resume = _resolve_resume_state(store, jql, incremental)
+    sweep = _sweep_pages(
+        store, client, resume,
+        fields=fields, root_cause_field=root_cause_field,
+        page_size=page_size, max_pages=max_pages,
+    )
+    if resume.in_incremental:
+        _persist_incremental_progress(store, sweep, max_pages)
     else:
-        # Initial / resuming backfill: no watermark filter; resume from token.
-        effective_jql = jql
-        next_token = store.get_meta(_META_BACKFILL_TOKEN) or None
-        token_meta = _META_BACKFILL_TOKEN
-        pending_newest = None
-
-    resumed_from_persisted_token = next_token is not None
-
-    ingested = 0
-    pages = 0
-    newest = watermark
-    if pending_newest and (newest is None or pending_newest > newest):
-        newest = pending_newest
-    exhausted = False
-    seen_keys: set[str] = set()
-
-    while pages < max_pages:
-        try:
-            resp = client.search(
-                effective_jql, fields=fields, max_results=page_size,
-                next_page_token=next_token,
-            )
-        except Exception as e:
-            if resumed_from_persisted_token and pages == 0 and _is_client_error(e):
-                # The persisted resume token went stale (Jira expires them, and
-                # server-side query changes invalidate them). Clear it and
-                # restart this phase from the first page — otherwise every
-                # future run re-reads the same dead token and 400-fails before
-                # persisting anything.
-                logger.warning(
-                    "persisted Jira resume token rejected (%s); clearing it "
-                    "and restarting from the first page", e)
-                store.set_meta(token_meta, "")
-                next_token = None
-                resumed_from_persisted_token = False
-                continue
-            raise
-        issues = resp.get("issues", []) if isinstance(resp, dict) else []
-        if not issues:
-            exhausted = True
-            break
-        mapped: list[dict[str, Any]] = []
-        for issue in issues:
-            try:
-                mapped.append(map_issue(issue, root_cause_field))
-            except Exception as e:
-                logger.debug("skipping unmappable issue: %s", e)
-        # upsert_many returns the count of rows that were actually new or
-        # changed (unchanged re-fetches are skipped), so "ingested" reflects
-        # real index change — not the boundary issues every incremental sync
-        # re-fetches and re-upserts idempotently.
-        ingested += store.upsert_many(mapped)
-        seen_keys.update(row["key"] for row in mapped if row.get("key"))
-        pages += 1
-
-        page_newest = _max_updated(mapped)
-        if page_newest and (newest is None or page_newest > newest):
-            newest = page_newest
-
-        next_token = resp.get("nextPageToken") if isinstance(resp, dict) else None
-        if not next_token:
-            exhausted = True
-            break
-
-    if in_incremental:
-        # Only advance the watermark once the run has seen everything down to
-        # the old watermark; a truncated run persists its resume state instead.
-        if exhausted:
-            if newest:
-                store.set_watermark(newest)
-            store.set_meta(_META_SYNC_TOKEN, "")
-            store.set_meta(_META_SYNC_NEWEST, "")
-        else:
-            store.set_meta(_META_SYNC_TOKEN, next_token or "")
-            store.set_meta(_META_SYNC_NEWEST, newest or "")
-            logger.info(
-                "incremental sync paused after %d page(s) (max_pages=%d); "
-                "watermark held back, will resume next sync", pages, max_pages,
-            )
-    else:
-        # Backfill: advancing the watermark early is safe because the watermark
-        # is not used for filtering until the backfill is marked done.
-        if newest:
-            store.set_watermark(newest)
-        # Persist backfill progress so the next run resumes where this stopped.
-        if exhausted:
-            store.set_meta(_META_BACKFILL_DONE, "1")
-            store.set_meta(_META_BACKFILL_TOKEN, "")
-        else:
-            store.set_meta(_META_BACKFILL_TOKEN, next_token or "")
-            logger.info(
-                "backfill paused after %d page(s) (max_pages=%d); will resume "
-                "next sync", pages, max_pages,
-            )
+        _persist_backfill_progress(store, sweep, max_pages)
 
     return {
-        "ingested": ingested,
-        "pages": pages,
-        "watermark": newest,
-        "backfill_complete": backfill_done or exhausted,
-        "seen_keys": seen_keys,
+        "ingested": sweep.ingested,
+        "pages": sweep.pages,
+        "watermark": sweep.newest,
+        "backfill_complete": resume.backfill_done or sweep.exhausted,
+        "seen_keys": sweep.seen_keys,
     }

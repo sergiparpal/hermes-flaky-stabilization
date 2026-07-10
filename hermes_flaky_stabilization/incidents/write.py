@@ -79,11 +79,11 @@ def _adf(text: str) -> dict[str, Any]:
     }
 
 
-def create_incident(client, cfg, ticket: dict[str, Any]) -> dict[str, Any]:
+def create_incident(client, ticket: dict[str, Any]) -> dict[str, Any]:
     """POST the (already gated/redacted) *ticket* via *client*.
 
-    ``cfg`` is an :class:`~.config.IncidentsConfig`-shaped object plus the
-    unified ``jira`` section values (``project_key``, ``issue_type``). Returns
+    ``project_key`` and ``issue_type`` come from the *ticket* that
+    :func:`build_ticket` assembled, not from the config. Returns
     ``{"created": True, "key", "url"}``; raises on transport errors (the
     handler shapes those into envelopes that never echo the body).
     """
@@ -194,7 +194,7 @@ def handle_create_incident(args: dict[str, Any], **kwargs: Any) -> str:
 
     try:
         client = config_mod.build_client(incidents_config, token=token)
-        result = create_incident(client, incidents_config, ticket)
+        result = create_incident(client, ticket)
     except Exception as exc:
         # Never echo the request body or the raw response; the client already
         # strips response bodies from its errors.
