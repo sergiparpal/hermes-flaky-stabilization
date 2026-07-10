@@ -37,18 +37,43 @@ class GateResult:
         }
 
 
-def assert_evidence_clean(paths: list[str] | None) -> GateResult:
+def _configured_max_files() -> int | None:
+    """The unified config's ``pii.default_max_files``, sanitised for the scan.
+
+    Read via ``config.load_config`` (no dedicated env var exists for this key,
+    so the file value — merged over DEFAULTS — is authoritative). ``None``
+    (scanner default) when unset or unusable; clamped to the scanner's hard
+    ceiling so a generous config value cannot turn every scan into a
+    validation error (which would fail the gate on clean evidence).
+    """
+    try:
+        from .. import config as unified_config
+
+        value = (unified_config.load_config().get("pii") or {}).get("default_max_files")
+    except Exception:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return min(value, scanner.MAX_MAX_FILES)
+
+
+def assert_evidence_clean(paths: list[str] | None,
+                          max_files: int | None = None) -> GateResult:
     """Scan every path; the gate passes only when ALL are clean AND complete.
 
     No paths means nothing to gate (ok=True with an empty report) — the caller
     decides whether evidence is mandatory. A scan error fails the gate closed.
+    ``max_files`` defaults to the unified config's ``pii.default_max_files``
+    (the scanner's own default when that is unset).
     """
     result = GateResult(ok=True)
+    if max_files is None and paths:
+        max_files = _configured_max_files()
     for raw in paths or []:
         path = str(raw)
         result.checked_paths.append(path)
         try:
-            scan_result = scanner.scan(path, None, None)
+            scan_result = scanner.scan(path, None, max_files)
         except Exception as exc:  # fail closed — an unscannable path is unsafe
             result.ok = False
             result.errors.append(f"{path}: scan failed ({type(exc).__name__})")

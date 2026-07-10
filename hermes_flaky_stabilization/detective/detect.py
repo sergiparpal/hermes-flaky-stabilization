@@ -30,8 +30,9 @@ from . import domain
 class Verdict:
     """One test's classification over the detection window.
 
-    Field set mirrors the ``flaky_verdicts`` table columns (see ``schema.py``) so
-    storage can persist a verdict without an impedance-mismatch translation.
+    Field set mirrors the ``flaky_verdicts`` table columns (the unified DDL in
+    ``storage/state.py``) so storage can persist a verdict without an
+    impedance-mismatch translation.
     """
 
     test_key: str

@@ -22,10 +22,21 @@ import subprocess
 import time
 from pathlib import Path
 
+try:  # POSIX-only; imported at module level so the forked child (see
+    import resource  # _rlimits) only does a sys.modules lookup — importing
+except ImportError:  # between fork and exec in a multi-threaded parent
+    resource = None  # (map_runs uses a thread pool) is a deadlock hazard.
+
 from .. import config
-from .base import PLAYWRIGHT_ARGS, RunResult, execute_phase, tail
+from .base import PLAYWRIGHT_ARGS, RunResult, SandboxError, execute_phase, tail
 
 _NPROC_TARGET = 4096
+
+# Post-kill drain budget: after SIGKILLing the session we still communicate()
+# to collect output, but a test-spawned daemon that setsid'd away while
+# inheriting the stdout pipe would keep the pipe open forever — never block
+# the heal on it for more than this.
+_KILL_COMMUNICATE_TIMEOUT_S = 10
 
 
 @functools.lru_cache(maxsize=1)
@@ -62,8 +73,10 @@ def _netns_prefix() -> tuple[str, ...]:
 
 
 def _rlimits() -> None:  # pragma: no cover - runs in the child process
-    import resource
-
+    # Runs between fork and exec: no imports here (module-level `resource`
+    # above is only a globals lookup) and nothing beyond the rlimit calls.
+    if resource is None:
+        return
     try:
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     except (ValueError, OSError):
@@ -111,13 +124,13 @@ class SubprocessSandbox:
                 start_new_session=True,
             )
         except (FileNotFoundError, OSError) as exc:
-            # npx absent or not launchable: report a failed run rather than crash
-            # the heal (the burn-in will simply read this as not-green).
-            return RunResult(
-                exit_code=-1,
-                duration_s=time.monotonic() - start,
-                stdout_tail=f"failed to launch 'npx': {exc}",
-            )
+            # npx absent or not launchable is an INFRASTRUCTURE failure, not a
+            # test failure: reporting it as a RunResult would fabricate
+            # "reproduced" verdicts and unfairly charge recipes. Abort the heal.
+            raise SandboxError(
+                f"subprocess sandbox infrastructure failure: cannot launch 'npx' "
+                f"(is Node.js installed and on PATH?): {exc}"
+            ) from exc
         try:
             out, _ = proc.communicate(timeout=timeout_s)
             return RunResult(
@@ -131,7 +144,21 @@ class SubprocessSandbox:
                 os.killpg(proc.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
                 proc.kill()
-            out, _ = proc.communicate()
+            try:
+                out, _ = proc.communicate(timeout=_KILL_COMMUNICATE_TIMEOUT_S)
+            except subprocess.TimeoutExpired as exc:
+                # A daemon escaped the killed session but inherited our stdout
+                # pipe: draining would block forever. Close the pipes and return
+                # the timed-out result with whatever output was collected.
+                out = exc.stdout or ""
+                if isinstance(out, bytes):
+                    out = out.decode("utf-8", "replace")
+                for stream in (proc.stdout, proc.stderr, proc.stdin):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
             return RunResult(
                 exit_code=-1,
                 duration_s=time.monotonic() - start,

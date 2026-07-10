@@ -9,12 +9,19 @@
                                                   ``relaxed_key`` backfill here)
 * ``<home>/hermes-jira-incidents.db``           → ``incidents`` (+FTS), ``links``, ``meta``
 
-Sources are attached read-only (``mode=ro`` URI, ``immutable`` fallback off)
-and **never modified** — rollback is trivial because nothing moves. Rows copy
-via ``INSERT OR IGNORE … SELECT`` so pre-existing unified rows are never
-clobbered. Idempotency is anchored on provenance: each completed source writes
-a ``meta`` row ``migrated_from_<name> = <path> @ <iso-ts> rows=<n>`` and is
-skipped on re-runs, so running migrate twice adds nothing.
+Sources are attached strictly read-only (``mode=ro`` URI on a connection
+opened with ``uri=True``, plus ``PRAGMA legacy.query_only``) and **never
+modified** — rollback is trivial because nothing moves. If the read-only
+attach is rejected, migration ABORTS with :class:`MigrationError` rather
+than fall back to a writable attach (which could checkpoint a WAL-mode
+source on detach). Rows copy via ``INSERT OR IGNORE … SELECT`` so
+pre-existing unified rows are never clobbered; surrogate autoincrement
+``id`` columns are deliberately *not* copied (fresh rowids are assigned),
+so legacy rows can never collide with — and be silently dropped against —
+rows the unified DB wrote before migration. Idempotency is anchored on
+provenance, not PK dedupe: each completed source writes a ``meta`` row
+``migrated_from_<name> = <path> @ <iso-ts> rows=<n>`` and is skipped on
+re-runs, so running migrate twice adds nothing.
 
 ``history.db`` needs no migration by design — unchanged path and schema (D2).
 """
@@ -30,6 +37,12 @@ from pathlib import Path
 
 from .. import paths
 from . import state
+
+
+class MigrationError(RuntimeError):
+    """Raised when the migration cannot proceed safely (e.g. a legacy source
+    cannot be attached read-only) — aborting beats degrading, because the
+    "originals untouched → trivial rollback" promise (D4) must hold."""
 
 
 @dataclass
@@ -55,16 +68,40 @@ def default_sources(home: Path) -> dict[str, Path]:
 
 
 def _attach_ro(conn: sqlite3.Connection, path: Path) -> None:
-    """Attach *path* strictly read-only (the source must never be modified)."""
+    """Attach *path* strictly read-only (the source must never be modified).
+
+    *conn* must be opened with ``uri=True`` (see :func:`migrate`) so the
+    ``mode=ro`` URI is honored. If the read-only attach is rejected anyway
+    (e.g. an SQLite build without URI filename support), ABORT: a plain
+    fallback would attach READ-WRITE, and detaching a WAL-mode legacy DB
+    with a non-empty ``-wal`` would then checkpoint — i.e. mutate — the
+    source file, breaking the trivial-rollback promise (D4).
+    """
     uri = f"file:{path}?mode=ro"
     try:
         conn.execute("ATTACH DATABASE ? AS legacy", (uri,))
-        return
+    except sqlite3.OperationalError as exc:
+        raise MigrationError(
+            f"cannot attach legacy DB read-only ({path}): {exc}. Refusing the "
+            "read-write fallback — sources must stay untouched. (Is this "
+            "SQLite built without URI filename support?)"
+        ) from exc
+    # Belt and braces: PROVE the attach is read-only with a no-op header
+    # write (re-set user_version to its current value). On an honored
+    # mode=ro SQLite refuses before touching the file; if the write is
+    # accepted the attach is secretly read-write — abort. (query_only would
+    # be the obvious guard, but it is connection-wide and would also block
+    # the INSERTs into the state.db target tables.)
+    try:
+        version = int(conn.execute("PRAGMA legacy.user_version").fetchone()[0])
+        conn.execute(f"PRAGMA legacy.user_version = {version}")
     except sqlite3.OperationalError:
-        pass
-    # Older SQLite builds may not accept URI filenames in ATTACH parameters;
-    # plain attach still only ever READS legacy.* below.
-    conn.execute("ATTACH DATABASE ? AS legacy", (str(path),))
+        return  # read-only confirmed
+    _detach(conn)
+    raise MigrationError(
+        f"legacy DB attached writable despite mode=ro ({path}); aborting — "
+        "sources must stay untouched."
+    )
 
 
 def _detach(conn: sqlite3.Connection) -> None:
@@ -98,6 +135,15 @@ def _copy_select(conn: sqlite3.Connection, target: str, columns: list[str],
 
 
 # -- per-source copy steps ------------------------------------------------------
+#
+# NOTE: surrogate autoincrement `id` columns (scan_runs, healer_runs, audit,
+# links) are deliberately NOT in the copied column lists — SQLite assigns
+# fresh rowids on insert. Copying legacy ids would make INSERT OR IGNORE
+# silently drop every legacy row whose id collides with a row the unified DB
+# already wrote (e.g. a scan/heal run before migrating), and the provenance
+# marker would then prevent re-runs from ever recovering them. Nothing
+# references these ids across tables; idempotency is anchored on the
+# provenance marker, not PK dedupe.
 
 
 def _copy_detective(conn: sqlite3.Connection, report: SourceReport) -> None:
@@ -112,7 +158,7 @@ def _copy_detective(conn: sqlite3.Connection, report: SourceReport) -> None:
     if "scan_runs" in tables:
         report.tables["scan_runs"] = _copy_select(
             conn, "scan_runs",
-            ["id", "ran_at", "window_days", "min_fails", "include_errors",
+            ["ran_at", "window_days", "min_fails", "include_errors",
              "source_schema_version", "tests_examined", "flaky_found"],
             "scan_runs")
 
@@ -154,7 +200,7 @@ def _copy_healer(conn: sqlite3.Connection, report: SourceReport) -> None:
     if "runs" in tables:
         report.tables["healer_runs"] = _copy_select(
             conn, "healer_runs",
-            ["id", "ts", "source", "build_id", "test_id", "diagnosis_json",
+            ["ts", "source", "build_id", "test_id", "diagnosis_json",
              "strategy", "result", "isolation", "duration_s"],
             "runs")
     if "recipes" in tables:
@@ -182,7 +228,7 @@ def _copy_healer(conn: sqlite3.Connection, report: SourceReport) -> None:
         report.tables["recipes"] = copied
     if "audit" in tables:
         report.tables["audit"] = _copy_select(
-            conn, "audit", ["id", "ts", "event", "payload_json"], "audit")
+            conn, "audit", ["ts", "event", "payload_json"], "audit")
 
 
 def _copy_incidents(conn: sqlite3.Connection, report: SourceReport) -> None:
@@ -202,7 +248,7 @@ def _copy_incidents(conn: sqlite3.Connection, report: SourceReport) -> None:
     if "links" in tables:
         report.tables["links"] = _copy_select(
             conn, "links",
-            ["id", "session_id", "incident_key", "note", "created_at"], "links")
+            ["session_id", "incident_key", "note", "created_at"], "links")
     if "meta" in tables:
         report.tables["meta"] = _copy_select(conn, "meta", ["key", "value"], "meta")
 
@@ -212,6 +258,17 @@ _COPIERS = {
     "ci_triage": _copy_triage,
     "flaky_healer": _copy_healer,
     "jira_incidents": _copy_incidents,
+}
+
+# Per-source legacy-table -> target-table mapping, mirroring exactly what the
+# copiers above read and write. The dry run counts through this map (reporting
+# TARGET names), so its output predicts the real run — table-for-table — and a
+# test pins dry-run reports == real-run reports to keep the two in sync.
+TABLE_MAP: dict[str, dict[str, str]] = {
+    "flaky_detective": {"flaky_verdicts": "flaky_verdicts", "scan_runs": "scan_runs"},
+    "ci_triage": {"patterns": "triage_patterns"},
+    "flaky_healer": {"runs": "healer_runs", "recipes": "recipes", "audit": "audit"},
+    "jira_incidents": {"incidents": "incidents", "links": "links", "meta": "meta"},
 }
 
 
@@ -236,7 +293,10 @@ def migrate(home: Path | None = None, *, dry_run: bool = False,
             sources[name] = Path(path)
 
     reports: list[SourceReport] = []
-    with closing(state.connect()) as conn:
+    # uri=True so the ATTACH `file:…?mode=ro` filenames in _attach_ro are
+    # honored on every SQLite build (not only those compiled with
+    # SQLITE_USE_URI) — the read-only guarantee depends on it.
+    with closing(state.connect(uri=True)) as conn:
         for name, path in sources.items():
             report = SourceReport(name=name, path=str(path))
             reports.append(report)
@@ -253,14 +313,14 @@ def migrate(home: Path | None = None, *, dry_run: bool = False,
             if dry_run:
                 _attach_ro(conn, path)
                 try:
-                    for table in sorted(_legacy_tables(conn)):
-                        # Skip FTS virtual tables AND their shadow tables
-                        # (_fts_data/_fts_idx/…), sqlite internals, and the
-                        # per-plugin version marker.
-                        if "_fts" in table or table.startswith("sqlite_") \
-                                or table == "schema_version":
-                            continue
-                        report.tables[table] = _count(conn, table)
+                    # Count through the same legacy->target mapping the copier
+                    # uses, reporting TARGET names — the dry run must predict
+                    # the real run (FTS/sqlite internals and the per-plugin
+                    # schema_version marker are outside the map by design).
+                    present = _legacy_tables(conn)
+                    for legacy_table, target in TABLE_MAP[name].items():
+                        if legacy_table in present:
+                            report.tables[target] = _count(conn, legacy_table)
                 finally:
                     _detach(conn)
                 report.skipped = "dry-run (nothing written)"

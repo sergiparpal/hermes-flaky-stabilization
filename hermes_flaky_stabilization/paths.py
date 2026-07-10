@@ -23,6 +23,11 @@ def get_hermes_home() -> Path:
 
     Prefer the official helpers when Hermes is importable; otherwise fall back
     to the ``HERMES_HOME`` env var, then ``~/.hermes``. Never hardcoded.
+
+    The env value gets ``expandvars`` + ``expanduser`` applied: sources like a
+    systemd ``EnvironmentFile`` or crontab set ``HERMES_HOME=~/hermes-data``
+    with no shell expansion, and a literal ``~/...`` would otherwise become a
+    *relative* path that ``get_data_dir`` mkdirs as ``./~`` under the CWD.
     """
     try:
         from hermes_constants import get_hermes_home as _core_home  # type: ignore
@@ -36,7 +41,10 @@ def get_hermes_home() -> Path:
         return Path(display_hermes_home())
     except Exception:
         pass
-    return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+    env_home = os.environ.get("HERMES_HOME")
+    if env_home:
+        return Path(os.path.expanduser(os.path.expandvars(env_home)))
+    return Path.home() / ".hermes"
 
 
 def get_data_dir() -> Path:

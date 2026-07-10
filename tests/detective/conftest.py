@@ -27,7 +27,7 @@ _REAL = "hermes_flaky_stabilization.detective"
 
 _pkg = importlib.import_module(_REAL)
 sys.modules.setdefault(_ALIAS, _pkg)
-for _name in ("domain", "timeutil", "detect", "schema", "storage", "query",
+for _name in ("domain", "timeutil", "detect", "storage", "query",
               "config", "reporting", "cli"):
     _mod = importlib.import_module(f"{_REAL}.{_name}")
     sys.modules.setdefault(f"{_ALIAS}.{_name}", _mod)

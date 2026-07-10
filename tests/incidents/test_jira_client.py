@@ -85,9 +85,34 @@ def test_non_2xx_raises_jira_error():
     assert exc.value.status == 401
 
 
-def test_transport_exception_wrapped():
-    t = FakeTransport(raise_exc=jc.JiraError("network error: timeout"))
-    client = jc.JiraClient("https://x.atlassian.net", token="t", transport=t)
+def test_urllib_transport_wraps_urlerror(monkeypatch):
+    # Exercise the REAL default transport's wrapping (no fake transport, no
+    # pre-wrapped exception): urlopen raising URLError must surface as
+    # JiraError.
+    import urllib.error
+    import urllib.request
+
+    def boom(*args, **kwargs):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    client = jc.JiraClient("https://x.atlassian.net", token="t")  # default transport
+    with pytest.raises(jc.JiraError) as exc:
+        client.search("x")
+    assert "network error" in str(exc.value)
+
+
+def test_urllib_transport_wraps_socket_timeout(monkeypatch):
+    import urllib.request
+
+    def boom(*args, **kwargs):
+        # socket.timeout has been an alias of TimeoutError since 3.10; this is
+        # exactly what urlopen raises on a read timeout, and it exercises the
+        # transport's generic (non-URLError) wrapping branch.
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    client = jc.JiraClient("https://x.atlassian.net", token="t")
     with pytest.raises(jc.JiraError):
         client.search("x")
 

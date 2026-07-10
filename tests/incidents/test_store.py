@@ -1,6 +1,7 @@
 """SQLite + FTS5 store tests (plan §2). Self-contained, no network."""
 
 import os
+import sqlite3
 
 import pytest
 from jira_incidents.store import IncidentStore
@@ -167,6 +168,114 @@ class TestRetention:
         store.upsert(_inc("NODATE-1", "no timestamp"))  # updated == ""
         assert store.prune_older_than("2025-01-01") == 0
         assert store.get("NODATE-1") is not None
+
+
+class TestFtsMirrorMaintenance:
+    """Mirror rows are refreshed via an indexed MATCH + rowid delete, not a
+    per-key full virtual-table scan under the store lock (perf finding)."""
+
+    def test_fts_delete_plan_is_not_a_full_scan(self, store):
+        store.upsert(_inc("INC-1", "x"))
+        plan = " | ".join(
+            row[3] for row in store._conn.execute(
+                "EXPLAIN QUERY PLAN " + IncidentStore._FTS_DELETE_SQL,
+                IncidentStore._fts_delete_params("INC-1"),
+            ).fetchall()
+        )
+        # fts5 renders a full scan as a bare "VIRTUAL TABLE INDEX 0:"; the
+        # MATCH-driven subquery plan carries an M constraint instead.
+        assert "0:M" in plan, plan
+
+    def test_upsert_replaces_fts_row_without_duplicates(self, store):
+        store.upsert(_inc("INC-1", "first words"))
+        store.upsert(_inc("INC-1", "second words"))
+        n = store._conn.execute(
+            "SELECT count(*) FROM incidents_fts WHERE key = ?", ("INC-1",)
+        ).fetchone()[0]
+        assert n == 1
+        assert [r["key"] for r in store.search("second")] == ["INC-1"]
+        assert store.search("first") == []
+
+    def test_similar_keys_are_not_clobbered(self, store):
+        # A phrase match for "INC-1" also hits "INC-1-EXTRA" (token prefix);
+        # the exact-key filter must protect the neighbour's mirror row.
+        store.upsert(_inc("INC-1", "alpha"))
+        store.upsert(_inc("INC-1-EXTRA", "beta"))
+        store.upsert(_inc("INC-1", "alpha revised"))
+        assert {r["key"] for r in store.search("beta")} == {"INC-1-EXTRA"}
+        assert {r["key"] for r in store.search("alpha")} == {"INC-1"}
+
+
+class TestFtsUnavailableFallback:
+    """On an FTS5-less SQLite the store must still open (fts_available=False)
+    and search() must degrade to a LIKE scan with the same result shape —
+    matching state.py's 'readers must keep a LIKE fallback' contract."""
+
+    @pytest.fixture
+    def nofts(self, tmp_home, monkeypatch):
+        def no_fts5(self):
+            raise sqlite3.OperationalError("no such module: fts5")
+        monkeypatch.setattr(IncidentStore, "_create_fts", no_fts5)
+        s = IncidentStore(os.path.join(tmp_home, "nofts.db"))
+        yield s
+        s.close()
+
+    def test_store_opens_and_flags_fts_unavailable(self, nofts):
+        assert nofts.fts_available is False
+
+    def test_upsert_and_like_search(self, nofts):
+        nofts.upsert(_inc("INC-1", "database pool exhausted"))
+        nofts.upsert(_inc("INC-2", "payment gateway timeout"))
+        rows = nofts.search("database")
+        assert {r["key"] for r in rows} == {"INC-1"}
+        # identical row shape to the FTS path
+        assert set(rows[0]) == {"key", "summary", "status", "root_cause",
+                                "reporter", "assignee", "created", "updated", "body"}
+
+    def test_like_search_matches_body_and_root_cause(self, nofts):
+        nofts.upsert(_inc("INC-1", "outage", root_cause="kernel OOM killer"))
+        assert {r["key"] for r in nofts.search("OOM")} == {"INC-1"}
+
+    def test_like_ranking_prefers_more_matched_tokens(self, nofts):
+        nofts.upsert(_inc("INC-1", "kafka consumer lag", body="kafka"))
+        nofts.upsert(_inc("INC-2", "consumer complaints"))
+        assert nofts.search("kafka consumer")[0]["key"] == "INC-1"
+
+    def test_like_wildcards_are_literal(self, nofts):
+        nofts.upsert(_inc("INC-1", "failure_rate at 50%"))
+        nofts.upsert(_inc("INC-2", "failureXrate"))
+        # "_" in the query token must not act as a LIKE single-char wildcard.
+        assert {r["key"] for r in nofts.search("failure_rate")} == {"INC-1"}
+        assert nofts.search("") == []
+        assert nofts.search("!!!") == []
+
+    def test_upsert_many_prune_and_retention_work_without_fts(self, nofts):
+        assert nofts.upsert_many([_inc("INC-1", "a"), _inc("INC-2", "b")]) == 2
+        old = {**_inc("OLD-1", "ancient"), "updated": "2020-01-01T00:00:00.000+0000"}
+        nofts.upsert(old)
+        assert nofts.prune_older_than("2025-01-01") == 1
+        assert nofts.delete_keys_not_in({"INC-1"}) == 1
+        assert nofts.get("INC-2") is None
+        assert nofts.get("INC-1") is not None
+
+
+class TestDeleteKeysNotIn:
+    """--full resync support: expunge keys Jira no longer returns."""
+
+    def test_removes_unseen_keys_and_their_fts_rows(self, store):
+        store.upsert(_inc("INC-1", "alpha thing"))
+        store.upsert(_inc("INC-2", "beta thing"))
+        removed = store.delete_keys_not_in({"INC-2"})
+        assert removed == 1
+        assert store.get("INC-1") is None
+        assert store.get("INC-2") is not None
+        assert {r["key"] for r in store.search("thing")} == {"INC-2"}
+        assert store.count() == 1
+
+    def test_noop_when_everything_was_seen(self, store):
+        store.upsert(_inc("INC-1", "x"))
+        assert store.delete_keys_not_in({"INC-1"}) == 0
+        assert store.count() == 1
 
 
 # ---------------------------------------------------------------------------

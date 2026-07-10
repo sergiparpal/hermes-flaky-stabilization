@@ -9,6 +9,9 @@
 #
 # Per repo: (1) add a README deprecation banner + final commit, (2) tag a final
 # release, (3) archive the repo (read-only).
+#
+# Safe to re-run after a partial failure (e.g. gh unauthenticated at the
+# release step): step 1 is skipped when the banner is already present.
 set -euo pipefail
 
 REPOS=(
@@ -24,6 +27,12 @@ OWNER="sergiparpal"
 UNIFIED="https://github.com/${OWNER}/hermes-flaky-stabilization"
 BANNER="> **DEPRECATED — superseded by [hermes-flaky-stabilization](${UNIFIED}).**\\n> Bug fixes land only there; see its MIGRATION.md. This repo is archived read-only."
 
+# Legacy repos are checked out as SIBLINGS of this repo — resolve their parent
+# from the script's own location (preflight.sh's pattern), never the caller's
+# CWD: run from scripts/ a plain ../<repo> would resolve inside this repo, and
+# run elsewhere it could hit same-named strangers.
+PARENT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
 MODE="print"
 [ "${1:-}" = "--execute" ] && MODE="execute"
 
@@ -32,18 +41,24 @@ run() {
     echo "+ $*"
     "$@"
   else
-    echo "  $*"
+    # %q keeps the printed command copy-paste runnable (word quoting survives).
+    printf ' %q' "$@"
+    printf '\n'
   fi
 }
 
 for repo in "${REPOS[@]}"; do
   echo "# --- ${repo} -------------------------------------------------"
-  dir="../${repo}"
+  dir="${PARENT}/${repo}"
   echo "# 1) banner + final commit"
-  run bash -c "printf '%b\n\n' \"${BANNER}\" | cat - '${dir}/README.md' > '${dir}/README.md.new' && mv '${dir}/README.md.new' '${dir}/README.md'"
-  run git -C "${dir}" add README.md
-  run git -C "${dir}" commit -m "Deprecate: superseded by ${OWNER}/hermes-flaky-stabilization"
-  run git -C "${dir}" push
+  if [ -f "${dir}/README.md" ] && grep -qF 'superseded by' "${dir}/README.md"; then
+    echo "#    banner already present — skipping step 1 (idempotent re-run)"
+  else
+    run bash -c "printf '%b\n\n' \"${BANNER}\" | cat - '${dir}/README.md' > '${dir}/README.md.new' && mv '${dir}/README.md.new' '${dir}/README.md'"
+    run git -C "${dir}" add README.md
+    run git -C "${dir}" commit -m "Deprecate: superseded by ${OWNER}/hermes-flaky-stabilization"
+    run git -C "${dir}" push
+  fi
   echo "# 2) final release"
   run gh release create v-final --repo "${OWNER}/${repo}" --title "Final release (deprecated)" \
       --notes "Superseded by ${UNIFIED}. See its MIGRATION.md."

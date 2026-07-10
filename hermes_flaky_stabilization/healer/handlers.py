@@ -273,10 +273,17 @@ def _signature_for(trace_summary, diagnosis: dict | None) -> str:
 def _pr_flow(ctx, report: healer.HealReport, repo_dir: str) -> dict:
     sig = report.recipe_signature or _signature_for(None, report.diagnosis)
     branch = gitflow.branch_name(report.test_id, sig)
+    base = config.base_branch()
+
+    # Read-only preflight (via the same dispatch mechanism): refuses to start
+    # the write sequence on a dirty tree and records the original ref (restored
+    # on failure) plus the validated HEAD the fix branch is cut from.
+    pre = gitflow.run_preflight(ctx, repo_dir)
+
     patch_dir = config.data_dir(ctx) / "patches"
     patch_dir.mkdir(parents=True, exist_ok=True)
     patch_path = patch_dir / f"{branch.rsplit('/', 1)[-1]}.patch"
-    patch_path.write_text(report.diff)
+    patch_path.write_text(report.diff, encoding="utf-8")
 
     burnin = report.burnin or {}
     commit_message = (
@@ -296,22 +303,30 @@ def _pr_flow(ctx, report: healer.HealReport, repo_dir: str) -> dict:
         f"- **Reproduced pre-patch**: {report.reproduced}\n"
         f"- **Burn-in**: {burnin.get('passed')}/{burnin.get('runs')} green, "
         f"isolation `{report.isolation}`\n"
-        f"- **Signature**: `{sig[:8]}`\n\n"
+        f"- **Signature**: `{sig[:8]}`\n"
+        f"- **Validated base**: `{pre.head_sha}` — burn-in ran against this commit; "
+        f"the fix branch is cut from it\n\n"
         f"```diff\n{report.diff}```\n"
     )
     dispatches = gitflow.build_dispatches(
         repo_dir=repo_dir,
         branch=branch,
+        base=base,
         patch_path=patch_path,
         commit_message=commit_message,
         pr_title=pr_title,
         pr_body=pr_body,
     )
-    cleanup = gitflow.checkout_dispatch(repo_dir, config.base_branch())
+    # Non-destructive failure cleanup: back to the user's original ref (the
+    # preflight guarantees the tree was clean, so a forced checkout can only
+    # discard our own half-applied patch), then drop the stale fix branch.
+    cleanup = gitflow.cleanup_dispatches(repo_dir, pre.original_ref, branch=branch)
     results = gitflow.execute_via_ctx(ctx, dispatches, on_error=cleanup)
     return {
         "branch": branch,
-        "base": config.base_branch(),
+        "base": base,
+        "validated_head": pre.head_sha,
+        "original_ref": pre.original_ref,
         "signature": sig,
         "patch_path": str(patch_path),
         "dispatches": dispatches,
@@ -527,7 +542,11 @@ def _audit_event(event: str, args: tuple, kwargs: dict, ctx=None) -> None:
     try:
         json.dumps(payload)
     except TypeError:
-        payload = {"repr": repr({"args": args, "kwargs": kwargs})[:2000]}
+        # Repr the REDACTED payload, never the raw inputs: raw args next to a
+        # non-serializable object would bypass _SENSITIVE_KEY_RE. Objects that
+        # survive _redact untouched may still embed credentials in their repr,
+        # so mask token-shaped values once more before storing.
+        payload = {"repr": _TOKEN_VALUE_RE.sub("***", repr(payload))[:2000]}
     _store_for(ctx).audit(event, payload)
     log.debug("audit %s: %s", event, json.dumps(payload)[:500])
 

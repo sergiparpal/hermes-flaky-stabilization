@@ -116,17 +116,41 @@ def fts5_available() -> bool:
 
 _FTS_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,}")
 
+# Ubiquitous failure vocabulary — present in virtually every CI log, so a fuzzy
+# match on one of these alone is meaningless (it would surface the project's
+# most-seen pattern as a "similar" prior for any unrelated failure). Excluded
+# from the fuzzy query and from the overlap count.
+_FUZZY_STOPWORDS = frozenset({
+    "error", "errors", "errored",
+    "fail", "fails", "failed", "failing", "failure", "failures",
+    "exception", "exceptions",
+})
+
+# How many fuzzy candidates to inspect for genuine token overlap.
+_FUZZY_CANDIDATES = 10
+
 
 def _fuzzy_tokens(excerpt: str, limit: int = 12) -> list[str]:
-    """Pick salient alphanumeric tokens from an excerpt for an FTS query."""
+    """Pick salient alphanumeric tokens from an excerpt for an FTS query.
+
+    Stopwords (ubiquitous failure vocabulary) are excluded: they carry no
+    similarity signal and would let any log fuzzy-match any pattern.
+    """
     seen: dict[str, None] = {}
     for tok in _FTS_TOKEN_RE.findall(normalize_signature_text(excerpt)):
         low = tok.lower()
+        if low in _FUZZY_STOPWORDS:
+            continue
         if low not in seen:
             seen[low] = None
         if len(seen) >= limit:
             break
     return list(seen)
+
+
+def _sample_tokens(sample: str) -> set[str]:
+    """The stored sample's token set, derived the same way as the query tokens."""
+    return {t.lower() for t in _FTS_TOKEN_RE.findall(normalize_signature_text(sample or ""))}
 
 
 class PatternStore:
@@ -234,29 +258,52 @@ class PatternStore:
         tokens = _fuzzy_tokens(excerpt)
         if not tokens:
             return None
+        # A "similar" prior must share real signal with the excerpt: at least
+        # two distinct non-stopword tokens (or the whole query when it has only
+        # one). Ranking by occurrences alone let one shared common token return
+        # the project's most-seen pattern for any unrelated failure.
+        min_overlap = min(2, len(tokens))
         try:
             if self.fts:
                 match = " OR ".join(f'"{t}"' for t in tokens)
-                row = self.conn.execute(
+                rows = self.conn.execute(
                     "SELECT p.* FROM triage_patterns_fts f "
                     "JOIN triage_patterns p ON p.project=f.project AND p.signature=f.signature "
                     "WHERE f.project=? AND triage_patterns_fts MATCH ? "
-                    "ORDER BY p.occurrences DESC LIMIT 1",
-                    (project, match),
-                ).fetchone()
+                    "ORDER BY bm25(triage_patterns_fts) LIMIT ?",
+                    (project, match, _FUZZY_CANDIDATES),
+                ).fetchall()
             else:
                 clauses = " OR ".join("sample LIKE ?" for _ in tokens)
-                params = [project] + [f"%{t}%" for t in tokens]
-                row = self.conn.execute(
+                params = [project] + [f"%{t}%" for t in tokens] + [_FUZZY_CANDIDATES]
+                rows = self.conn.execute(
                     f"SELECT * FROM triage_patterns WHERE project=? AND ({clauses}) "
-                    "ORDER BY occurrences DESC LIMIT 1",
+                    "ORDER BY occurrences DESC LIMIT ?",
                     params,
-                ).fetchone()
+                ).fetchall()
         except sqlite3.Error:
             return None
-        if row is None:
+        if self.fts:
+            # Candidates arrive best-relevance-first (bm25); take the first
+            # with enough genuine overlap.
+            for row in rows:
+                if len(_sample_tokens(row["sample"]) & set(tokens)) >= min_overlap:
+                    return self._row_to_dict(row, fuzzy=True)
             return None
-        return self._row_to_dict(row, fuzzy=True)
+        # LIKE fallback has no relevance ranking — approximate it: most shared
+        # tokens first, occurrences as the tie-break.
+        best = None
+        best_key = (0, 0)
+        for row in rows:
+            overlap = len(_sample_tokens(row["sample"]) & set(tokens))
+            if overlap < min_overlap:
+                continue
+            key = (overlap, row["occurrences"])
+            if best is None or key > best_key:
+                best, best_key = row, key
+        if best is None:
+            return None
+        return self._row_to_dict(best, fuzzy=True)
 
     @staticmethod
     def _row_to_dict(row: sqlite3.Row, *, fuzzy: bool) -> dict[str, object]:

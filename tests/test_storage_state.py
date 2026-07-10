@@ -89,6 +89,21 @@ def test_db_lives_under_hermes_home(profile_env):
     assert paths.get_data_dir() == profile_env / "flaky-stabilization"
 
 
+def test_hermes_home_env_value_is_expanded(monkeypatch, tmp_path):
+    """HERMES_HOME often arrives unexpanded (systemd EnvironmentFile, crontab —
+    no shell): a literal `~/...` must expand to the user's home, never become
+    a relative Path("~/...") that get_data_dir() mkdirs as ./~ under the CWD."""
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    monkeypatch.setenv("HERMES_HOME", "~/hermes-data")
+    resolved = paths.get_hermes_home()
+    assert resolved.is_absolute()
+    assert resolved == tmp_path / "userhome" / "hermes-data"
+
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path / "root"))
+    monkeypatch.setenv("HERMES_HOME", "$DATA_ROOT/hermes")
+    assert paths.get_hermes_home() == tmp_path / "root" / "hermes"
+
+
 def test_appendix_a_legacy_column_sets(profile_env):
     """Migration is a plain INSERT..SELECT only if legacy column sets survive
     verbatim — pin the ones the Phase-7 importer relies on."""

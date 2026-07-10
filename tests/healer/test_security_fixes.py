@@ -282,7 +282,10 @@ class TestSubprocessPrGuard:
         assert fake_ctx.dispatched == [], "a subprocess heal must not reach the write path"
 
     def test_override_env_allows_subprocess_pr(self, fake_ctx, monkeypatch):
+        from conftest import FakeGitHost
+
         monkeypatch.setenv("FLAKY_HEALER_ALLOW_SUBPROCESS_PR", "1")
+        fake_ctx.dispatch_executor = FakeGitHost()
         data = json.loads(
             handlers.heal_flaky_test(
                 {

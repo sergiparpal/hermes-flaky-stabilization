@@ -1,9 +1,9 @@
 """All Hermes-facing wiring: tools, hooks, commands, skills, CLI.
 
 Only this module and the package ``__init__`` may import Hermes surfaces;
-stage packages receive ``llm`` / ``dispatch_tool`` / paths as injected
-parameters (plan D3). Registrations grow phase by phase; each stage's wiring
-lands with its port.
+stage packages receive ``llm`` / paths (and, for the healer's git/PR flow,
+``dispatch_tool``) as injected parameters (plan D3). Registrations grow phase
+by phase; each stage's wiring lands with its port.
 """
 
 from __future__ import annotations
@@ -21,11 +21,13 @@ def register(ctx) -> None:
     from . import bugreport, detective, healer, history, incidents, pii, triage
 
     # Stage registrations (tool contracts preserved verbatim). history.register
-    # also registers the `test-history` CLI alias — a kept public contract (D2);
+    # also registers the `test-history` CLI alias — a kept public contract (D2)
+    # routed through the same CLI-mismatch guard as the flaky-stab command (a
+    # host register_cli_command mismatch must not block tool loading);
     # bugreport.register also registers the /improve-bug slash command;
     # healer.register also registers /heal, the flaky-healer skill, and the two
     # approval audit observer hooks.
-    history.register(ctx)
+    history.register(_GuardedCliContext(ctx))
     detective.register(ctx)
     triage.register(ctx)
     healer.register(ctx)
@@ -81,20 +83,49 @@ def register(ctx) -> None:
     _register_cli(ctx)
 
 
+def _guarded_register_cli_command(ctx, *args, **kwargs) -> None:
+    """Register a CLI command, degrading any host mismatch to a warning.
+
+    Policy shared by BOTH CLI registrations (`flaky-stab` and the
+    `test-history` alias): a host ``register_cli_command`` signature mismatch
+    must not block tool loading — the 16 tools matter more than the CLI.
+    """
+    name = kwargs.get("name") or (args[0] if args else "?")
+    try:
+        ctx.register_cli_command(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 — a CLI mismatch must not block tool loading
+        logger.warning("%s: CLI command %r not registered: %s", PLUGIN_NAME, name, exc)
+
+
+class _GuardedCliContext:
+    """Transparent proxy over a ``PluginContext``: everything delegates to the
+    wrapped context except ``register_cli_command``, which goes through
+    :func:`_guarded_register_cli_command`. Stage modules (history) register
+    their CLI alias through this so the guard applies without the stage
+    knowing about it."""
+
+    def __init__(self, ctx):
+        self._ctx = ctx
+
+    def __getattr__(self, name):
+        return getattr(self._ctx, name)
+
+    def register_cli_command(self, *args, **kwargs) -> None:
+        _guarded_register_cli_command(self._ctx, *args, **kwargs)
+
+
 def _register_cli(ctx) -> None:
     from . import cli
 
-    try:
-        ctx.register_cli_command(
-            name=CLI_COMMAND,
-            help="Unified flaky-test stabilization pipeline (history, detection, triage, healing)",
-            setup_fn=cli.setup_cli,
-            handler_fn=cli.run_cli,
-            description=(
-                "Manage the hermes-flaky-stabilization plugin: ingest JUnit XML, scan for "
-                "flaky tests, sync the Jira incident index, migrate legacy plugin data, "
-                "and install the nightly cron job."
-            ),
-        )
-    except Exception as exc:  # noqa: BLE001 — a CLI mismatch must not block tool loading
-        logger.warning("%s: CLI command %r not registered: %s", PLUGIN_NAME, CLI_COMMAND, exc)
+    _guarded_register_cli_command(
+        ctx,
+        name=CLI_COMMAND,
+        help="Unified flaky-test stabilization pipeline (history, detection, triage, healing)",
+        setup_fn=cli.setup_cli,
+        handler_fn=cli.run_cli,
+        description=(
+            "Manage the hermes-flaky-stabilization plugin: ingest JUnit XML, scan for "
+            "flaky tests, sync the Jira incident index, migrate legacy plugin data, "
+            "and install the nightly cron job."
+        ),
+    )

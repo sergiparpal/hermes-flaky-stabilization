@@ -71,6 +71,37 @@ def test_rejects_nonpositive_min_fails_without_persisting(profile_env, capsys):
 
 
 # ---------------------------------------------------------------------------
+# missing/failing shim source — clean error, config never mutated first
+# ---------------------------------------------------------------------------
+
+
+def test_missing_shim_source_errors_before_persisting_config(profile_env, capsys, monkeypatch):
+    # A site-packages install has no checkout scripts/ dir: install-cron must
+    # verify the shim source BEFORE writing config.json and fail with a one-line
+    # error (exit 1) — never an uncaught FileNotFoundError with config mutated.
+    monkeypatch.setattr(cli, "SHIM_NAME", "no-such-shim.sh")
+    assert _run(["install-cron", "--no-create", "--deliver", "local"]) == 1
+    err = capsys.readouterr().err
+    assert "error:" in err and "no-such-shim.sh" in err
+    assert "Traceback" not in err
+    assert not config.config_path().exists()          # config untouched
+    assert not (profile_env / "scripts").exists()     # nothing installed
+
+
+def test_shim_copy_failure_is_a_clean_error(profile_env, capsys, monkeypatch):
+    # An install failure after the source check (e.g. permissions) must surface
+    # as a one-line error + non-zero exit, not a traceback.
+    def boom(src, dst):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr("shutil.copyfile", boom)
+    assert _run(["install-cron", "--no-create", "--deliver", "local"]) == 1
+    err = capsys.readouterr().err
+    assert "error:" in err and "denied" in err
+    assert "Traceback" not in err
+
+
+# ---------------------------------------------------------------------------
 # job creation via the (mocked) subprocess
 # ---------------------------------------------------------------------------
 

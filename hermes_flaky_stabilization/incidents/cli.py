@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Any
 
 from ..pii import redaction
 from . import config as config_mod
 from . import ingest as ingest_mod
+from .jira_client import JiraError
 from .store import IncidentStore
 
 
@@ -34,20 +36,35 @@ def register_cli(subparser) -> None:
     """Attach the ``jira`` subcommands to *subparser* (a `flaky-stab jira` node)."""
     actions = subparser.add_subparsers(dest="action", metavar="{status,sync,config}")
     actions.add_parser("status", help="Show config + local index stats")
-    actions.add_parser("sync", help="Reindex from Jira now (synchronous)")
+    p_sync = actions.add_parser("sync", help="Reindex from Jira now (synchronous)")
+    p_sync.add_argument(
+        "--full", action="store_true",
+        help="Re-ingest everything from scratch: clears the sync watermark and "
+             "resume state, then — after a run that completed without hitting "
+             "max_pages — deletes local incidents Jira no longer returns "
+             "(issues deleted or re-keyed upstream). Deletion is skipped if "
+             "the run was truncated.")
+    p_sync.add_argument(
+        "--quiet", action="store_true",
+        help="Suppress the success line when nothing changed "
+             "(errors still go to stderr).")
     actions.add_parser("config", help="Show effective (non-secret) config")
 
 
-def hermes_jira_incidents_command(args) -> None:
+def hermes_jira_incidents_command(args) -> int:
+    """Dispatch a ``flaky-stab jira`` action. Returns a process exit code
+    (0 success, 1 credential/config/Jira failure) for the top-level
+    ``run_cli`` to propagate — the nightly cron shim alerts on non-zero."""
     action = getattr(args, "action", None) or "status"
     home = _hermes_home()
     raw = config_mod.load_config(home)
     if action == "sync":
-        _cmd_sync(home, raw)
-    elif action == "config":
-        _cmd_config(raw)
-    else:
-        _cmd_status(home, raw)
+        return _cmd_sync(home, raw,
+                         full=bool(getattr(args, "full", False)),
+                         quiet=bool(getattr(args, "quiet", False)))
+    if action == "config":
+        return _cmd_config(raw)
+    return _cmd_status(home, raw)
 
 
 def _db_path(home: str, cfg: config_mod.IncidentsConfig) -> str:
@@ -57,7 +74,7 @@ def _db_path(home: str, cfg: config_mod.IncidentsConfig) -> str:
     return os.path.join(home, "flaky-stabilization", "state.db")
 
 
-def _cmd_status(home: str, raw: dict[str, Any]) -> None:
+def _cmd_status(home: str, raw: dict[str, Any]) -> int:
     cfg = config_mod.IncidentsConfig.from_dict(raw)
     db_path = _db_path(home, cfg)
     print("jira incidents — status")
@@ -78,39 +95,76 @@ def _cmd_status(home: str, raw: dict[str, Any]) -> None:
             store.close()
     else:
         print(f"  db_path     : {db_path} (not created yet)")
+    return 0
 
 
-def _cmd_config(raw: dict[str, Any]) -> None:
+def _cmd_config(raw: dict[str, Any]) -> int:
     # Show the raw on-disk config (arbitrary keys), minus secrets. Defensive:
     # never print secrets even if a token leaked into the JSON.
     safe = {k: v for k, v in raw.items() if k not in config_mod.SECRET_CONFIG_KEYS}
     safe = {k: (redaction.redact_text(v) if isinstance(v, str) else v) for k, v in safe.items()}
     print(json.dumps(safe, indent=2, sort_keys=True))
+    return 0
 
 
-def _cmd_sync(home: str, raw: dict[str, Any]) -> None:
+def _cmd_sync(home: str, raw: dict[str, Any], *, full: bool = False,
+              quiet: bool = False) -> int:
+    """Run one synchronous sync. Returns 0 on success, 1 on failure.
+
+    ``full`` clears the watermark/backfill state, re-ingests everything and —
+    only when the run completed (was not truncated by max_pages) — deletes
+    local incidents that Jira no longer returned. ``quiet`` suppresses the
+    success line when nothing changed (cron shims want silent ticks); errors
+    always go to stderr.
+    """
     cfg = config_mod.IncidentsConfig.from_dict(raw)
     token = config_mod.resolve_token()
     if not token or not cfg.base_url():
-        print("Cannot sync: set JIRA_API_TOKEN in .env and jira_base_url in config.")
-        return
+        print("Cannot sync: set JIRA_API_TOKEN in .env and jira_base_url in config.",
+              file=sys.stderr)
+        return 1
     try:
         client = config_mod.build_client(cfg, token=token)
     except ValueError as e:
         # e.g. a non-https base_url, which we refuse so the token is never sent
         # over cleartext.
-        print(f"Cannot sync: {e}")
-        return
+        print(f"Cannot sync: {e}", file=sys.stderr)
+        return 1
     store = IncidentStore(_db_path(home, cfg))
     try:
-        result = ingest_mod.run_sync(
-            store, client, cfg.jql, **cfg.run_sync_kwargs(),
-        )
-        print(f"Sync complete: ingested {result['ingested']} incident(s) "
-              f"over {result['pages']} page(s). Watermark: {result['watermark']}")
-        if not result.get("backfill_complete", True):
+        if full:
+            # Restart ingest from scratch so the run enumerates every live
+            # issue (needed to detect deletions/re-keys).
+            ingest_mod.reset_sync_state(store)
+        try:
+            result = ingest_mod.run_sync(
+                store, client, cfg.jql, incremental=not full,
+                **cfg.run_sync_kwargs(),
+            )
+        except JiraError as e:
+            # Clean one-line failure (no traceback) with a non-zero exit code,
+            # so the nightly cron shim can alert.
+            print(f"Sync failed: {e}", file=sys.stderr)
+            return 1
+        removed = 0
+        if full:
+            if result.get("backfill_complete"):
+                removed = store.delete_keys_not_in(result.get("seen_keys") or set())
+            else:
+                print("Full sync was truncated by max_pages before seeing every "
+                      "issue — skipping deletion of unseen local incidents; "
+                      "run `jira sync` again to finish re-indexing.")
+        changed = bool(result["ingested"] or removed)
+        incomplete = not result.get("backfill_complete", True)
+        if not quiet or changed or incomplete:
+            print(f"Sync complete: ingested {result['ingested']} incident(s) "
+                  f"over {result['pages']} page(s). Watermark: {result['watermark']}")
+            if removed:
+                print(f"Removed {removed} local incident(s) no longer present in Jira.")
+        if incomplete and not full:  # the full path printed its own notice
             print("Initial backfill is not finished yet — run sync again to "
                   "continue indexing older incidents.")
+        return 0
     finally:
         store.close()
 

@@ -31,19 +31,28 @@ _MAX_OFFENDERS = 50           # cap on module_failure_history rows (bound output
 # the grouped query below, so the two agree by construction. The SQL form is
 # concatenated in as a *static fragment* (like ``_CASE_COLS`` — never a value).
 
-# Shared column list, concatenated (not f-string interpolated) into the two
-# case-fetching statements below.
+# ``_ET_TR`` is the ``tr.``-qualified "effective timestamp" expression
+# (run_timestamp, else ingested_at) from ``domain.effective_time`` — shared with
+# the CLI so the rule cannot drift between where it is queried and where it is
+# pruned.
+_ET_TR = domain.effective_time("tr.")
+
+# Shared column list, concatenated (not f-string interpolated) into the
+# failure-fetching statement below.
 _CASE_COLS = (
     "tc.id AS cid, tc.run_id, tc.classname, tc.name, tc.file_path, tc.status, "
     "tc.failure_message, tc.failure_type, tc.stack_trace, "
     "tr.run_timestamp, tr.ingested_at"
 )
-_EXACT_SELECT = (
-    "SELECT " + _CASE_COLS + " FROM test_cases tc "
+# FROM/WHERE fragments shared by the aggregate and failure-fetching statements
+# of ``test_failure_lookup`` (the exact form gets its predicate appended; the
+# FTS form may get further ``AND`` clauses appended after the MATCH).
+_EXACT_FROM_WHERE = (
+    "FROM test_cases tc "
     "JOIN test_runs tr ON tr.id = tc.run_id WHERE "
 )
-_FTS_SELECT = (
-    "SELECT " + _CASE_COLS + " FROM test_cases_fts f "
+_FTS_FROM_WHERE = (
+    "FROM test_cases_fts f "
     "JOIN test_cases tc ON tc.id = f.rowid "
     "JOIN test_runs tr ON tr.id = tc.run_id "
     "WHERE test_cases_fts MATCH ?"
@@ -117,37 +126,14 @@ def _row_timestamp(row) -> str:
     return row["run_timestamp"] or row["ingested_at"] or ""
 
 
-def _row_timestamp_key(row) -> datetime:
-    """Chronological sort key for a result row.
+def _resolve_predicate(test_id: str) -> tuple[str, tuple, str]:
+    """Resolve ``test_id`` to ``(from_where, params, fts_query)``.
 
-    Sort chronologically, not lexicographically: ``run_timestamp`` is
-    ``T``-separated while ``ingested_at`` is space-separated, so a string sort
-    would mis-order them on same-date ties, and any stray non-ISO value would
-    sort to the top. Unparseable timestamps sort last.
-    """
-    try:
-        return datetime.fromisoformat(_row_timestamp(row).replace(" ", "T", 1))
-    except ValueError:
-        return datetime.min
-
-
-def _collect_fts(conn, match_query: str, into: dict) -> None:
-    """Best-effort FTS lookup; malformed FTS syntax is swallowed (-> no rows)."""
-    try:
-        for row in conn.execute(_FTS_SELECT, (match_query,)):
-            into.setdefault(row["cid"], row)
-    except sqlite3.OperationalError:
-        # e.g. "fts5: syntax error" from an injection-y / malformed query.
-        pass
-
-
-def _resolve_rows(conn, test_id: str) -> dict:
-    """Resolve candidate case rows for ``test_id``, keyed by case id.
-
-    Resolution order:
-      * ``classname::name`` or ``file_path::name`` → exact structured match,
-        falling back to FTS on the name part if nothing matched;
-      * otherwise → exact name match, falling back to FTS if nothing matched.
+    ``from_where`` + ``params`` is the exact-match candidate set:
+      * ``classname::name`` or ``file_path::name`` → exact structured match;
+      * otherwise → exact name match.
+    ``fts_query`` is the FTS fallback query (the name part) used when the exact
+    set turns out empty.
 
     Exact matching is always attempted first and is safe for any input — the
     value only ever flows through a ``?`` placeholder — so a test whose literal
@@ -156,22 +142,56 @@ def _resolve_rows(conn, test_id: str) -> dict:
     match an exact name and falls through to the FTS branch, which preserves the
     documented FTS-query capability.
     """
-    rows: dict[int, sqlite3.Row] = {}
     if "::" in test_id:
         left, right = (part.strip() for part in test_id.rsplit("::", 1))
-        for row in conn.execute(
-            _EXACT_SELECT + "tc.name = ? AND (tc.classname = ? OR tc.file_path = ?)",
+        return (
+            _EXACT_FROM_WHERE + "tc.name = ? AND (tc.classname = ? OR tc.file_path = ?)",
             (right, left, left),
-        ):
-            rows[row["cid"]] = row
-        if not rows:
-            _collect_fts(conn, right, rows)
-    else:
-        for row in conn.execute(_EXACT_SELECT + "tc.name = ?", (test_id,)):
-            rows[row["cid"]] = row
-        if not rows:
-            _collect_fts(conn, test_id, rows)
-    return rows
+            right,
+        )
+    return _EXACT_FROM_WHERE + "tc.name = ?", (test_id,), test_id
+
+
+def _lookup_counts(conn, from_where: str, params: tuple) -> tuple[int, int, int]:
+    """``(total_runs, failure_count, matched_tests)`` for one candidate set.
+
+    Two small aggregate statements instead of fetching every candidate row: the
+    full (untruncated) stack traces never leave SQLite just to be counted.
+    ``matched_tests`` counts distinct ``(classname, name)`` pairs — a subquery,
+    because ``COUNT(DISTINCT ...)`` takes a single expression and concatenation
+    would collapse NULL classnames.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS total_runs, "
+        "SUM(CASE WHEN tc.status IN " + domain.FAIL_STATUSES_SQL + " THEN 1 ELSE 0 END) "
+        "AS failure_count " + from_where,
+        params,
+    ).fetchone()
+    matched = conn.execute(
+        "SELECT COUNT(*) FROM (SELECT DISTINCT tc.classname, tc.name " + from_where + ")",
+        params,
+    ).fetchone()[0]
+    return row["total_runs"], row["failure_count"] or 0, matched
+
+
+def _lookup_failures(conn, from_where: str, params: tuple, limit: int) -> list:
+    """The ``limit`` most recent failing rows of one candidate set.
+
+    Ordering and limiting happen in SQL so at most ``limit`` stack traces are
+    ever fetched. ``datetime()`` normalizes the ``T``-separated ``run_timestamp``
+    and space-separated ``ingested_at`` forms so they compare chronologically
+    (the same normalization ``module_failure_history`` applies to its window),
+    and it yields NULL for an unparseable timestamp — which ``DESC`` sorts last,
+    matching the previous Python sort's ``datetime.min`` fallback. ``tc.id``
+    breaks ties deterministically (insertion order, which the previous stable
+    sort preserved).
+    """
+    return conn.execute(
+        "SELECT " + _CASE_COLS + " " + from_where
+        + " AND tc.status IN " + domain.FAIL_STATUSES_SQL
+        + " ORDER BY datetime(" + _ET_TR + ") DESC, tc.id ASC LIMIT ?",
+        params + (limit,),
+    ).fetchall()
 
 
 def test_failure_lookup(conn, test_id: str, limit: int = domain.DEFAULT_LIMIT,
@@ -179,8 +199,8 @@ def test_failure_lookup(conn, test_id: str, limit: int = domain.DEFAULT_LIMIT,
     """Failure history of one test, by identifier or FTS query.
 
     The identifier-resolution order (exact ``classname::name`` / ``file::name`` /
-    bare name, each with an FTS fall-back) lives in ``_resolve_rows``. ``config``
-    is the resolved tool config injected by the caller (the handler in
+    bare name, each with an FTS fall-back) lives in ``_resolve_predicate``.
+    ``config`` is the resolved tool config injected by the caller (the handler in
     ``__init__``); ``None`` means "use the documented defaults" — what direct
     callers and tests get without having to touch any module-level state.
     """
@@ -190,17 +210,24 @@ def test_failure_lookup(conn, test_id: str, limit: int = domain.DEFAULT_LIMIT,
     max_trace = _coerce_int(cfg.get("max_stack_trace_chars", domain.DEFAULT_MAX_STACK_TRACE_CHARS),
                             default=domain.DEFAULT_MAX_STACK_TRACE_CHARS, lo=0, hi=None)
 
-    all_rows = list(_resolve_rows(conn, test_id).values())
-    # An exact id resolves to a single test; a fuzzy FTS fallback can match rows
-    # from several distinct tests, in which case the counts below aggregate
-    # across them. Surface how many distinct (classname, name) tests matched so
-    # that breadth is explicit rather than silently folded into one figure.
-    matched_tests = len({(r["classname"], r["name"]) for r in all_rows})
-    failed = sorted(
-        (r for r in all_rows if r["status"] in domain.FAIL_STATUSES),
-        key=_row_timestamp_key,
-        reverse=True,
-    )
+    from_where, params, fts_query = _resolve_predicate(test_id)
+    total_runs, failure_count, matched_tests = _lookup_counts(conn, from_where, params)
+    if total_runs == 0:
+        # Nothing matched exactly — fall back to FTS on the name part. An exact
+        # id resolves to a single test; the fuzzy fallback can match rows from
+        # several distinct tests, in which case the counts aggregate across
+        # them (matched_tests surfaces that breadth explicitly). Best-effort:
+        # malformed FTS syntax (e.g. an injection attempt) yields empty
+        # results, not an exception.
+        from_where, params = _FTS_FROM_WHERE, (fts_query,)
+        try:
+            total_runs, failure_count, matched_tests = _lookup_counts(conn, from_where, params)
+        except sqlite3.OperationalError:
+            # e.g. "fts5: syntax error" from an injection-y / malformed query.
+            total_runs = failure_count = matched_tests = 0
+    # limit >= MIN_LIMIT (1), so whenever failure_count > 0 this fetches at
+    # least the most recent failing row (which also supplies last_failure_at).
+    failed = _lookup_failures(conn, from_where, params, limit) if failure_count else []
 
     failures_out = [
         {
@@ -214,14 +241,14 @@ def test_failure_lookup(conn, test_id: str, limit: int = domain.DEFAULT_LIMIT,
             "message": r["failure_message"],
             "stack_trace_excerpt": _truncate(r["stack_trace"], max_trace),
         }
-        for r in failed[:limit]
+        for r in failed
     ]
 
     return {
         "test_id": test_id,
         "matched_tests": matched_tests,
-        "total_runs": len(all_rows),
-        "failure_count": len(failed),
+        "total_runs": total_runs,
+        "failure_count": failure_count,
         "last_failure_at": _row_timestamp(failed[0]) if failed else None,
         "failures": failures_out,
     }
@@ -238,17 +265,19 @@ def test_failure_lookup(conn, test_id: str, limit: int = domain.DEFAULT_LIMIT,
 # number of qualifying tests (``total_groups``) and the bounded, ordered
 # top-offenders slice. Counting and fetching as two statements would instead run
 # this aggregation twice. ``domain.FAIL_STATUSES_SQL`` is the shared
-# failure-status definition rendered as a static SQL fragment, and ``_ET_TR`` is
-# the ``tr.``-qualified "effective timestamp" expression (run_timestamp, else
-# ingested_at) from ``domain.effective_time`` — shared with the CLI so the rule
-# cannot drift between where it is queried and where it is pruned.
-_ET_TR = domain.effective_time("tr.")
+# failure-status definition rendered as a static SQL fragment, and ``_ET_TR``
+# (defined with the shared fragments above) is the ``tr.``-qualified "effective
+# timestamp" expression. ``last_failure_at`` wraps it in ``datetime()`` — the
+# same normalization the WHERE clause applies — because a raw-string MAX() over
+# mixed ``T``-separated ``run_timestamp`` and space-separated ``ingested_at``
+# values mis-orders same-date ties ('T' > ' '); this also makes the output
+# format uniform.
 _MODULE_CORE = (
     "SELECT tc.name AS name, tc.file_path AS file_path, tc.classname AS classname, "
     "       COUNT(*) AS total_runs, "
     "       SUM(CASE WHEN tc.status IN " + domain.FAIL_STATUSES_SQL + " THEN 1 ELSE 0 END) AS failure_count, "
     "       MAX(CASE WHEN tc.status IN " + domain.FAIL_STATUSES_SQL + " "
-    "                THEN " + _ET_TR + " END) AS last_failure_at "
+    "                THEN datetime(" + _ET_TR + ") END) AS last_failure_at "
     "FROM test_cases tc JOIN test_runs tr ON tr.id = tc.run_id "
     "WHERE tc.file_path LIKE ? ESCAPE '\\' "
     "  AND datetime(" + _ET_TR + ") >= datetime(?) "

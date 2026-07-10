@@ -11,10 +11,19 @@ visible in one place:
                            no-op without credentials).
 * ``pre_tool_call``      — approval escalation (plan D6.3, the *correct* Hermes
                            gate): ``{"action": "approve", ...}`` for
-                           ``heal_flaky_test`` with ``mode="pr"`` and for every
-                           ``jira_create_incident`` call. The host treats the
-                           directive fail-closed (error/deny/timeout ⇒ blocked).
-                           Pure dict inspection — no I/O on the hot path.
+                           ``heal_flaky_test`` with ``mode="pr"``, for every
+                           ``jira_create_incident`` call, and for
+                           ``stabilize_test_failure`` whenever the run could
+                           reach an external write — ``mode="pr"`` requested,
+                           or the tracker write is live (``jira.enable_write``
+                           on AND ``JIRA_API_TOKEN`` set; a failed config read
+                           escalates, fail closed). The pipeline calls its
+                           tracker stage as a plain function, so this hook is
+                           the D6.3 approval gate for that path too. The host
+                           treats the directive fail-closed (error/deny/timeout
+                           ⇒ blocked). Dict inspection plus, for stabilize
+                           only, one local config-file read — never network
+                           I/O on the hot path.
 * ``pre_approval_request`` / ``post_approval_response`` — the healer's audit
                            observers (registered by the healer stage itself).
 
@@ -25,15 +34,40 @@ exceptions to WARNING, but a broken hook still wastes a turn's error budget).
 from __future__ import annotations
 
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
 RULE_KEY_PR = "flaky_stab_pr"
 RULE_KEY_TRACKER_WRITE = "flaky_stab_tracker_write"
+RULE_KEY_STABILIZE = "flaky_stab_stabilize_pipeline"
+
+
+def _jira_write_live() -> bool:
+    """True when a pipeline run could reach the live Jira tracker.
+
+    The tracker write needs both ``jira.enable_write`` (config) and
+    ``JIRA_API_TOKEN`` (env); without the token no write can happen, so no
+    escalation is needed. A config read failure counts as live — fail closed,
+    like the host treats a broken approval directive.
+    """
+    if not os.environ.get("JIRA_API_TOKEN"):
+        return False
+    try:
+        from .. import config as unified_config
+
+        jira_cfg = unified_config.load_config().get("jira") or {}
+        return bool(jira_cfg.get("enable_write"))
+    except Exception:
+        logger.warning(
+            "unified config read failed in pre_tool_call; escalating "
+            "stabilize_test_failure (fail closed)", exc_info=True,
+        )
+        return True
 
 
 def pre_tool_call(tool_name: str = "", args: dict | None = None, **kwargs):
-    """Escalate the two sensitive calls to the human approval gate (D6.3)."""
+    """Escalate the sensitive calls to the human approval gate (D6.3)."""
     if tool_name == "heal_flaky_test":
         mode = str((args or {}).get("mode") or "").strip().lower()
         if mode == "pr":
@@ -54,6 +88,30 @@ def pre_tool_call(tool_name: str = "", args: dict | None = None, **kwargs):
             ),
             "rule_key": RULE_KEY_TRACKER_WRITE,
         }
+    if tool_name == "stabilize_test_failure":
+        # The orchestrator invokes its tracker/healer stages as plain function
+        # calls (no dispatch_tool), so the per-tool escalations above never
+        # fire inside a pipeline run — this rule is the D6.3 gate for the
+        # whole run whenever it could produce an external write.
+        reasons = []
+        mode = str((args or {}).get("mode") or "").strip().lower()
+        if mode == "pr":
+            reasons.append("open a pull request for a healed test (mode='pr')")
+        if _jira_write_live():
+            reasons.append(
+                "create a Jira issue on the bug branch (jira.enable_write is "
+                "on and JIRA_API_TOKEN is set)"
+            )
+        if reasons:
+            return {
+                "action": "approve",
+                "message": (
+                    "stabilize_test_failure may " + " and ".join(reasons) +
+                    ". The pipeline calls these stages directly, so this is "
+                    "the approval gate for the run. Allow?"
+                ),
+                "rule_key": RULE_KEY_STABILIZE,
+            }
     return None
 
 

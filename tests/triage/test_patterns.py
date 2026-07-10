@@ -88,3 +88,39 @@ def test_fts_when_available(tmp_path):
     fuzzy = s.lookup("proj", "other-sig", "connection refused redis")
     assert fuzzy is not None and fuzzy["fuzzy"] is True
     s.close()
+
+
+def _fts_variants(fts):
+    if fts and not patterns.fts5_available():
+        pytest.skip("FTS5 not available in this sqlite build")
+
+
+@pytest.mark.parametrize("fts", [False, True])
+def test_fuzzy_lookup_shared_stopword_returns_nothing(tmp_path, fts):
+    """Regression: one ubiquitous shared token ("error", "failed") must not
+    surface the project's most-seen pattern as a 'similar' prior for an
+    unrelated failure."""
+    _fts_variants(fts)
+    s = _store(tmp_path, fts=fts)
+    for _ in range(5):  # the project's most-seen pattern
+        s.record("proj", "hot-sig", "infra",
+                 "ERROR: connection refused to redis at startup")
+    # Shares only the ubiquitous "error" token with the stored sample.
+    assert s.lookup("proj", "other-sig",
+                    "ERROR: widget frobnicator melted unexpectedly") is None
+    # A query of nothing but failure vocabulary has no fuzzy signal at all.
+    assert s.lookup("proj", "other-sig", "error failure exception failed") is None
+    s.close()
+
+
+@pytest.mark.parametrize("fts", [False, True])
+def test_fuzzy_lookup_single_shared_token_is_not_similarity(tmp_path, fts):
+    _fts_variants(fts)
+    s = _store(tmp_path, fts=fts)
+    s.record("proj", "sig", "infra", "connection refused to redis at startup")
+    # Only "redis" is shared; one non-stopword token is not meaningful overlap.
+    assert s.lookup("proj", "other-sig", "redis wombat grapefruit") is None
+    # Two shared non-stopword tokens are.
+    fuzzy = s.lookup("proj", "other-sig", "redis startup wombat")
+    assert fuzzy is not None and fuzzy["fuzzy"] is True
+    s.close()

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -39,6 +40,10 @@ from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# build_id is untrusted input that ends up in a spool *filename*; anything
+# outside this class (path separators above all) is replaced with "-".
+_SAFE_BUILD_ID_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 STAGE_KEYS = (
     "evidence", "history", "detective", "triage",
@@ -157,11 +162,17 @@ class Pipeline:
             category = "flaky"
             notes.append("no triage category; forked on the detective verdict")
 
+        # The branch is decided HERE, at the fork, and recorded as such — the
+        # ledger must not reverse-engineer it from stage-result shapes (a heal
+        # branch that skipped the healer would otherwise record branch=NULL).
+        branch: str | None = None
         if category in heal_categories:
+            branch = "heal"
             for key in ("bugreport", "dedup", "pii", "tracker"):
                 results[key] = {"skipped": f"heal branch taken (category {category!r})"}
             outcome = self._heal_branch(args, test_id, results, notes)
         elif category is not None:
+            branch = "bug"
             results["healer"] = {"skipped": f"bug branch taken (category {category!r})"}
             outcome = self._bug_branch(args, log_path, test_id, results, notes)
         else:
@@ -176,7 +187,7 @@ class Pipeline:
             "stage_results": results,
             "notes": notes,
         }
-        self._ledger(args, category, outcome, results, time.monotonic() - started)
+        self._ledger(args, category, branch, outcome, results, time.monotonic() - started)
         return envelope
 
     # -- stage steps --------------------------------------------------------
@@ -196,7 +207,16 @@ class Pipeline:
                 results["evidence"] = {"error": f"fetch_ci_logs failed ({type(exc).__name__})"}
                 return None
             if isinstance(data, dict) and data.get("filtered_log"):
-                path = self._spool_log(data["filtered_log"], build_id)
+                try:
+                    # Inside the stage's error envelope: an unwritable spool dir
+                    # (or any other spool failure) is an evidence-stage error,
+                    # not a run abort that loses every result and the ledger row.
+                    path = self._spool_log(data["filtered_log"], build_id)
+                except Exception as exc:
+                    results["evidence"] = {
+                        "error": f"evidence spool failed ({type(exc).__name__})",
+                    }
+                    return None
                 results["evidence"] = {
                     "source": "fetch_ci_logs", "log": str(path),
                     "bytes_filtered": data.get("bytes_filtered"),
@@ -215,7 +235,10 @@ class Pipeline:
 
         spool = paths.get_data_dir() / "pipeline-evidence"
         spool.mkdir(parents=True, exist_ok=True)
-        path = spool / f"ci-log-{build_id}.log"
+        # build_id is untrusted ("123/456" would escape the spool dir or just
+        # fail on a missing subdirectory); sanitise before it names a file.
+        safe_id = _SAFE_BUILD_ID_RE.sub("-", build_id) or "unknown"
+        path = spool / f"ci-log-{safe_id}.log"
         path.write_text(text, encoding="utf-8")
         from ..paths import restrict_file
 
@@ -246,8 +269,14 @@ class Pipeline:
     def _verdict_is_flaky(detective_result) -> bool:
         return isinstance(detective_result, dict) and detective_result.get("is_flaky") is True
 
-    def _incident_context(self, log_path: str | None, test_id: str) -> list | None:
-        """The NET-NEW incidents→triage feedback seed (redacted, local-only)."""
+    def _incident_context(self, log_path: str | None, test_id: str,
+                          notes: list[str]) -> list | None:
+        """The NET-NEW incidents→triage feedback seed (redacted, local-only).
+
+        Failures here must never be silent: an errored lookup is otherwise
+        indistinguishable from "no similar incidents", so both fallbacks log a
+        warning and leave a note in the run.
+        """
         if self.stages.incident_search is None:
             return None
         query = test_id
@@ -258,14 +287,23 @@ class Pipeline:
                 from ..triage import prefilter
 
                 excerpt, _stats = prefilter.prefilter(raw)
-                query = triage_enrichment._top_signal_line(excerpt) or query
-            except Exception:
-                pass
+                query = triage_enrichment.top_signal_line(excerpt) or query
+            except Exception as exc:
+                logger.warning("incident-context query derivation failed", exc_info=True)
+                notes.append(
+                    f"incident-context query derivation failed "
+                    f"({type(exc).__name__}) — fell back to the bare test id"
+                )
         if not query:
             return None
         try:
             rows = self.stages.incident_search(query)
-        except Exception:
+        except Exception as exc:
+            logger.warning("incident-context lookup failed", exc_info=True)
+            notes.append(
+                f"incident-context lookup failed ({type(exc).__name__}) — "
+                f"triage ran without incident hints"
+            )
             return None
         return rows or None
 
@@ -276,7 +314,7 @@ class Pipeline:
         if self.stages.triage is None:
             results["triage"] = {"skipped": "triage stage unavailable"}
             return None
-        incident_context = self._incident_context(log_path, test_id)
+        incident_context = self._incident_context(log_path, test_id, notes)
         call: dict[str, Any] = {"log_url_or_path": log_path}
         if args.get("project"):
             call["project"] = args["project"]
@@ -332,8 +370,12 @@ class Pipeline:
         recovery."""
         if self.stages.ingest_synthetic is None:
             return
-        burnin = report.get("burn_in") or {}
-        repeats = int(burnin.get("repeats") or burnin.get("runs") or 0)
+        # The healer's real envelope is report["burnin"] (HealReport.to_dict)
+        # with the sandbox aggregate's "runs"/"passed" keys. Only stable heals
+        # reach this point, where passed == runs; prefer "passed" (what
+        # actually went green) with "runs" as the robustness fallback.
+        burnin = report.get("burnin") or {}
+        repeats = int(burnin.get("passed") or burnin.get("runs") or 0)
         classname, name = None, test_id
         if "::" in test_id:
             classname, name = test_id.rsplit("::", 1)
@@ -368,12 +410,26 @@ class Pipeline:
         else:
             results["dedup"] = {"skipped": "no dedup stage or empty summary"}
 
-        evidence_paths = list(args.get("evidence_paths") or [])
+        evidence_paths = self._coerce_evidence_paths(args.get("evidence_paths"),
+                                                     results, notes)
+        if evidence_paths is None:
+            return OUTCOME_NEEDS_ATTENTION
         if log_path and not str(log_path).startswith("http"):
             evidence_paths.append(str(log_path))
 
         pipeline_cfg = self.config.get("pipeline") or {}
-        if pipeline_cfg.get("require_pii_gate", True) and self.stages.gate is not None:
+        if pipeline_cfg.get("require_pii_gate", True):
+            if self.stages.gate is None:
+                # Fail CLOSED, mirroring assert_evidence_clean's scan-error
+                # policy: a required gate that cannot run must block the
+                # tracker, not wave the evidence through.
+                results["pii"] = {
+                    "ok": False,
+                    "error": "pii gate required by config but unavailable (fail closed)",
+                }
+                results["tracker"] = {"skipped": "pii_gate_unavailable — nothing sent"}
+                notes.append("PII gate required but unavailable — failing closed")
+                return OUTCOME_NEEDS_ATTENTION
             gate_result = self.stages.gate(evidence_paths)
             gate_dict = gate_result.to_dict() if hasattr(gate_result, "to_dict") else gate_result
             results["pii"] = gate_dict
@@ -382,9 +438,35 @@ class Pipeline:
                 notes.append("PII gate failed: scrub or drop the flagged evidence")
                 return OUTCOME_NEEDS_ATTENTION
         else:
-            results["pii"] = {"skipped": "gate disabled or unavailable"}
+            results["pii"] = {"skipped": "gate disabled by config"}
 
         return self._tracker(report, evidence_paths, results, notes)
+
+    @staticmethod
+    def _coerce_evidence_paths(raw: Any, results, notes) -> list[str] | None:
+        """Validate the untrusted ``evidence_paths`` argument.
+
+        The slash command (and models) routinely pass a lone string — iterating
+        it would char-split into single-character "paths" and send the gate
+        walking the filesystem root; a non-iterable would raise ``TypeError``
+        out of ``run()`` and lose the ledger row. A lone string is one path;
+        any other non-list shape is a clean stage error (``None`` return —
+        the caller ends the run as ``needs_attention`` with the row written).
+        """
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            return [raw] if raw.strip() else []
+        if isinstance(raw, (list, tuple)):
+            return [str(p) for p in raw]
+        results["pii"] = {
+            "ok": False,
+            "error": (f"invalid evidence_paths type ({type(raw).__name__}); "
+                      "expected a list of path strings"),
+        }
+        results["tracker"] = {"skipped": "invalid evidence_paths — nothing sent"}
+        notes.append("evidence_paths must be a list of file paths (or one path string)")
+        return None
 
     def _bugreport(self, args, log_path, test_id, results) -> dict | None:
         if self.stages.bugreport is None:
@@ -428,20 +510,50 @@ class Pipeline:
             parts.append(f"CI log: {log_path}")
         return "\n".join(parts) or "CI pipeline failure (no further evidence collected)"
 
+    @staticmethod
+    def _egress_mask(text: str) -> tuple[str, bool]:
+        """Egress canary (D6.4b hardening) on outbound ticket text.
+
+        ``redact_text`` misses PII classes the plugin's own scanner detects
+        (validated IBANs, space-separated SSNs, …), so after redaction the
+        detectors run once more over the assembled text and any remaining
+        finding is masked in place via its span. Returns ``(text, fired)``.
+        """
+        from ..pii.scanner import mask_pii
+
+        masked = mask_pii(text)
+        return masked, masked != text
+
     def _tracker(self, report, evidence_paths, results, notes) -> str:
-        ticket_body = self._ticket_body(report)
+        from ..pii import redaction
+
+        # D7: the TITLE is outbound text exactly like the body — redact it on
+        # this side too (the enabled path's build_ticket re-redacts internally,
+        # but the ticket_ready title is hand-pasted into Jira as returned).
+        title, title_fired = self._egress_mask(
+            redaction.redact_text(str(report.get("title") or "")))
+        body, body_fired = self._egress_mask(self._ticket_body(report))
+        egress_fired = title_fired or body_fired
+        if egress_fired:
+            notes.append(
+                "egress canary fired: PII remained after redaction and was "
+                "masked in the outbound ticket text"
+            )
         jira_cfg = self.config.get("jira") or {}
         if not jira_cfg.get("enable_write") or self.stages.tracker is None:
+            ticket: dict[str, Any] = {"title": title, "body": body}
+            if egress_fired:
+                ticket["egress_masked"] = True
             results["tracker"] = {
                 "skipped": "jira.enable_write is off",
-                "ticket": {"title": report.get("title", ""), "body": ticket_body},
+                "ticket": ticket,
             }
             notes.append("tracker write disabled — returning the ticket body to file manually")
             return OUTCOME_TICKET_READY
         try:
             raw = self.stages.tracker({
-                "title": report.get("title", ""),
-                "body": ticket_body,
+                "title": title,
+                "body": body,
                 "severity": report.get("severity", ""),
                 "evidence_paths": evidence_paths,
             })
@@ -479,18 +591,12 @@ class Pipeline:
 
     # -- ledger -----------------------------------------------------------------
 
-    def _ledger(self, args, category, outcome, results, duration_s) -> None:
+    def _ledger(self, args, category, branch, outcome, results, duration_s) -> None:
+        """Record the run; *branch* is the fork decision made in :meth:`run`
+        (never reverse-engineered from stage-result shapes, which would record
+        NULL for exactly the failed runs one queries the ledger for)."""
         if self.record_run is None:
             return
-        branch = None
-        healer_taken = isinstance(results.get("healer"), dict) \
-            and "skipped" not in results["healer"]
-        bug_taken = isinstance(results.get("bugreport"), dict) \
-            and "skipped" not in results["bugreport"]
-        if healer_taken:
-            branch = "heal"
-        elif bug_taken:
-            branch = "bug"
         try:
             self.record_run({
                 "trigger": "tool",
@@ -568,7 +674,6 @@ def build_pipeline(ctx, incidents_service) -> Pipeline:
         return triage_handlers.triage_pipeline_failure(
             call,
             llm=getattr(ctx, "llm", None),
-            dispatch_tool=getattr(ctx, "dispatch_tool", None),
             hermes_home=_resolve_home(),
             enable_enrichment=_enable_enrichment(),
             incident_context=incident_context,
@@ -576,7 +681,7 @@ def build_pipeline(ctx, incidents_service) -> Pipeline:
 
     def incident_search(query: str) -> list:
         incidents_service.ensure_initialized()
-        store = incidents_service._store
+        store = incidents_service.store
         if store is None:
             return []
         rows = store.search(query, limit=_INCIDENT_HINT_LIMIT)
@@ -593,7 +698,7 @@ def build_pipeline(ctx, incidents_service) -> Pipeline:
 
     def dedup_stage(summary: str) -> dict:
         incidents_service.ensure_initialized()
-        return dedup_mod.find_duplicate_incidents(incidents_service._store, summary)
+        return dedup_mod.find_duplicate_incidents(incidents_service.store, summary)
 
     def ingest_synthetic(**kwargs) -> int:
         conn = history_storage.get_connection()
@@ -651,14 +756,28 @@ def make_command(ctx, incidents_service):
                     "[repo_dir=…] [mode=suggest|pr] [project=…]")
         args: dict[str, Any] = {}
         head = tokens[0]
-        if head.startswith("http") or os.path.sep in head or os.path.exists(head):
+        if head.startswith("http"):
+            args["log_url_or_path"] = head
+        elif "::" in head and not os.path.exists(head):
+            # The documented `file_path::name` test-id form: a '::'-containing
+            # head that is not an actual file on disk is a test id, even when
+            # it carries a path separator (tests/login.spec.ts::checkout).
+            args["test_id"] = head
+        elif os.path.sep in head or os.path.exists(head):
             args["log_url_or_path"] = head
         else:
             args["test_id"] = head
         for token in tokens[1:]:
             if "=" in token:
                 key, value = token.split("=", 1)
-                args[key.strip()] = value.strip()
+                key, value = key.strip(), value.strip()
+                if key == "evidence_paths":
+                    # The tool contract wants a LIST; a raw string would be
+                    # char-split by an unaware consumer. Comma-separated form.
+                    args[key] = [p for p in (s.strip() for s in value.split(","))
+                                 if p]
+                else:
+                    args[key] = value
         handler = make_tool_handler(ctx, incidents_service)
         envelope = json.loads(handler(args))
         if not envelope.get("success"):
@@ -708,7 +827,7 @@ def make_find_duplicates_handler(incidents_service):
                 })
             incidents_service.ensure_initialized()
             result = dedup_mod.find_duplicate_incidents(
-                incidents_service._store, summary, args.get("limit", 5)
+                incidents_service.store, summary, args.get("limit", 5)
             )
             return json.dumps({"success": True, **result}, ensure_ascii=False)
         except Exception as exc:

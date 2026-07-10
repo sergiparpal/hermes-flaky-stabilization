@@ -5,6 +5,7 @@ payloads, the branch is always fix/flaky-<test>-<sig8>, and nothing ever
 pushes a default branch.
 """
 
+import shlex
 import subprocess
 
 import pytest
@@ -13,8 +14,10 @@ from flaky_healer.gitflow import (
     GitFlowError,
     branch_name,
     build_dispatches,
+    cleanup_dispatches,
     execute_locally,
     execute_via_ctx,
+    run_preflight,
     slugify_test_id,
 )
 
@@ -105,7 +108,9 @@ def test_dispatch_sequence_shape(tmp_path):
     tools = [d["tool"] for d in dispatches]
     assert tools == ["terminal", "terminal", "terminal", "terminal", "create_pull_request"]
     cmds = [d["arguments"].get("command", "") for d in dispatches[:4]]
-    assert "checkout -b" in cmds[0] and branch in cmds[0]
+    # cut from the validated CURRENT HEAD (no explicit start point), -B so a
+    # stale branch from a failed earlier attempt never blocks the retry
+    assert cmds[0].endswith(f"checkout -B {branch}")
     assert "apply --index" in cmds[1]
     assert "commit -m" in cmds[2]
     assert f"push -u origin {branch}" in cmds[3]
@@ -186,3 +191,93 @@ def test_execute_via_ctx_stops_on_error(fake_ctx):
     with pytest.raises(GitFlowError, match="denied by approval policy"):
         execute_via_ctx(fake_ctx, dispatches)
     assert len(fake_ctx.dispatched) == 1, "must stop at the first failed dispatch"
+
+
+def test_local_execution_idempotent_when_stale_branch_exists(tmp_path, git_world):
+    """A failed earlier attempt leaves the deterministic branch behind; the
+    retry must not die at branch creation (checkout -B, not -b)."""
+    work, origin = git_world
+    patch = _patch_file(tmp_path, work)
+    branch = branch_name("tests/flaky-selector.spec.ts", SIG)
+    _git(work, "branch", branch)  # stale leftover from a failed attempt
+
+    dispatches = build_dispatches(
+        repo_dir=work,
+        branch=branch,
+        base="main",
+        patch_path=patch,
+        commit_message="fix(flaky): retry after stale branch",
+        pr_title="t",
+        pr_body="b",
+    )
+    results = execute_locally(dispatches)
+    assert results[-1]["simulated"] is True
+    assert branch in _git(origin, "branch", "--list", branch)
+
+
+class _LocalGitCtx:
+    """Bridges dispatch_tool onto real local git (PR tool simulated), so the
+    preflight/cleanup path can be exercised against a real repo."""
+
+    def __init__(self):
+        self.dispatched = []
+
+    def dispatch_tool(self, name, arguments):
+        self.dispatched.append({"tool": name, "arguments": arguments})
+        command = arguments.get("command")
+        if command is None:
+            return {"url": f"local://pr/{arguments.get('head')}", "head": arguments.get("head")}
+        proc = subprocess.run(
+            shlex.split(command), capture_output=True, text=True, timeout=60
+        )
+        return {"exit_code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
+
+
+def test_preflight_against_real_repo(git_world):
+    work, _origin = git_world
+    ctx = _LocalGitCtx()
+    pre = run_preflight(ctx, work)
+    assert pre.original_ref == "main"
+    assert pre.head_sha == _git(work, "rev-parse", "HEAD")
+
+
+def test_preflight_refuses_dirty_tree_real_repo(git_world):
+    work, _origin = git_world
+    (work / "tests" / "flaky-selector.spec.ts").write_text("// uncommitted edit\n")
+    ctx = _LocalGitCtx()
+    with pytest.raises(GitFlowError, match="uncommitted changes"):
+        run_preflight(ctx, work)
+    # read-only: nothing beyond `git status` may have been dispatched
+    assert all("status --porcelain" in d["arguments"]["command"] for d in ctx.dispatched)
+
+
+def test_failed_push_restores_original_branch_and_deletes_fix_branch(tmp_path, git_world):
+    """End-to-end against real git: a mid-sequence failure (push to a removed
+    remote) must leave the user exactly where they started — original branch
+    checked out, clean tree, no stale fix branch."""
+    work, _origin = git_world
+    _git(work, "checkout", "-q", "-b", "feature/work")  # user's own branch
+    patch = _patch_file(tmp_path, work)
+    branch = branch_name("tests/flaky-selector.spec.ts", SIG)
+    ctx = _LocalGitCtx()
+
+    pre = run_preflight(ctx, work)
+    assert pre.original_ref == "feature/work"
+    _git(work, "remote", "remove", "origin")  # make the push step fail
+
+    dispatches = build_dispatches(
+        repo_dir=work,
+        branch=branch,
+        base="main",
+        patch_path=patch,
+        commit_message="m",
+        pr_title="t",
+        pr_body="b",
+    )
+    cleanup = cleanup_dispatches(work, pre.original_ref, branch=branch)
+    with pytest.raises(GitFlowError, match="dispatch terminal failed"):
+        execute_via_ctx(ctx, dispatches, on_error=cleanup)
+
+    assert _git(work, "rev-parse", "--abbrev-ref", "HEAD") == "feature/work"
+    assert _git(work, "status", "--porcelain") == "", "tree must be clean after cleanup"
+    assert branch not in _git(work, "branch", "--list", branch), "fix branch must be deleted"

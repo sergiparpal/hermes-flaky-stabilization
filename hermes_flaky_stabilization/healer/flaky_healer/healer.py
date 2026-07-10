@@ -21,7 +21,7 @@ from . import config, skill_export, strategies
 from . import diagnose as diagnose_mod
 from .recipes import matcher
 from .recipes import signature as signature_mod
-from .sandbox.base import RunReport, Sandbox, create_sandbox
+from .sandbox.base import RunReport, Sandbox, SandboxError, create_sandbox
 from .trace import TraceSummary
 
 _VOLATILE_DIAGNOSIS_KEYS = ("diagnosis_stage", "llm_used", "llm_error")
@@ -151,6 +151,8 @@ def _patch_and_burnin(
         )
     except strategies.StrategyError as exc:  # a faithful copy can't diverge, but stay safe
         return "", None, f"patch application failed: {exc}"
+    except SandboxError as exc:  # infra failure: surface a clean tool error
+        return "", None, f"sandbox failure during burn-in: {exc}"
     return diff, burnin, None
 
 
@@ -196,7 +198,14 @@ def heal(
     m = m or default_m
     n = n or default_n
     llm = _CountingLLM(complete_structured)
-    test_source = spec_path.read_text()
+    # Explicit utf-8: on LANG=C hosts the locale default is ASCII and a
+    # non-ASCII spec would raise UnicodeDecodeError out of the tool contract.
+    try:
+        test_source = spec_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        report.error = f"test file is not valid UTF-8: {spec_path} ({exc})"
+        report.duration_s = time.monotonic() - started
+        return report
 
     # --- signature + recipe short-circuit ------------------------------------
     parts: dict | None = None
@@ -255,7 +264,12 @@ def heal(
     report.ops = [op.to_dict() for op in ops]
 
     # --- reproduce on the unpatched project (validation is never skipped) -----
-    repro = sandbox.run_test(repo_dir, test_id, repeats=m)
+    try:
+        repro = sandbox.run_test(repo_dir, test_id, repeats=m)
+    except SandboxError as exc:  # infra failure: surface a clean tool error
+        report.error = f"sandbox failure during reproduce runs: {exc}"
+        report.duration_s = time.monotonic() - started
+        return report
     report.repro = repro.to_dict()
     report.reproduced = repro.any_failed
     if not report.reproduced:

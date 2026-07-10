@@ -56,10 +56,81 @@ def test_other_tools_yield_none(tmp_path):
 
 def test_pre_tool_call_is_pure_dict_inspection():
     # No registration/service needed: the hook body is a module function that
-    # does no I/O — safe on the host's hot path.
+    # does no I/O for the per-tool rules — safe on the host's hot path. (The
+    # stabilize rule below adds one local config read, never network I/O.)
     assert hooks.pre_tool_call(tool_name="heal_flaky_test", args={"mode": "pr"})
     assert hooks.pre_tool_call(tool_name="heal_flaky_test", args=None) is None
     assert hooks.pre_tool_call(tool_name="", args={}) is None
+
+
+# --- stabilize_test_failure escalation (D6.3 closure) --------------------------------
+#
+# The pipeline calls its tracker/healer stages as PLAIN functions (no
+# dispatch_tool), so the per-tool jira_create_incident/heal_flaky_test rules
+# never fire inside a run — pre_tool_call must escalate the pipeline entry
+# itself whenever the run could reach an external write.
+
+
+def _write_unified_jira_cfg(home, **jira):
+    from hermes_flaky_stabilization import config as unified_config
+
+    unified_config.write_config({"jira": jira}, home / "flaky-stabilization")
+
+
+def test_stabilize_pr_mode_yields_approve_directive(tmp_path):
+    # Escalates even with tracker write dead (no token, write disabled): the
+    # heal-PR path is itself a cross-host write.
+    ctx = _register(tmp_path)
+    results = ctx.fire_hook("pre_tool_call", tool_name="stabilize_test_failure",
+                            args={"mode": "pr", "repo_dir": ".", "test_id": "t"})
+    directives = [r for r in results if r]
+    assert len(directives) == 1
+    assert directives[0]["action"] == "approve"
+    assert directives[0]["rule_key"] == "flaky_stab_stabilize_pipeline"
+    assert directives[0]["message"]
+
+
+def test_stabilize_escalates_when_jira_write_is_live(_isolated_env, monkeypatch):
+    """SCENARIO: jira.enable_write=true + JIRA_API_TOKEN set — the pipeline's
+    plain-function tracker stage could create a real Jira issue, so even a
+    suggest-mode call must be approval-escalated."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    _write_unified_jira_cfg(_isolated_env, enable_write=True,
+                            base_url="https://x.atlassian.net")
+    directive = hooks.pre_tool_call(tool_name="stabilize_test_failure",
+                                    args={"test_id": "t"})
+    assert directive is not None
+    assert directive["action"] == "approve"
+    assert directive["rule_key"] == "flaky_stab_stabilize_pipeline"
+    assert "Jira" in directive["message"]
+
+
+def test_stabilize_stays_silent_when_no_write_is_reachable(_isolated_env, monkeypatch):
+    # Token present but write disabled: the tracker handler refuses, no write.
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    _write_unified_jira_cfg(_isolated_env, enable_write=False)
+    assert hooks.pre_tool_call(tool_name="stabilize_test_failure",
+                               args={"mode": "suggest"}) is None
+    # Write enabled but no token: the handler cannot authenticate, no write.
+    monkeypatch.delenv("JIRA_API_TOKEN", raising=False)
+    _write_unified_jira_cfg(_isolated_env, enable_write=True)
+    assert hooks.pre_tool_call(tool_name="stabilize_test_failure",
+                               args={}) is None
+
+
+def test_stabilize_escalates_when_config_read_fails(monkeypatch):
+    """Fail closed: an unreadable config with a token present must escalate."""
+    from hermes_flaky_stabilization import config as unified_config
+
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+
+    def boom(*args, **kwargs):
+        raise OSError("config unreadable")
+
+    monkeypatch.setattr(unified_config, "load_config", boom)
+    directive = hooks.pre_tool_call(tool_name="stabilize_test_failure", args={})
+    assert directive is not None and directive["action"] == "approve"
+    assert directive["rule_key"] == "flaky_stab_stabilize_pipeline"
 
 
 # --- PII gate (D6.4) -----------------------------------------------------------------
@@ -91,6 +162,71 @@ def test_gate_fails_closed_on_missing_path(tmp_path):
 def test_gate_with_no_paths_is_ok():
     result = gate.assert_evidence_clean([])
     assert result.ok and result.checked_paths == []
+
+
+def test_gate_passes_configured_max_files_to_the_scanner(_isolated_env, monkeypatch,
+                                                         tmp_path):
+    """Regression: pii.default_max_files in the unified config was dead — the
+    gate always called scan(path, None, None)."""
+    from hermes_flaky_stabilization import config as unified_config
+
+    unified_config.write_config({"pii": {"default_max_files": 123}},
+                                _isolated_env / "flaky-stabilization")
+    seen = {}
+
+    def fake_scan(target, types, max_files):
+        seen["max_files"] = max_files
+        return {"success": True, "clean": True, "complete": True}
+
+    monkeypatch.setattr(gate.scanner, "scan", fake_scan)
+    clean = tmp_path / "clean.log"
+    clean.write_text("all good\n", encoding="utf-8")
+    result = gate.assert_evidence_clean([str(clean)])
+    assert result.ok
+    assert seen["max_files"] == 123
+
+
+def test_gate_configured_max_files_bounds_the_walk(_isolated_env, tmp_path):
+    """End to end: a directory with more files than pii.default_max_files is a
+    truncated (incomplete) scan, so the gate fails closed."""
+    from hermes_flaky_stabilization import config as unified_config
+
+    unified_config.write_config({"pii": {"default_max_files": 1}},
+                                _isolated_env / "flaky-stabilization")
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    (evidence / "a.log").write_text("clean\n", encoding="utf-8")
+    (evidence / "b.log").write_text("clean\n", encoding="utf-8")
+    result = gate.assert_evidence_clean([str(evidence)])
+    assert not result.ok
+    assert str(evidence) in result.incomplete_paths
+
+
+def test_gate_invalid_or_oversized_config_value_degrades_safely(_isolated_env,
+                                                                monkeypatch, tmp_path):
+    """A bad config value must not turn every scan into a validation error
+    (which would fail the gate on clean evidence): invalid values fall back to
+    the scanner default, oversized ones are clamped to the scanner ceiling."""
+    from hermes_flaky_stabilization import config as unified_config
+    from hermes_flaky_stabilization.pii import scanner as pii_scanner
+
+    seen = []
+
+    def fake_scan(target, types, max_files):
+        seen.append(max_files)
+        return {"success": True, "clean": True, "complete": True}
+
+    monkeypatch.setattr(gate.scanner, "scan", fake_scan)
+    clean = tmp_path / "clean.log"
+    clean.write_text("all good\n", encoding="utf-8")
+
+    unified_config.write_config({"pii": {"default_max_files": -5}},
+                                _isolated_env / "flaky-stabilization")
+    assert gate.assert_evidence_clean([str(clean)]).ok
+    unified_config.write_config({"pii": {"default_max_files": 999_999}},
+                                _isolated_env / "flaky-stabilization")
+    assert gate.assert_evidence_clean([str(clean)]).ok
+    assert seen == [None, pii_scanner.MAX_MAX_FILES]
 
 
 # --- dedup (D9) ------------------------------------------------------------------------

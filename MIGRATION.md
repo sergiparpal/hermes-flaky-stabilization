@@ -34,9 +34,14 @@ JSON return shapes.
    runs/recipes/audit (v1 recipes get the relaxed-key backfill), and the
    incident index (+ links + sync watermark) into
    `flaky-stabilization/state.db`. Sources are opened read-only and left
-   byte-identical; re-running adds nothing (provenance rows in `meta` record
-   what was migrated when). `history.db` needs no migration — unchanged path
-   and schema. If your healer data dir was relocated via
+   byte-identical — if a source cannot be attached strictly read-only the
+   migration aborts with exit 1 rather than risk mutating it. Rows in the
+   surrogate-id tables (`scan_runs`, `healer_runs`, `audit`, `links`) get
+   fresh ids on copy, so nothing is lost when the unified DB already has rows
+   of its own; `--dry-run` reports the same target-table names and counts the
+   real run will copy. Re-running adds nothing (provenance rows in `meta`
+   record what was migrated when). `history.db` needs no migration — unchanged
+   path and schema. If your healer data dir was relocated via
    `FLAKY_HEALER_DATA_DIR`, point the importer at it:
    `hermes flaky-stab migrate --healer-db <dir>/healer.db`.
 
@@ -56,10 +61,13 @@ JSON return shapes.
 
 | Legacy | Unified (`flaky-stabilization/config.json`) |
 |---|---|
-| `test-history/config.json` | `history` section |
+| `test-history/config.json` | `history` section (still read; unified keys win per key) |
 | `flaky-detective/config.json` | `detective` section |
 | `hermes-jira-incidents.json` | `jira` + `incidents` sections |
 | ci-triage / healer env-only config | `triage` / `healer` sections (env still wins) |
+
+Precedence everywhere: env var > unified `config.json` section > legacy
+file (history only) > built-in default.
 
 ## Breaking changes (documented, accepted)
 

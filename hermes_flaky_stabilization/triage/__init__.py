@@ -149,7 +149,6 @@ def register(ctx: Any) -> None:
             return handlers.triage_pipeline_failure(
                 args if isinstance(args, dict) else {},
                 llm=getattr(ctx, "llm", None),
-                dispatch_tool=getattr(ctx, "dispatch_tool", None),
                 hermes_home=hermes_home,
                 enable_enrichment=_enable_enrichment(),
             )

@@ -59,8 +59,13 @@ def test_authorization_is_sent_as_unredirected_header(monkeypatch):
         status = 200
         headers: dict = {}
 
-        def read(self):
-            return b"{}"
+        def __init__(self):
+            self._data = b"{}"
+
+        def read(self, n=None):
+            # honor the transport's capped chunked-read contract: drain, then EOF
+            data, self._data = self._data, b""
+            return data
 
         def __enter__(self):
             return self
@@ -280,7 +285,10 @@ def test_pr_mode_refused_on_empty_diff(fake_ctx, monkeypatch):
     assert fake_ctx.dispatched == []
 
 
-def test_pr_branch_is_cut_from_base(tmp_path):
+def test_pr_branch_is_cut_from_validated_head(tmp_path):
+    """The branch is cut from the CURRENT HEAD — the commit burn-in actually
+    validated — never from base, which stays only the PR target (a cut from
+    base could publish a never-validated combination)."""
     from flaky_healer.gitflow import branch_name, build_dispatches
 
     branch = branch_name("tests/x.spec.ts", "deadbeefcafe")
@@ -288,7 +296,8 @@ def test_pr_branch_is_cut_from_base(tmp_path):
         repo_dir=tmp_path, branch=branch, base="main",
         patch_path=tmp_path / "p.patch", commit_message="m", pr_title="t", pr_body="b",
     )
-    assert dispatches[0]["arguments"]["command"].endswith(f"checkout -b {branch} main")
+    assert dispatches[0]["arguments"]["command"].endswith(f"checkout -B {branch}")
+    assert dispatches[-1]["arguments"]["base"] == "main", "base is only the PR target"
 
 
 # --- M5: audit hook writes to the same store as tool calls ------------------

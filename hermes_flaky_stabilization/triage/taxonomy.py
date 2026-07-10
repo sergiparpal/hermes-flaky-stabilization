@@ -72,9 +72,16 @@ CATEGORIES: list[Category] = [
             "tool version, missing binaries, permission errors, bad PATH or env "
             "vars."
         ),
+        # "no such file or directory" alone is NOT an environment signal — a
+        # missing test fixture is the data category's own definition — so it
+        # only counts when a binary-ish token appears on the same line (either
+        # side: "/usr/bin/env: 'python': No such file or directory" vs
+        # "No such file or directory: /usr/bin/tool").
         heuristic=re.compile(
             r"modulenotfounderror|no module named|importerror|cannot find module"
-            r"|command not found|no such file or directory.*(?:bin|exe)?"
+            r"|command not found"
+            r"|no such file or directory.*(?:/bin/|\.exe\b|\bbinary\b)"
+            r"|(?:/bin/|\.exe\b|\bbinary\b).*no such file or directory"
             r"|version `?\S+'? not found|incompatible version|unsupported version"
             r"|permission denied|could not find a version that satisfies"
             r"|enoent|\bglibc\b|\.so(?:\.\d+)*: cannot open", re.I),
@@ -123,8 +130,17 @@ CATEGORIES: list[Category] = [
             "dependence, intermittent network/timing flakes explicitly noted as "
             "flaky."
         ),
+        # This rule fires FIRST (priority 10), so it must be precise: `\bflak`
+        # would hit "flake8" (lint) and a bare retry mention would hit infra
+        # noise like "will retry in 5s" — both would misroute to the healer and
+        # be learned into the pattern store. Whole flaky words only, and retry
+        # mentions only in a retry-SUCCESS context ("passed on retry",
+        # "succeeded after 3 retries").
         heuristic=re.compile(
-            r"\bflak|\bintermittent\b|passed on retry|retr(?:y|ied)\b|race condition",
+            r"\bflak(?:y|e|iness)\b|\bintermittent\b"
+            r"|pass(?:ed|es)? (?:on|after) (?:\d+ |the )?retr(?:y|ies)\b"
+            r"|succeed(?:ed|s)? (?:on|after) (?:\d+ )?retr(?:y|ies)\b"
+            r"|race condition",
             re.I),
         priority=10,
     ),

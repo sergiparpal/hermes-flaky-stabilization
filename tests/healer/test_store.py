@@ -94,10 +94,10 @@ def test_recipe_upsert_get_bump(store):
     assert recipe.last_used_ts is not None
 
 
-def test_recipe_upsert_refresh_preserves_counters(store):
+def test_recipe_upsert_refresh_with_same_body_preserves_counters(store):
     store.upsert_recipe(
         "sig-2", diagnosis={"cause": "timeout"}, strategy="bump_timeout",
-        patch_ops=[], signature_parts={},
+        patch_ops=[{"op": "replace"}], signature_parts={},
     )
     store.bump_recipe("sig-2", success=True)
     store.upsert_recipe(
@@ -105,9 +105,9 @@ def test_recipe_upsert_refresh_preserves_counters(store):
         patch_ops=[{"op": "replace"}], signature_parts={},
     )
     recipe = store.get_recipe("sig-2")
-    assert recipe.hits == 1 and recipe.successes == 1, "refresh must keep counters"
+    assert recipe.hits == 1 and recipe.successes == 1, "same-body refresh keeps counters"
+    assert recipe.last_used_ts is not None
     assert recipe.diagnosis["v"] == 2
-    assert recipe.patch_ops == [{"op": "replace"}]
 
 
 def test_get_missing_recipe_is_none(store):

@@ -6,10 +6,15 @@ import json
 import re
 from urllib.parse import quote, urlparse
 
-from .base import CIError, Transport, UrllibTransport
+from .base import MAX_RESPONSE_BYTES, CIError, Transport, UrllibTransport
 
 API_VERSION = "2022-11-28"
 USER_AGENT = "hermes-flaky-healer/0.1.0"
+
+# Hard cap for the run-logs zip. The default UrllibTransport already enforces
+# this while streaming; the check in download_logs_zip keeps the guarantee for
+# injected transports too (the zipsafe budget only applies AFTER download).
+MAX_LOGS_ZIP_BYTES = MAX_RESPONSE_BYTES
 
 # repo/run_id are interpolated into the request path; constrain them to their
 # real shapes so a crafted value cannot traverse to another API path or inject a
@@ -97,4 +102,10 @@ class GitHubActionsCI:
     def download_logs_zip(self, repo: str, run_id: str) -> bytes:
         # GitHub answers with a 302 to short-lived blob storage; urllib follows it.
         repo, run_id = _safe_repo(repo), _safe_run_id(run_id)
-        return self._get(f"{self._base}/repos/{repo}/actions/runs/{run_id}/logs")
+        body = self._get(f"{self._base}/repos/{repo}/actions/runs/{run_id}/logs")
+        if len(body) > MAX_LOGS_ZIP_BYTES:
+            raise CIError(
+                f"run-logs zip for {repo} run {run_id} exceeds the "
+                f"{MAX_LOGS_ZIP_BYTES}-byte cap"
+            )
+        return body

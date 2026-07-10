@@ -160,6 +160,52 @@ class FakePluginContext:
         return [cb(*args, **kwargs) for cb in self.hooks.get(hook_name, [])]
 
 
+class FakeGitHost:
+    """``dispatch_executor`` double for the PR git flow.
+
+    Answers the read-only preflight commands (`status --porcelain`,
+    `rev-parse …`) with canned output in the ``{"exit_code": 0, "stdout": …}``
+    shape ``execute_locally`` produces, records every git command and PR call,
+    and can script a failure (``fail_on``) or a raised exception (``raise_on``)
+    for the first command containing a given substring.
+    """
+
+    def __init__(
+        self,
+        *,
+        porcelain: str = "",
+        head_ref: str = "main",
+        head_sha: str = "a1" * 20,
+        fail_on: tuple[str, object] | None = None,
+        raise_on: str | None = None,
+    ):
+        self.porcelain = porcelain
+        self.head_ref = head_ref
+        self.head_sha = head_sha
+        self.fail_on = fail_on
+        self.raise_on = raise_on
+        self.commands: list[str] = []
+        self.pr_calls: list[dict] = []
+
+    def __call__(self, tool, arguments):
+        command = arguments.get("command")
+        if command is None:  # the PR-creation tool
+            self.pr_calls.append(dict(arguments))
+            return {"url": f"fake://pr/{arguments.get('head')}", "number": 1}
+        self.commands.append(command)
+        if self.raise_on and self.raise_on in command:
+            raise RuntimeError(f"transport failure on {command!r}")
+        if self.fail_on and self.fail_on[0] in command:
+            return self.fail_on[1]
+        if "status --porcelain" in command:
+            return {"exit_code": 0, "stdout": self.porcelain}
+        if "rev-parse --abbrev-ref HEAD" in command:
+            return {"exit_code": 0, "stdout": self.head_ref + "\n"}
+        if "rev-parse HEAD" in command:
+            return {"exit_code": 0, "stdout": self.head_sha + "\n"}
+        return {"exit_code": 0, "stdout": ""}
+
+
 class FakeTransport:
     """HTTP double: maps (METHOD, url) -> (status, headers, body); records requests."""
 

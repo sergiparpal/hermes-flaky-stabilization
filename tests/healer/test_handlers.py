@@ -178,8 +178,9 @@ class TestHealFlakyTest:
         assert fake_ctx.dispatched == [], "suggest mode must not touch the write path"
 
     def test_pr_mode_emits_exact_dispatch_sequence(self, fake_ctx):
-        from conftest import TOY_APP
+        from conftest import TOY_APP, FakeGitHost
 
+        fake_ctx.dispatch_executor = FakeGitHost()
         data = _call(
             handlers.heal_flaky_test,
             {
@@ -198,17 +199,25 @@ class TestHealFlakyTest:
 
         assert re.fullmatch(r"fix/flaky-flaky-selector-[0-9a-f]{8}", pr["branch"])
 
-        # every write went through dispatch_tool, in order, and nothing else
+        # everything went through dispatch_tool, in order, and nothing else:
+        # 3 read-only preflight steps, 4 write steps, then the PR tool
         tools = [d["tool"] for d in fake_ctx.dispatched]
-        assert tools == ["terminal", "terminal", "terminal", "terminal", "create_pull_request"]
-        cmds = [d["arguments"].get("command", "") for d in fake_ctx.dispatched[:4]]
-        assert "checkout -b" in cmds[0] and pr["branch"] in cmds[0]
+        assert tools == ["terminal"] * 7 + ["create_pull_request"]
+        pre = [d["arguments"]["command"] for d in fake_ctx.dispatched[:3]]
+        assert "status --porcelain" in pre[0]
+        assert "rev-parse HEAD" in pre[1]
+        assert "rev-parse --abbrev-ref HEAD" in pre[2]
+        cmds = [d["arguments"].get("command", "") for d in fake_ctx.dispatched[3:7]]
+        assert "checkout -B" in cmds[0] and pr["branch"] in cmds[0]
         assert "apply --index" in cmds[1]
         assert "commit -m" in cmds[2]
         assert f"push -u origin {pr['branch']}" in cmds[3]
         assert all("push -u origin main" not in c for c in cmds)
-        pr_args = fake_ctx.dispatched[4]["arguments"]
+        pr_args = fake_ctx.dispatched[7]["arguments"]
         assert pr_args["head"] == pr["branch"] and pr_args["base"] == "main"
+        # the PR body records the commit burn-in actually validated
+        assert pr["validated_head"] == "a1" * 20
+        assert "a1" * 20 in pr_args["body"]
 
     def test_pr_mode_refused_when_burnin_unstable(self, fake_ctx):
         from conftest import TOY_APP, FakeSandbox, make_run_report

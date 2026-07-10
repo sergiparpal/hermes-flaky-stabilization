@@ -232,6 +232,23 @@ def classify(
                 normalised = _normalise_result(parsed)
                 if normalised is not None:
                     return normalised
+                # Non-exception failure path: a malformed parsed object or an
+                # out-of-taxonomy category. Warn — a host misintegration here
+                # would otherwise silently degrade EVERY call to the
+                # 0.3-confidence heuristic.
+                offending = parsed.get("category") if isinstance(parsed, dict) else None
+                logger.warning(
+                    "LLM returned unusable JSON classification (parsed type %s, "
+                    "category %r); using heuristic fallback",
+                    type(parsed).__name__,
+                    offending,
+                )
+            else:
+                logger.warning(
+                    "LLM returned non-JSON classification output "
+                    "(content_type %r); using heuristic fallback",
+                    content_type,
+                )
         except Exception as exc:
             # Provider error, schema-validation ValueError, malformed output —
             # all degrade to the heuristic rather than failing the tool. Log it

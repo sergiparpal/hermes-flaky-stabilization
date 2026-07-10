@@ -155,6 +155,30 @@ def test_fallback_matches_window_function_path(tmp_path):
     assert primary == fallback
 
 
+def test_fallback_read_tolerates_numeric_run_timestamp(tmp_path):
+    # A numeric run_timestamp (here a julian-day float, which SQLite's datetime()
+    # accepts, so the row survives the window filter) used to crash the fallback
+    # path: it sorted the *raw* rows, comparing float to str -> TypeError. It must
+    # normalize before sorting, like the window-function path. Row *contents* must
+    # agree between the paths (order may differ for this pathological input: SQL
+    # sorts numerics before text, normalized strings sort lexically).
+    db = build_test_history_db(tmp_path / "h.db", [
+        {"source_file": "a.xml", "run_timestamp": 2461188.5,   # 2026-05-28 (julian day)
+         "cases": [{"name": "t_num", "status": "failed"}]},
+        {"source_file": "b.xml", "run_timestamp": "2026-05-20T09:00:00",
+         "cases": [{"name": "t_str", "status": "failed"}]},
+    ])
+    conn = sqlite3.connect(query.read_only_uri(db), uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        primary = query._read_windowed(conn, CUTOFF)
+        fallback = query._fallback_read(conn, CUTOFF)
+    finally:
+        conn.close()
+    assert set(fallback) == set(primary)
+    assert all(isinstance(r[4], str) for r in fallback)   # normalized, core-safe
+
+
 def test_window_path_orders_rows_by_effective_time(tmp_path):
     # Runs inserted out of chronological order must come back ordered by eff_ts, so
     # the core's output order (and file_path backfill) is deterministic, not join-order.
@@ -257,6 +281,28 @@ def test_schema_mismatch_warns_but_still_reads(tmp_path, caplog):
 
 def test_read_only_uri_contains_mode_ro(tmp_path):
     assert query.read_only_uri(tmp_path / "h.db").endswith("?mode=ro")
+
+
+def test_read_only_uri_percent_encodes_special_chars(tmp_path):
+    # A raw `#`, `?`, or `%` in the DB path used to terminate/alter the URI's path
+    # part, silently dropping mode=ro and opening (even creating) a *different*
+    # file read-write. The path must be percent-encoded — SQLite decodes escapes
+    # in URI filenames — so the URI resolves to the same file, still read-only.
+    db = build_test_history_db(tmp_path / "hi#st%y.db", [
+        {"source_file": "a.xml", "run_timestamp": "2026-05-20T09:00:00",
+         "cases": [{"name": "t", "status": "failed"}]},
+    ])
+    before = {p.name for p in tmp_path.iterdir()}
+    conn = sqlite3.connect(query.read_only_uri(db), uri=True)
+    try:
+        # Resolves to the *same* file (its data is readable) ...
+        assert conn.execute("SELECT COUNT(*) FROM test_runs").fetchone()[0] == 1
+        # ... and is genuinely read-only (a write must fail).
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("CREATE TABLE pwned (x INTEGER)")
+    finally:
+        conn.close()
+    assert {p.name for p in tmp_path.iterdir()} == before   # no stray file created
 
 
 def test_connection_is_read_only(tmp_path):

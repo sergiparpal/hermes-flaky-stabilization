@@ -150,7 +150,7 @@ def fts_available(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
-def connect(db_path: Path | str | None = None) -> sqlite3.Connection:
+def connect(db_path: Path | str | None = None, *, uri: bool = False) -> sqlite3.Connection:
     """Open ``state.db`` with the schema ensured.
 
     WAL journal mode (with silent fallback for filesystems that refuse it),
@@ -158,10 +158,16 @@ def connect(db_path: Path | str | None = None) -> sqlite3.Connection:
     ``check_same_thread=False`` because tools may run in the gateway's async
     worker pool, owner-only file permissions. Callers own closing (short-lived
     connections via ``contextlib.closing`` are the house style).
+
+    ``uri=True`` sets ``SQLITE_OPEN_URI`` on the connection so that later
+    ``ATTACH 'file:…?mode=ro'`` filenames are honored regardless of the
+    build's ``SQLITE_USE_URI`` default — the legacy migration relies on this
+    for its strictly read-only source attaches. Plain paths (which never
+    start with ``file:``) are unaffected by the flag.
     """
     path = Path(db_path) if db_path is not None else state_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=15, check_same_thread=False)
+    conn = sqlite3.connect(str(path), timeout=15, check_same_thread=False, uri=uri)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA journal_mode=WAL")

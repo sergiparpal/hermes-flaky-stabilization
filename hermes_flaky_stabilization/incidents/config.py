@@ -205,8 +205,20 @@ class IncidentsConfig:
 
     def run_sync_kwargs(self) -> dict[str, Any]:
         """Build the keyword args for :func:`ingest.run_sync`."""
+        fields = list(self.fields) if self.fields else None
+        if self.root_cause_field:
+            # The configured root-cause field must actually be requested from
+            # Jira, or extract_root_cause can never see it. When `fields` is
+            # unset the client would fall back to DEFAULT_SEARCH_FIELDS, which
+            # cannot include a per-site custom field — materialise the default
+            # list and append. (Without this, root_cause_field was a silent
+            # no-op and jira_get_root_cause fell back to the description.)
+            if fields is None:
+                fields = list(jira_mod.DEFAULT_SEARCH_FIELDS)
+            if self.root_cause_field not in fields:
+                fields.append(self.root_cause_field)
         return {
-            "fields": list(self.fields) if self.fields else None,
+            "fields": fields,
             "root_cause_field": self.root_cause_field or None,
             "page_size": self.page_size,
             "max_pages": self.max_pages,

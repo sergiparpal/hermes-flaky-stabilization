@@ -35,6 +35,24 @@ for _name in ("classifier", "enrichment", "handlers", "logfetch", "patterns",
 PLUGIN_PACKAGE = _pkg
 
 
+@pytest.fixture(autouse=True)
+def isolated_unified_config(tmp_path, monkeypatch):
+    """Point the unified config at an empty temp data dir for every test.
+
+    ``logfetch``/``safehttp`` now consult ``<data_dir>/config.json`` for
+    ``triage.log_roots`` / ``token_hosts`` / ``allow_private`` when the
+    HERMES_CI_TRIAGE_* env vars are unset — a real operator config must never
+    leak into (or be created by) the suite. Config-wiring tests write their
+    config.json into the returned directory.
+    """
+    from hermes_flaky_stabilization import paths
+
+    cfg_dir = tmp_path / "flaky-stab-config"
+    cfg_dir.mkdir(exist_ok=True)
+    monkeypatch.setattr(paths, "get_data_dir", lambda: cfg_dir)
+    return cfg_dir
+
+
 @pytest.fixture
 def tmp_hermes_home(tmp_path, monkeypatch):
     """Point HERMES_HOME (and Path.home) at a temp dir so SQLite lands there."""

@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 
 from . import parser
+from .timeutil import parse_iso_window
 
 logger = logging.getLogger(__name__)
 
@@ -105,12 +106,21 @@ def ingest_synthetic_run(conn, *, suite_name: str = "flaky-healer-burnin",
     ``classname``, ``name`` (required), ``file_path``, ``status`` (default
     ``passed``), ``failure_message``, ``failure_type``, ``stack_trace``,
     ``duration_ms``, ``line_number``. Returns the new ``test_runs.id``.
+
+    ``run_timestamp`` is normalized through the shared ISO parser (raising
+    ``ValueError`` on garbage) so the module's naive-UTC invariant holds for
+    synthetic rows too — a tz-aware value stored verbatim would poison every
+    future chronological comparison for this test, and an unparseable one
+    would make the run invisible to time-windowed queries.
     """
     from datetime import UTC, datetime
 
     if not cases:
         raise ValueError("cases must be a non-empty list")
-    stamp = run_timestamp or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    if run_timestamp:
+        stamp = parse_iso_window(run_timestamp, "run_timestamp")
+    else:
+        stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
     pseudo = source_file or f"synthetic://{suite_name}/{stamp}"
     failures = sum(1 for c in cases if c.get("status") == "failed")
     errors = sum(1 for c in cases if c.get("status") == "error")

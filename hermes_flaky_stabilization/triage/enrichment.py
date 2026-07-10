@@ -23,6 +23,7 @@ detection and on the in-package ``history`` stage for data.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from . import prefilter
@@ -37,13 +38,47 @@ _ENRICH_LIMIT = 5
 
 _SOURCE = "test_failure_lookup"
 
+# Prefilter-injected marker lines ("... (N lines omitted) ..." and the
+# "⟪ previous line repeated N more times ⟫" collapse marker).
+_PREFILTER_MARKER_RE = re.compile(
+    r"^\s*(?:\.\.\. \(\d+ lines omitted\) \.\.\."
+    r"|⟪ previous line repeated \d+ more times? ⟫)\s*$"
+)
 
-def _top_signal_line(excerpt: str) -> str:
-    """Pick the most representative line of *excerpt* to seed the lookup query."""
-    for line in (excerpt or "").split("\n"):
+
+def _is_synthetic_line(line: str) -> bool:
+    """True for lines the prefilter injected rather than took from the log.
+
+    The truncation note contains the word "failure", so
+    ``prefilter.is_failure_line`` matches it — without this guard every
+    truncated excerpt would seed the history lookup with the note itself
+    (it is the excerpt's first line) and enrichment would silently never
+    work on exactly the big logs it matters for.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if stripped.startswith(prefilter.TRUNCATION_NOTE):
+        return True
+    return bool(_PREFILTER_MARKER_RE.match(line))
+
+
+def top_signal_line(excerpt: str) -> str:
+    """Pick the most representative line of *excerpt* to seed the lookup query.
+
+    Public seam: the orchestrator reuses this to derive its incident-context
+    query from the triage excerpt."""
+    lines = (excerpt or "").split("\n")
+    for line in lines:
+        if _is_synthetic_line(line):
+            continue
         if prefilter.is_failure_line(line):
             return line.strip()[:_SIGNAL_LINE_CHARS]
-    return (excerpt or "").strip().split("\n")[0][:_SIGNAL_LINE_CHARS]
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not _is_synthetic_line(line):
+            return stripped[:_SIGNAL_LINE_CHARS]
+    return ""
 
 
 def _history_lookup(query: str) -> dict[str, Any]:
@@ -64,7 +99,7 @@ def enrich(excerpt: str) -> dict[str, Any] | None:
     unreadable history DB, a validation error, or any other exception yields
     ``None``.
     """
-    query = _top_signal_line(excerpt)
+    query = top_signal_line(excerpt)
     if not query:
         return None
     try:

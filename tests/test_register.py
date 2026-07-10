@@ -95,6 +95,24 @@ def test_register_twice_on_fresh_contexts_is_idempotent():
     assert set(first.cli_commands) == set(second.cli_commands) == EXPECTED_CLI_COMMANDS
 
 
+def test_cli_mismatch_does_not_block_tool_loading():
+    """Policy: a host register_cli_command mismatch must not block tool
+    loading — and it must cover BOTH CLI registrations (`flaky-stab` and the
+    history stage's `test-history` alias). Before the guard was hoisted over
+    the alias, a mismatch killed the entire plugin (0 of 16 tools)."""
+
+    class HostileCliContext(FakePluginContext):
+        def register_cli_command(self, *args, **kwargs):
+            raise TypeError("register_cli_command() got an unexpected keyword argument")
+
+    import hermes_flaky_stabilization as plugin
+
+    ctx = HostileCliContext()
+    plugin.register(ctx)  # must not raise
+    assert set(ctx.tools) == EXPECTED_TOOLS  # every tool still loaded
+    assert ctx.cli_commands == {}  # both CLI commands degraded, not fatal
+
+
 def test_cli_command_is_wired():
     ctx = _register()
     entry = ctx.cli_commands["flaky-stab"]

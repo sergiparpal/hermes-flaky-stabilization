@@ -209,13 +209,22 @@ def test_migrate_dry_run_writes_nothing(legacy_home):
     home, _counts, _parts = legacy_home
     before_hashes = _hashes(home)
     reports = {r.name: r for r in migrate_legacy.migrate(home, dry_run=True)}
+    # The dry run counts through the same legacy->target mapping the copiers
+    # use and reports TARGET names — including the sources whose legacy names
+    # differ (healer `runs` -> `healer_runs`, triage `patterns` ->
+    # `triage_patterns`) — so its output predicts the real run.
     assert reports["jira_incidents"].tables == {"incidents": 2, "links": 1, "meta": 1}
+    assert reports["flaky_healer"].tables == {"healer_runs": 1, "recipes": 1, "audit": 1}
+    assert reports["ci_triage"].tables == {"triage_patterns": 1}
+    assert reports["flaky_detective"].tables == {"flaky_verdicts": 2, "scan_runs": 1}
     assert all(r.skipped == "dry-run (nothing written)" for r in reports.values())
     counts = _state_counts()
     assert all(count == 0 for count in counts.values()), counts
     assert _hashes(home) == before_hashes
-    # A real run after the dry run still copies everything.
-    migrate_legacy.migrate(home)
+    # A real run after the dry run copies exactly what the dry run predicted.
+    real = {r.name: r for r in migrate_legacy.migrate(home)}
+    assert ({name: r.tables for name, r in real.items()}
+            == {name: r.tables for name, r in reports.items()})
     assert _state_counts()["incidents"] == 2
 
 
@@ -235,6 +244,109 @@ def test_migrate_never_clobbers_newer_unified_rows(legacy_home):
     with closing(state.connect()) as conn:
         row = conn.execute("SELECT summary FROM incidents WHERE key='INC-1'").fetchone()
     assert row["summary"] == "NEWER unified row"  # INSERT OR IGNORE kept ours
+
+
+def test_migrate_keeps_legacy_rows_despite_autoincrement_id_collisions(legacy_home):
+    """Surrogate autoincrement ids must NOT be copied: if the unified DB
+    already wrote rows (a scan/heal/link before migrating), its rowids start
+    at 1 exactly like the legacy DBs', and copying legacy ids via INSERT OR
+    IGNORE would silently drop every colliding legacy row — unrecoverably,
+    since the provenance marker blocks re-runs. Fresh rowids keep them all."""
+    home, _counts, _parts = legacy_home
+    with closing(state.connect()) as conn, conn:
+        conn.execute(
+            "INSERT INTO scan_runs (window_days, min_fails, include_errors,"
+            " tests_examined, flaky_found) VALUES (7, 1, 1, 10, 0)")
+        conn.execute("INSERT INTO healer_runs (ts, source) VALUES"
+                     " ('2026-07-01', 'pre-migration')")
+        conn.execute("INSERT INTO audit (ts, event) VALUES"
+                     " ('2026-07-01', 'pre-migration-event')")
+        conn.execute("INSERT INTO links (session_id, incident_key) VALUES"
+                     " ('s0', 'INC-0')")
+
+    reports = {r.name: r for r in migrate_legacy.migrate(home)}
+    assert reports["flaky_detective"].tables["scan_runs"] == 1
+    assert reports["flaky_healer"].tables == {"healer_runs": 1, "recipes": 1, "audit": 1}
+    assert reports["jira_incidents"].tables["links"] == 1
+
+    counts = _state_counts()
+    # 1 pre-existing unified row + 1 legacy row each: nothing vanished.
+    assert counts["scan_runs"] == 2
+    assert counts["healer_runs"] == 2
+    assert counts["audit"] == 2
+    assert counts["links"] == 2
+    with closing(state.connect()) as conn:
+        events = {r["event"] for r in conn.execute("SELECT event FROM audit")}
+    assert events == {"pre-migration-event", "pre_approval_request"}
+
+
+def test_attach_ro_write_protects_and_aborts_rather_than_degrade(legacy_home):
+    """The read-only promise (D4): attached legacy sources reject writes on
+    this connection, and a build that refuses the mode=ro URI attach makes
+    migration ABORT instead of falling back to a writable attach (which could
+    checkpoint a WAL-mode source on detach)."""
+    home, _counts, _parts = legacy_home
+    legacy_db = home / "hermes-jira-incidents.db"
+
+    # (a) writes through the attach are refused
+    with closing(state.connect(uri=True)) as conn:
+        migrate_legacy._attach_ro(conn, legacy_db)
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                conn.execute("INSERT INTO legacy.meta VALUES ('x', 'y')")
+        finally:
+            migrate_legacy._detach(conn)
+
+    # (b) a rejected read-only ATTACH aborts loudly — never a writable fallback
+    class NoUriAttachConn:
+        """Wraps a real connection; refuses URI-filename ATTACHes the way an
+        SQLite build without URI support would."""
+
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *params):
+            if sql.startswith("ATTACH") and params and \
+                    str(params[0][0]).startswith("file:"):
+                raise sqlite3.OperationalError("unable to open database file")
+            return self._real.execute(sql, *params)
+
+    with closing(state.connect(uri=True)) as conn:
+        with pytest.raises(migrate_legacy.MigrationError, match="read-only"):
+            migrate_legacy._attach_ro(NoUriAttachConn(conn), legacy_db)
+
+    # (c) an attach that silently comes up WRITABLE (mode=ro ignored) is
+    # detected by the write probe and aborted too — never used for copying
+    class SilentlyWritableAttachConn:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *params):
+            if sql.startswith("ATTACH"):
+                return self._real.execute(
+                    "ATTACH DATABASE ? AS legacy", (str(legacy_db),))
+            return self._real.execute(sql, *params)
+
+    with closing(state.connect(uri=True)) as conn:
+        with pytest.raises(migrate_legacy.MigrationError, match="writable"):
+            migrate_legacy._attach_ro(SilentlyWritableAttachConn(conn), legacy_db)
+
+
+def test_cli_migrate_reports_migration_error_as_failure(profile_env, monkeypatch,
+                                                        capsys):
+    import argparse
+
+    from hermes_flaky_stabilization import cli
+    from hermes_flaky_stabilization.storage import migrate_legacy as ml
+
+    def refuse(**kwargs):
+        raise ml.MigrationError("cannot attach legacy DB read-only (probe)")
+
+    monkeypatch.setattr(ml, "migrate", refuse)
+    parser = argparse.ArgumentParser(prog="flaky-stab")
+    cli.setup_cli(parser)
+    assert cli.run_cli(parser.parse_args(["migrate"])) == 1
+    assert "migration aborted" in capsys.readouterr().out
 
 
 def test_cli_migrate_and_status(legacy_home, capsys):
@@ -286,3 +398,8 @@ def test_install_cron_with_jira_sync(profile_env, monkeypatch, capsys):
     assert names == ["flaky-stabilization", "flaky-stabilization-jira-sync"]
     shim = profile_env / "scripts" / "flaky-stab-jira-sync.sh"
     assert shim.exists()
+    content = shim.read_text(encoding="utf-8")
+    # D10: --quiet keeps successful ticks silent (no nightly delivery noise);
+    # exec propagates the sync's exit code so failures still alert.
+    assert "exec hermes flaky-stab jira sync --quiet" in content
+    assert "set -euo pipefail" in content

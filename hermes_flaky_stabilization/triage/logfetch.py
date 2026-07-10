@@ -5,7 +5,9 @@ Turns a ``log_url_or_path`` into raw text, safely, for two input shapes:
 * **Local path** — ``realpath``'d, confirmed to be a regular file, read with a
   hard byte cap. No credentials required; this path always works.
 * **Remote URL** — HTTPS only, explicit timeout, streamed read with the same
-  byte cap. The auth header targets the configured CI provider
+  byte cap, tail-biased: a body over the cap keeps its LAST cap-worth of bytes
+  (failures cluster at the end) and reports ``fetch_truncated`` via
+  :func:`fetch_with_stats`. The auth header targets the configured CI provider
   (**GitHub Actions**): a ``Bearer`` token read from ``GITHUB_TOKEN`` in the
   environment **at call time** (never at import). A missing/insufficient token
   surfaces as a :class:`LogFetchError` carrying a remediation hint rather than
@@ -28,6 +30,7 @@ import socket
 import ssl
 import urllib.error
 import urllib.request
+from collections import deque
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -53,9 +56,28 @@ _PERMS_HINT = "Check the path and file permissions."
 _TIMEOUT_HINT = "Retry, or point at a smaller/specific job log."
 
 # Optional allowlist of directories local logs may be read from (os.pathsep-
-# separated). Unset = no restriction (default); set it to confine reads so the
-# tool cannot be steered into reading arbitrary files (~/.ssh/id_rsa, .env, …).
+# separated). Set it to confine reads so the tool cannot be steered into
+# reading arbitrary files (~/.ssh/id_rsa, .env, …). Precedence: this env var,
+# then the unified config's ``triage.log_roots`` (string or list), then no
+# restriction (default).
 _LOG_ROOTS_ENV = "HERMES_CI_TRIAGE_LOG_ROOTS"
+
+
+def _config_triage() -> dict:
+    """The unified config's ``triage`` section (``{}`` when unavailable).
+
+    Consulted only when the corresponding ``HERMES_CI_TRIAGE_*`` env var is
+    unset, so env vars keep highest precedence and env-only setups behave
+    exactly as before. Never raises: any config problem degrades to the
+    built-in defaults.
+    """
+    try:
+        from .. import config as unified_config
+
+        section = unified_config.load_config().get("triage")
+        return section if isinstance(section, dict) else {}
+    except Exception:
+        return {}
 
 
 def _safe_path(path: str) -> str:
@@ -93,14 +115,26 @@ def has_remote_credentials() -> bool:
 
 # The auth token is sent ONLY to these hosts. GitHub Actions job-log URLs live on
 # the API host and 302-redirect to a pre-signed blob URL that needs no token, so
-# we never have to send it anywhere else. Override/extend for GitHub Enterprise
-# via HERMES_CI_TRIAGE_TOKEN_HOSTS (comma-separated hostnames).
+# we never have to send it anywhere else. Extend for GitHub Enterprise via
+# HERMES_CI_TRIAGE_TOKEN_HOSTS (comma-separated hostnames), or — when that env
+# var is unset — the unified config's ``triage.token_hosts`` (string or list).
 _DEFAULT_TOKEN_HOSTS = ("api.github.com", "raw.githubusercontent.com")
 
 
 def _token_hosts() -> set:
     hosts = set(_DEFAULT_TOKEN_HOSTS)
-    for h in os.environ.get("HERMES_CI_TRIAGE_TOKEN_HOSTS", "").split(","):
+    raw = os.environ.get("HERMES_CI_TRIAGE_TOKEN_HOSTS", "")
+    if raw.strip():
+        extra = raw.split(",")
+    else:
+        cfg_val = _config_triage().get("token_hosts")
+        if isinstance(cfg_val, str):
+            extra = cfg_val.split(",")
+        elif isinstance(cfg_val, list):
+            extra = [str(h) for h in cfg_val]
+        else:
+            extra = []
+    for h in extra:
         h = h.strip().lower()
         if h:
             hosts.add(h)
@@ -121,17 +155,32 @@ def _timeout_error(url: str, timeout: float) -> LogFetchError:
     )
 
 
-def _read_capped(resp) -> bytes:
-    """Read a response body up to :data:`MAX_LOG_BYTES`, then stop."""
-    chunks: list[bytes] = []
+def _read_capped(resp) -> tuple[bytes, bool]:
+    """Read a response body, keeping the LAST :data:`MAX_LOG_BYTES` bytes.
+
+    Tail-biased on purpose: the failure signal clusters at the end of a CI
+    log, so when the body exceeds the cap the HEAD is discarded (mirroring the
+    prefilter's keep-the-tail rule) instead of silently dropping the failure.
+    Returns ``(data, truncated)``; memory stays bounded by the cap.
+    """
+    chunks: deque[bytes] = deque()
     total = 0
-    while total < MAX_LOG_BYTES:
+    truncated = False
+    while True:
         chunk = resp.read(_READ_CHUNK)
         if not chunk:
             break
         chunks.append(chunk)
         total += len(chunk)
-    return b"".join(chunks)[:MAX_LOG_BYTES]
+        # Drop whole head chunks while doing so still leaves >= cap bytes.
+        while total - len(chunks[0]) >= MAX_LOG_BYTES:
+            total -= len(chunks.popleft())
+            truncated = True
+    data = b"".join(chunks)
+    if len(data) > MAX_LOG_BYTES:
+        data = data[-MAX_LOG_BYTES:]
+        truncated = True
+    return data, truncated
 
 
 # --------------------------------------------------------------------------
@@ -139,9 +188,25 @@ def _read_capped(resp) -> bytes:
 # --------------------------------------------------------------------------
 
 def _log_roots() -> list:
-    """Resolved directories that local logs may be read from (opt-in allowlist)."""
+    """Resolved directories that local logs may be read from (opt-in allowlist).
+
+    Precedence: ``HERMES_CI_TRIAGE_LOG_ROOTS`` env var, then the unified
+    config's ``triage.log_roots`` (a list, or an ``os.pathsep``-separated
+    string), then no restriction.
+    """
+    raw = os.environ.get(_LOG_ROOTS_ENV, "")
+    if raw.strip():
+        parts = raw.split(os.pathsep)
+    else:
+        cfg_val = _config_triage().get("log_roots")
+        if isinstance(cfg_val, str):
+            parts = cfg_val.split(os.pathsep)
+        elif isinstance(cfg_val, list):
+            parts = [str(p) for p in cfg_val]
+        else:
+            parts = []
     roots = []
-    for part in os.environ.get(_LOG_ROOTS_ENV, "").split(os.pathsep):
+    for part in parts:
         part = part.strip()
         if part:
             roots.append(os.path.realpath(os.path.expanduser(part)))
@@ -161,9 +226,10 @@ def _within_roots(real: str, roots: list) -> bool:
 def read_local(path: str) -> str:
     """Read a local log file with a realpath check and byte cap.
 
-    When HERMES_CI_TRIAGE_LOG_ROOTS is set, the resolved path (after symlink
-    resolution) must live inside one of those roots, so the tool cannot be
-    steered into reading arbitrary files such as ~/.ssh/id_rsa or .env.
+    When HERMES_CI_TRIAGE_LOG_ROOTS (or the unified config's
+    ``triage.log_roots``) is set, the resolved path (after symlink resolution)
+    must live inside one of those roots, so the tool cannot be steered into
+    reading arbitrary files such as ~/.ssh/id_rsa or .env.
     """
     real = os.path.realpath(os.path.expanduser(path))
     roots = _log_roots()
@@ -216,11 +282,19 @@ def read_local(path: str) -> str:
 def fetch_remote(url: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
     """Fetch a remote log over HTTPS with auth, timeout and byte cap.
 
+    Bodies over :data:`MAX_LOG_BYTES` keep the tail (see :func:`_read_capped`);
+    use :func:`fetch_with_stats` to learn whether that truncation happened.
+
     Safety: HTTPS only; the token is attached only to GitHub hosts
     (:func:`_host_allows_token`) and stripped on cross-host redirects; requests
     to loopback/link-local/reserved addresses are refused to blunt SSRF (the
     redirect/connect-time guards live in :mod:`safehttp`).
     """
+    return _fetch_remote(url, timeout=timeout)[0]
+
+
+def _fetch_remote(url: str, *, timeout: float = DEFAULT_TIMEOUT) -> tuple[str, bool]:
+    """:func:`fetch_remote`, also reporting whether the body was tail-truncated."""
     if not (url or "").strip().lower().startswith("https://"):
         raise LogFetchError(
             f"Refusing non-HTTPS URL: {url}",
@@ -245,8 +319,8 @@ def fetch_remote(url: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
     opener = safehttp.build_opener(context)
     try:
         with opener.open(request, timeout=timeout) as resp:
-            data = _read_capped(resp)
-        return data.decode("utf-8", errors="replace")
+            data, truncated = _read_capped(resp)
+        return data.decode("utf-8", errors="replace"), truncated
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             raise LogFetchError(
@@ -277,6 +351,20 @@ def fetch_remote(url: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
 
 def fetch(target: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
     """Resolve *target* (local path or https URL) to raw log text."""
+    return fetch_with_stats(target, timeout=timeout)[0]
+
+
+def fetch_with_stats(
+    target: str, *, timeout: float = DEFAULT_TIMEOUT
+) -> tuple[str, dict[str, object]]:
+    """Like :func:`fetch`, but also return retrieval stats.
+
+    ``stats["fetch_truncated"]`` is True when a remote body exceeded
+    :data:`MAX_LOG_BYTES` and only the LAST cap-worth of bytes was kept
+    (tail-biased — the failure clusters at the end of a CI log).
+    :func:`read_local` refuses oversize files outright, so local reads never
+    truncate.
+    """
     if not target or not str(target).strip():
         raise LogFetchError(
             "Empty log_url_or_path.",
@@ -284,5 +372,6 @@ def fetch(target: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
         )
     target = str(target).strip()
     if is_remote(target):
-        return fetch_remote(target, timeout=timeout)
-    return read_local(target)
+        text, truncated = _fetch_remote(target, timeout=timeout)
+        return text, {"fetch_truncated": truncated}
+    return read_local(target), {"fetch_truncated": False}

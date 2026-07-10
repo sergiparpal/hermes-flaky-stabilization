@@ -121,6 +121,28 @@ def test_non_iso_timestamp_falls_back_to_mtime(db, tmp_path):
     assert db.execute("SELECT datetime(?)", (run.run_timestamp,)).fetchone()[0] is not None
 
 
+def test_partial_suite_attrs_fall_back_to_case_counts(tmp_path):
+    # Suite A carries tests="3" but suite B has no attribute at all: summing
+    # only the suites that carry it would report total==3 for a run with 7
+    # parsed cases (and suppress the case-derived fallback). Suite-attribute
+    # sums are only trusted when EVERY suite carries the attribute.
+    p = tmp_path / "partial.xml"
+    p.write_text(
+        "<testsuites>"
+        '  <testsuite name="a" tests="3">'
+        '    <testcase name="a1"/><testcase name="a2"/><testcase name="a3"/>'
+        "  </testsuite>"
+        '  <testsuite name="b">'
+        '    <testcase name="b1"/><testcase name="b2"/>'
+        '    <testcase name="b3"/><testcase name="b4"/>'
+        "  </testsuite>"
+        "</testsuites>"
+    )
+    run = parser.parse_junit_xml(p)
+    assert len(run.cases) == 7
+    assert run.total == 7   # not 3 — partial attribute sums are not trusted
+
+
 def test_nested_testsuite_counts_not_doubled(tmp_path):
     # <testsuite> nested inside <testsuite> must not double-count run totals.
     p = tmp_path / "nested.xml"
@@ -236,6 +258,45 @@ def test_ingest_file_with_out_of_range_attrs_succeeds(db, tmp_path):
     case = db.execute("SELECT * FROM test_cases WHERE run_id=?", (run_id,)).fetchone()
     assert case is not None and case["line_number"] is None   # 1e308 -> NULL, no crash
     assert db.execute("SELECT total FROM test_runs WHERE id=?", (run_id,)).fetchone()[0] == 1
+
+
+def test_synthetic_run_normalizes_tz_aware_timestamp(db):
+    # A tz-aware ISO run_timestamp must be normalized to the module's naive-UTC
+    # form before storing, like every other write path. Stored verbatim it
+    # poisons the row: a chronological sort then mixes tz-aware and naive
+    # datetimes, breaking every future test_failure_lookup for that test.
+    from hermes_test_history import queries
+
+    rid = ingest.ingest_synthetic_run(
+        db,
+        cases=[{"name": "t_syn", "status": "failed", "failure_message": "boom"}],
+        run_timestamp="2026-07-09T12:00:00+00:00",
+    )
+    stored = db.execute("SELECT run_timestamp FROM test_runs WHERE id=?", (rid,)).fetchone()[0]
+    assert stored == "2026-07-09T12:00:00"   # naive-UTC ISO seconds, offset stripped
+    # An offset timestamp converts to UTC, not merely drops its suffix.
+    rid2 = ingest.ingest_synthetic_run(
+        db,
+        cases=[{"name": "t_syn", "status": "failed", "failure_message": "boom"}],
+        run_timestamp="2026-07-08T14:00:00+02:00",
+    )
+    stored2 = db.execute("SELECT run_timestamp FROM test_runs WHERE id=?", (rid2,)).fetchone()[0]
+    assert stored2 == "2026-07-08T12:00:00"
+    # Both rows sort chronologically alongside naive ones without raising.
+    r = queries.test_failure_lookup(db, "t_syn")
+    assert r["failure_count"] == 2
+    assert r["last_failure_at"] == "2026-07-09T12:00:00"
+
+
+def test_synthetic_run_rejects_garbage_timestamp(db):
+    # Garbage must raise (naming the field) rather than storing a value that
+    # SQLite's datetime() cannot parse — which would make the run invisible to
+    # every time-windowed query — and must leave no rows behind.
+    with pytest.raises(ValueError, match="run_timestamp"):
+        ingest.ingest_synthetic_run(
+            db, cases=[{"name": "t"}], run_timestamp="Tue May 10 14:22:01 2026"
+        )
+    assert db.execute("SELECT COUNT(*) FROM test_runs").fetchone()[0] == 0
 
 
 def test_ingest_directory_insert_failure_leaves_no_orphan_run(db, tmp_path, monkeypatch):

@@ -16,6 +16,22 @@ from ..trace import TraceSummary
 
 PART_KEYS = ("framework", "error_class", "failing_action", "selector_shape", "message_shape")
 
+# The failure-describing subset of PART_KEYS (framework alone says nothing).
+_FAILURE_KEYS = ("error_class", "failing_action", "selector_shape", "message_shape")
+
+
+def is_degenerate(parts: dict) -> bool:
+    """True when the parts carry no failure information at all.
+
+    A trace with no failed action and no error event (e.g. the trace of a
+    PASSING retry, a common mixup) yields all-empty parts, which hash to one
+    CONSTANT signature — unrelated failures would then exact-match a single
+    meaningless recipe. The matcher treats degenerate parts as a miss and the
+    store refuses to persist recipes under them.
+    """
+    parts = parts or {}
+    return not any(parts.get(k) for k in _FAILURE_KEYS)
+
 
 def signature_parts(
     *,

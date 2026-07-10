@@ -128,8 +128,12 @@ def run_cli(args) -> int:
     if command == "jira":
         from .incidents import cli as incidents_cli
 
-        incidents_cli.hermes_jira_incidents_command(args)
-        return 0
+        # AGREED CONTRACT with the incidents CLI: it returns an int exit code
+        # (0 success, 1 credential/config/JiraError failure). Propagate it so
+        # handled sync failures exit non-zero and the nightly cron shim can
+        # alert; tolerate None (treated as 0) so the seam stays robust.
+        rc = incidents_cli.hermes_jira_incidents_command(args)
+        return 0 if rc is None else rc
     if command == "migrate":
         return _cmd_migrate(args)
     print(f"flaky-stab: unknown subcommand {command!r}")  # unreachable via argparse
@@ -144,7 +148,13 @@ def _cmd_migrate(args) -> int:
         from pathlib import Path
 
         overrides["flaky_healer"] = Path(args.healer_db)
-    reports = migrate_legacy.migrate(dry_run=args.dry_run, overrides=overrides)
+    try:
+        reports = migrate_legacy.migrate(dry_run=args.dry_run, overrides=overrides)
+    except migrate_legacy.MigrationError as exc:
+        # e.g. a read-only ATTACH the SQLite build refused — abort loudly
+        # rather than risk touching a legacy source (D4 rollback promise).
+        print(f"migration aborted: {exc}")
+        return 1
     for report in reports:
         if not report.found:
             print(f"{report.name}: {report.path} (not found — skipped)")

@@ -21,7 +21,9 @@ def _v(test_key, status, *, passes=0, fails=0, name=None, classname="pkg.Mod",
     )
 
 
-def test_apply_schema_creates_tables(verdicts_db):
+def test_state_schema_creates_verdict_tables(verdicts_db):
+    # Pins the real DDL path: opening the storage connection runs the unified
+    # state.db schema (storage/state.py), which must create the verdict tables.
     names = {r["name"] for r in verdicts_db.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"flaky_verdicts", "scan_runs", "schema_version"} <= names

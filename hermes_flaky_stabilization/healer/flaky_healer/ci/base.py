@@ -15,6 +15,31 @@ class CIError(RuntimeError):
         self.status = status
 
 
+# Hard cap on a single HTTP response body. Run-logs zips realistically reach
+# hundreds of MB, and an unbounded ``resp.read()`` buffers the whole payload in
+# memory BEFORE the zipsafe budget can apply. 100 MiB is comfortably above any
+# legitimate payload this plugin processes while bounding worst-case memory.
+MAX_RESPONSE_BYTES = 100 * 1024 * 1024
+_READ_CHUNK_BYTES = 1024 * 1024
+
+
+def _read_capped(resp, url: str) -> bytes:
+    """Read ``resp`` in chunks, raising ``CIError`` beyond MAX_RESPONSE_BYTES."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = resp.read(_READ_CHUNK_BYTES)
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > MAX_RESPONSE_BYTES:
+            raise CIError(
+                f"response for {url} exceeds the {MAX_RESPONSE_BYTES}-byte cap; "
+                "refusing to buffer it"
+            )
+        chunks.append(chunk)
+
+
 @runtime_checkable
 class Transport(Protocol):
     """Minimal HTTP surface so tests can inject a fake (plan Phase 1.3)."""
@@ -42,9 +67,10 @@ class UrllibTransport:
                 req.add_header(key, value)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-                return resp.status, dict(resp.headers), resp.read()
+                return resp.status, dict(resp.headers), _read_capped(resp, url)
         except urllib.error.HTTPError as exc:
-            return exc.code, dict(exc.headers or {}), exc.read() or b""
+            # Error bodies only feed short diagnostic snippets; one chunk is plenty.
+            return exc.code, dict(exc.headers or {}), exc.read(_READ_CHUNK_BYTES) or b""
 
 
 @runtime_checkable

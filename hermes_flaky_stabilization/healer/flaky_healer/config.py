@@ -1,4 +1,11 @@
-"""Environment/config resolution and defaults (stdlib only)."""
+"""Environment/config resolution and defaults (stdlib only).
+
+Resolution order for every key that exists in the unified config's ``healer``
+section (plan D5): ``FLAKY_HEALER_*`` env var > ``config.json`` ``healer``
+section > built-in default. When the unified package is unavailable (flat
+legacy import context) or the file is missing/unreadable, behavior degrades
+to the historical env-only resolution.
+"""
 
 from __future__ import annotations
 
@@ -37,6 +44,39 @@ def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _unified_healer_config() -> dict:
+    """The ``healer`` section of the unified flaky-stabilization config.json.
+
+    The unified package resolves ``<hermes_home>`` itself via its ``paths``
+    helper (registration binds ``ctx.hermes_home`` to the same profile; this
+    module stays ctx-free by design). Imported lazily to avoid a circular
+    import at package init, and every failure — package not importable,
+    unreadable/absent file — degrades to ``{}`` so env-only behavior is
+    preserved exactly when the section is unset.
+    """
+    try:
+        from hermes_flaky_stabilization import config as unified_config
+        from hermes_flaky_stabilization import paths as unified_paths
+    except Exception:  # pragma: no cover — flat import context without the package
+        return {}
+    try:
+        # get_hermes_home()/<dir> rather than get_data_dir(): reading config
+        # must not create the data directory as a side effect.
+        section_dir = unified_paths.get_hermes_home() / unified_paths.DATA_DIR_NAME
+        section = unified_config.load_config(section_dir).get("healer")
+    except Exception:  # noqa: BLE001 — config lookup must never break the healer
+        return {}
+    return section if isinstance(section, dict) else {}
+
+
+def _cfg_str(key: str) -> str | None:
+    """A non-empty string value for *key* from the unified section, else None."""
+    value = _unified_healer_config().get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
 def data_dir(ctx=None) -> Path:
     """Profile-aware persistent data dir, created on demand.
 
@@ -63,15 +103,21 @@ def data_dir(ctx=None) -> Path:
     return base
 
 
+def _parse_burnin(raw: str) -> tuple[int, int] | None:
+    try:
+        m, n = raw.split(":")
+        return max(1, int(m)), max(1, int(n))
+    except ValueError:
+        return None
+
+
 def burnin() -> tuple[int, int]:
-    """(reproduce_runs M, burn_in_runs N); env override FLAKY_HEALER_BURNIN='5:10'."""
-    raw = os.environ.get(ENV_BURNIN, "")
-    if raw:
-        try:
-            m, n = raw.split(":")
-            return max(1, int(m)), max(1, int(n))
-        except ValueError:
-            pass
+    """(reproduce_runs M, burn_in_runs N); FLAKY_HEALER_BURNIN='5:10' > config."""
+    for raw in (os.environ.get(ENV_BURNIN, ""), _cfg_str("burnin") or ""):
+        if raw:
+            parsed = _parse_burnin(raw)
+            if parsed is not None:
+                return parsed
     return DEFAULT_BURNIN
 
 
@@ -85,25 +131,26 @@ def github_api_base() -> str:
 
 def sandbox_backend() -> str:
     """'auto' | 'docker' | 'subprocess'."""
-    return os.environ.get(ENV_SANDBOX, "auto").strip().lower() or "auto"
+    env = (os.environ.get(ENV_SANDBOX) or "").strip().lower()
+    return env or (_cfg_str("sandbox") or "auto").lower()
 
 
 def docker_image() -> str:
-    return os.environ.get(ENV_DOCKER_IMAGE, DEFAULT_DOCKER_IMAGE)
+    return os.environ.get(ENV_DOCKER_IMAGE) or _cfg_str("docker_image") or DEFAULT_DOCKER_IMAGE
 
 
 def git_tool() -> str:
     """Host tool name used to run git commands through the approval pipeline."""
-    return os.environ.get(ENV_GIT_TOOL, "terminal")
+    return os.environ.get(ENV_GIT_TOOL) or _cfg_str("git_tool") or "terminal"
 
 
 def pr_tool() -> str:
     """Host tool name used to open a pull request through the approval pipeline."""
-    return os.environ.get(ENV_PR_TOOL, "create_pull_request")
+    return os.environ.get(ENV_PR_TOOL) or _cfg_str("pr_tool") or "create_pull_request"
 
 
 def base_branch() -> str:
-    return os.environ.get(ENV_BASE_BRANCH, "main")
+    return os.environ.get(ENV_BASE_BRANCH) or _cfg_str("base_branch") or "main"
 
 
 def subproc_pass_env() -> list[str]:
@@ -122,7 +169,11 @@ def allow_subprocess_pr() -> bool:
     patch executed) on the host with no container isolation, so it must not be
     auto-promoted to a PR unless the operator explicitly opts in.
     """
-    return _truthy(os.environ.get(ENV_ALLOW_SUBPROC_PR))
+    raw = os.environ.get(ENV_ALLOW_SUBPROC_PR)
+    if raw is not None and raw.strip():
+        return _truthy(raw)
+    value = _unified_healer_config().get("allow_subprocess_pr")
+    return value if isinstance(value, bool) else False
 
 
 def subproc_isolate_net() -> bool:
@@ -160,8 +211,10 @@ def hardlink_copy() -> bool:
     Off by default. When on, project copies (above all the large, immutable
     ``node_modules`` tree) are hardlinked on the same filesystem — near-instant
     and disk-free — with a per-file real-copy fallback across devices. Safe
-    because the sandbox only edits the spec file and writes artifacts under
-    ``test-results/``; ``node_modules`` is never mutated at run time. Enable on
-    hosts where the project tree lives on a single filesystem.
+    because ``apply_ops`` replaces patched files via a sibling temp file +
+    ``os.replace``, landing every write on a NEW inode instead of the
+    hardlinked original (writing through the shared inode would silently edit
+    the user's real project); ``node_modules`` is never mutated at run time.
+    Enable on hosts where the project tree lives on a single filesystem.
     """
     return _truthy(os.environ.get(ENV_HARDLINK_COPY))

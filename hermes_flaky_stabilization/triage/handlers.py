@@ -7,15 +7,15 @@ Orchestrates the pipeline:
       → prefilter (bounded, signal-dense excerpt)
       → compute signature
       → patterns.lookup (prior becomes a classifier hint)
-      → optional ctx.dispatch_tool enrichment (guarded, non-fatal)
+      → optional in-package history enrichment (guarded, non-fatal)
       → classifier.classify (LLM + heuristic fallback)
       → patterns.record
       → JSON envelope
 
 Kept thin: this module decides nothing about *how* each step works, only the
 order and the error contract. It is pure standard library — Hermes objects
-(``llm``, ``dispatch_tool``, ``hermes_home``) are injected by ``register()``
-in ``__init__.py`` — so it unit-tests with fakes.
+(``llm``, ``hermes_home``) are injected by ``register()`` in ``__init__.py``
+— so it unit-tests with fakes.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from . import classifier, enrichment, logfetch, patterns, prefilter, redact
-from .ports import LlmPort, ToolDispatcher
+from .ports import LlmPort
 
 logger = logging.getLogger(__name__)
 
@@ -86,8 +86,24 @@ def _infer_project(args: dict[str, Any]) -> str:
 
 
 def _tail_excerpt(raw: str, n_lines: int = _NO_SIGNAL_TAIL_LINES) -> str:
+    """The low-signal fallback: the last *n_lines*, hard-capped by characters.
+
+    A line cap alone is no bound at all — a 20 MB single-line log (CR progress
+    bars, minified output) is "one line" and would flow whole through
+    redaction, every signature regex, and into the LLM call. Cap by
+    :data:`prefilter.DEFAULT_CHAR_CAP`, keeping the TAIL (errors cluster at
+    the end), with the standard truncation note.
+    """
     lines = prefilter.strip_ansi(raw).split("\n")
-    return "\n".join(lines[-n_lines:])
+    excerpt = "\n".join(lines[-n_lines:])
+    if len(excerpt) > prefilter.DEFAULT_CHAR_CAP:
+        excerpt = excerpt[-prefilter.DEFAULT_CHAR_CAP:]
+        # Snap to a clean line boundary when one exists (same rule as prefilter).
+        first_nl = excerpt.find("\n")
+        if 0 <= first_nl < len(excerpt) - 1:
+            excerpt = excerpt[first_nl + 1:]
+        excerpt = prefilter.TRUNCATION_NOTE + "\n" + excerpt
+    return excerpt
 
 
 def _open_and_lookup(
@@ -122,7 +138,6 @@ def triage_pipeline_failure(
     args: dict[str, Any],
     *,
     llm: LlmPort | None = None,
-    dispatch_tool: ToolDispatcher | None = None,
     hermes_home: str | None = None,
     enable_enrichment: bool = True,
     incident_context: Any | None = None,
@@ -144,7 +159,7 @@ def triage_pipeline_failure(
 
     # --- retrieve --------------------------------------------------------
     try:
-        raw = logfetch.fetch(target)
+        raw, fetch_stats = logfetch.fetch_with_stats(target)
     except logfetch.LogFetchError as exc:
         return _error(str(exc), getattr(exc, "remediation", ""))
     except Exception as exc:  # defensive — never leak a traceback
@@ -159,6 +174,8 @@ def triage_pipeline_failure(
     low_signal = stats.get("hit_count", 0) == 0
     if low_signal:
         excerpt = _tail_excerpt(raw)
+        if excerpt.startswith(prefilter.TRUNCATION_NOTE):
+            stats["truncated"] = True
     # Scrub secrets BEFORE the excerpt is hashed, stored, sent to the LLM, used
     # to seed enrichment, or echoed back. CI logs routinely contain tokens/keys;
     # everything downstream operates on this redacted form.
@@ -235,6 +252,11 @@ def triage_pipeline_failure(
             "low_signal": low_signal,
         },
     }
+    # Only present when a remote body exceeded the fetch cap and the tail was
+    # kept (key omitted otherwise — the envelope stays parity-identical with
+    # the legacy plugin for untruncated fetches).
+    if fetch_stats.get("fetch_truncated"):
+        payload["log_stats"]["fetch_truncated"] = True
     if prior is not None and prior.get("fuzzy"):
         payload["prior_match"] = "fuzzy"
     if enrichment_data is not None:

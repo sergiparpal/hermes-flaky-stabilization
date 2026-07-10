@@ -7,7 +7,7 @@ import json
 
 import hermes_test_history as pkg
 import pytest
-from hermes_test_history import queries
+from hermes_test_history import domain, queries
 
 # --------------------------------------------------------------------------
 # test_failure_lookup
@@ -119,10 +119,34 @@ def test_failure_lookup_orders_chronologically_not_lexically(db):
     assert r["failures"][0]["timestamp"] == "2026-05-20T09:00:00"
 
 
-def test_failure_lookup_limit_clamped(seeded_db):
-    assert len(queries.test_failure_lookup(seeded_db, "test_oauth_login", limit=999)["failures"]) == 2
-    # Below the minimum clamps to 1 rather than crashing.
-    queries.test_failure_lookup(seeded_db, "test_oauth_login", limit=0)
+def test_failure_lookup_limit_clamped(db):
+    # Seed more failures than MAX_LIMIT so an oversized limit is provably
+    # clamped (with only a couple of rows, limit=999 was indistinguishable from
+    # no clamp at all). Each failure gets its own run with a distinct timestamp
+    # so the returned page is provably the most recent slice, newest first.
+    n = domain.MAX_LIMIT + 10
+    for i in range(n):
+        rid = db.execute(
+            "INSERT INTO test_runs (suite_name, run_timestamp, source_file) "
+            "VALUES ('s', ?, ?)",
+            (f"2026-05-01T{i // 60:02d}:{i % 60:02d}:00", f"f{i}"),
+        ).lastrowid
+        db.execute(
+            "INSERT INTO test_cases (run_id, name, status, failure_message) "
+            "VALUES (?, 't_clamp', 'failed', 'boom')",
+            (rid,),
+        )
+    db.commit()
+
+    r = queries.test_failure_lookup(db, "t_clamp", limit=999)
+    assert len(r["failures"]) == domain.MAX_LIMIT     # hi-clamp: exactly 50, not 999 or n
+    assert r["failure_count"] == n                    # counts span ALL failures, not the page
+    assert r["total_runs"] == n
+    stamps = [f["timestamp"] for f in r["failures"]]
+    assert stamps == sorted(stamps, reverse=True)     # the page is newest-first ...
+    assert r["last_failure_at"] == stamps[0] == f"2026-05-01T{(n - 1) // 60:02d}:{(n - 1) % 60:02d}:00"
+    # Below the minimum clamps up to MIN_LIMIT rather than crashing or paging zero.
+    assert len(queries.test_failure_lookup(db, "t_clamp", limit=0)["failures"]) == domain.MIN_LIMIT
 
 
 @pytest.mark.parametrize("bad", ["", "   ", "x" * 501, None, 123, ["x"]])
@@ -176,6 +200,32 @@ def test_module_history_total_counts_all_qualifying_groups(db):
     assert m["tests_with_failures"] == n
     assert len(m["top_offenders"]) == queries._MAX_OFFENDERS
     assert m["truncated"] is True
+
+
+def test_module_history_last_failure_at_normalized_across_formats(db):
+    # Two same-day failures of one test: an 08:00 T-separated run_timestamp and
+    # a 23:00 whose effective time is the space-separated ingested_at. A raw
+    # string MAX() would pick the 08:00 row because 'T' > ' ' lexically; the
+    # aggregate must normalize via datetime() — the same expression the WHERE
+    # clause uses — so the genuinely latest failure wins (and the output format
+    # is uniform).
+    rid1 = db.execute(
+        "INSERT INTO test_runs (suite_name, run_timestamp, source_file) "
+        "VALUES ('s', '2026-05-20T08:00:00', 'f1')"
+    ).lastrowid
+    rid2 = db.execute(
+        "INSERT INTO test_runs (suite_name, run_timestamp, ingested_at, source_file) "
+        "VALUES ('s', NULL, '2026-05-20 23:00:00', 'f2')"
+    ).lastrowid
+    for rid in (rid1, rid2):
+        db.execute(
+            "INSERT INTO test_cases (run_id, name, file_path, status, failure_message) "
+            "VALUES (?, 't_mix', 'src/mix/test_mix.py', 'failed', 'boom')",
+            (rid,),
+        )
+    db.commit()
+    m = queries.module_failure_history(db, "src/mix/", since="2026-01-01")
+    assert m["top_offenders"][0]["last_failure_at"] == "2026-05-20 23:00:00"
 
 
 def test_module_history_like_escaping(seeded_db):

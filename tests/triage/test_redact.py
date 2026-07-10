@@ -34,6 +34,38 @@ def test_private_key_block_redacted():
     assert "MOREBASE64" not in out
 
 
+def test_unpaired_private_key_begin_redacted_to_end():
+    """Regression: prefilter windowing / char caps routinely cut the END marker;
+    a BEGIN-marker-only key body must still be redacted (to end-of-text)."""
+    text = (
+        "step 12 failed\n"
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        "b3BlbnNzaC1rZXktdjEAAAAA\nMOREBASE64==\n"
+        "b3BlbnNzaC1rZXktdjIBBBBB\n"
+    )
+    out = redact.redact(text)
+    assert "MOREBASE64" not in out
+    assert "b3BlbnNzaC1rZXktdjEAAAAA" not in out
+    assert "b3BlbnNzaC1rZXktdjIBBBBB" not in out
+    assert "step 12 failed" in out          # text before the block survives
+    assert redact.PLACEHOLDER in out
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+        "sk-ant-api03-AbCdEfGh_IjKlMnOpQrStUvWxYz-0123456789",
+    ],
+)
+def test_hyphenated_sk_keys_redacted(secret):
+    """Regression: hyphenated key formats (sk-proj-…, sk-ant-…) passed through
+    intact when not in key=value form."""
+    out = redact.redact(f"request rejected, credential {secret} is invalid")
+    assert secret not in out
+    assert redact.PLACEHOLDER in out
+
+
 def test_key_value_secret_value_redacted_key_kept():
     out = redact.redact("password=hunter2longvalue\nAPI_KEY: abcd1234efgh")
     assert "hunter2longvalue" not in out

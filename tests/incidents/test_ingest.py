@@ -1,6 +1,8 @@
 """Ingest mapping + incremental sync tests (plan §3). No network."""
 
+import logging
 import os
+import re
 
 import pytest
 from jira_incidents import ingest
@@ -132,6 +134,22 @@ def test_apply_watermark_noop_without_watermark():
     assert ingest.apply_watermark(jql, None) == jql
 
 
+def test_apply_watermark_ignores_order_by_inside_quoted_literal():
+    # An "order by" inside a quoted string literal must not be treated as the
+    # sort clause — splicing the watermark mid-string produced rejected JQL.
+    jql = 'summary !~ "order by" ORDER BY updated DESC'
+    out = ingest.apply_watermark(jql, "2024-01-05T12:30:00Z")
+    assert 'summary !~ "order by"' in out  # literal left intact
+    assert out.lower().endswith("order by updated desc")
+    # the watermark clause lands before the real (unquoted, last) ORDER BY
+    assert out.index('updated >= "2024/01/05 12:30"') < out.lower().rindex("order by")
+
+
+def test_apply_watermark_appends_when_order_by_only_inside_quotes():
+    out = ingest.apply_watermark('summary !~ "order by"', "2024-01-05T12:30:00Z")
+    assert out == '(summary !~ "order by") AND updated >= "2024/01/05 12:30"'
+
+
 # ---------------------------------------------------------------------------
 # run_sync with a fake client
 # ---------------------------------------------------------------------------
@@ -260,3 +278,168 @@ def test_backfill_then_incremental(store):
     client2 = FakeClient([])
     ingest.run_sync(store, client2, "project = INC ORDER BY updated DESC")
     assert any("updated >=" in q for q in client2.queries)
+
+
+# ---------------------------------------------------------------------------
+# Truncated incremental sync: watermark held back + token resume
+# ---------------------------------------------------------------------------
+
+class WatermarkPagingClient:
+    """Jira-faithful fake: honours the ``updated >= "..."`` watermark clause
+    and serves results ORDER BY updated DESC with token pagination (the token
+    is the next start offset)."""
+
+    def __init__(self, issues, page=2):
+        self._issues = sorted(
+            issues, key=lambda i: i["fields"]["updated"], reverse=True)
+        self._page = page
+        self.calls = []  # (jql, next_page_token)
+
+    def search(self, jql, fields=None, max_results=50, next_page_token=None):
+        self.calls.append((jql, next_page_token))
+        issues = self._issues
+        m = re.search(r'updated >= "([^"]+)"', jql)
+        if m:
+            cutoff = m.group(1)
+            issues = [i for i in issues
+                      if ingest.iso_to_jql(i["fields"]["updated"]) >= cutoff]
+        start = int(next_page_token) if next_page_token else 0
+        chunk = issues[start:start + self._page]
+        resp = {"issues": chunk}
+        if start + self._page < len(issues):
+            resp["nextPageToken"] = str(start + self._page)
+        return resp
+
+
+def test_truncated_incremental_sync_holds_watermark_and_resumes(store):
+    """SCENARIO: 6 new issues, max_pages=1, page_size=2, incremental mode.
+
+    Results arrive newest-first, so advancing the watermark to the global
+    newest after a truncated run (and discarding the nextPageToken) skipped
+    the 4 unfetched older-but-still-new issues forever. The watermark must
+    hold until a run exhausts; truncated runs persist a resume token.
+    """
+    store.set_meta("backfill_done", "1")
+    old_wm = "2024-01-01T00:00:00.000+0000"
+    store.set_watermark(old_wm)
+    issues = [_issue(i) for i in range(1, 7)]  # updated 2024-01-02 .. 2024-01-07
+    client = WatermarkPagingClient(issues, page=2)
+
+    jql = "project = INC ORDER BY updated DESC"
+    r1 = ingest.run_sync(store, client, jql, page_size=2, max_pages=1)
+    assert store.count() == 2
+    # Truncated: the watermark must NOT advance and a resume token must exist.
+    assert store.get_watermark() == old_wm
+    assert store.get_meta("sync_token")
+
+    r2 = ingest.run_sync(store, client, jql, page_size=2, max_pages=1)
+    # The second run resumed from the persisted token, not from page one.
+    assert client.calls[1][1] == "2"
+    assert store.count() == 4
+    assert store.get_watermark() == old_wm
+
+    r3 = ingest.run_sync(store, client, jql, page_size=2, max_pages=1)
+    assert store.count() == 6  # every issue ingested despite max_pages=1
+    # Exhausted: watermark advances to the global newest across the runs.
+    assert store.get_watermark() == "2024-01-07T00:00:00.000+0000"
+    assert not store.get_meta("sync_token")
+    assert not store.get_meta("sync_pending_newest")
+    assert (r1["ingested"], r2["ingested"], r3["ingested"]) == (2, 2, 2)
+
+
+# ---------------------------------------------------------------------------
+# Stale/invalidated resume tokens must not brick the sync
+# ---------------------------------------------------------------------------
+
+class _ClientError(Exception):
+    """JiraError-shaped (a ``status`` attribute) without importing the client."""
+
+    def __init__(self, message, status):
+        super().__init__(message)
+        self.status = status
+
+
+class StaleTokenClient:
+    """400-rejects any request carrying a page token (as Jira does for expired
+    or invalidated nextPageTokens); serves a single page otherwise."""
+
+    def __init__(self, issues):
+        self._issues = issues
+        self.calls = []  # (jql, next_page_token)
+
+    def search(self, jql, fields=None, max_results=50, next_page_token=None):
+        self.calls.append((jql, next_page_token))
+        if next_page_token:
+            raise _ClientError("Jira returned HTTP 400", status=400)
+        return {"issues": self._issues}
+
+
+def test_stale_backfill_token_is_cleared_and_run_restarts(store, caplog):
+    """SCENARIO: a persisted backfill token Jira now 400-rejects. Every run
+    used to fail before persisting anything, re-reading the same dead token
+    forever; it must instead clear the token and restart from page one."""
+    store.set_meta("backfill_token", "EXPIRED-TOKEN")
+    store.set_meta("sync_jql", "project = INC")  # unchanged JQL: token kept
+    client = StaleTokenClient([SAMPLE_ISSUE])
+    with caplog.at_level(logging.WARNING):
+        result = ingest.run_sync(store, client, "project = INC")
+    assert result["ingested"] == 1
+    assert store.count() == 1
+    assert client.calls[0][1] == "EXPIRED-TOKEN"  # tried the persisted token
+    assert client.calls[1][1] is None             # then restarted from page one
+    assert not store.get_meta("backfill_token")
+    assert any("resume token" in r.getMessage() for r in caplog.records)
+
+
+def test_stale_incremental_token_is_cleared_and_run_restarts(store):
+    store.set_meta("backfill_done", "1")
+    store.set_watermark("2024-01-01T00:00:00.000+0000")
+    store.set_meta("sync_token", "EXPIRED-TOKEN")
+    store.set_meta("sync_jql", "project = INC")
+    client = StaleTokenClient([SAMPLE_ISSUE])
+    result = ingest.run_sync(store, client, "project = INC")
+    assert result["ingested"] == 1
+    assert not store.get_meta("sync_token")
+
+
+def test_non_4xx_error_on_resume_token_still_propagates(store):
+    store.set_meta("backfill_token", "TKN")
+    store.set_meta("sync_jql", "project = INC")
+    client = FakeClient([], raise_exc=_ClientError("Jira returned HTTP 503", status=503))
+    with pytest.raises(_ClientError):
+        ingest.run_sync(store, client, "project = INC")
+
+
+def test_changed_jql_clears_persisted_resume_tokens(store):
+    """Editing jira.jql invalidates Jira's query-bound tokens: the next run
+    must drop them and paginate from the first page of the new query."""
+    store.set_meta("backfill_token", "TOKEN-FOR-OLD-JQL")
+    store.set_meta("sync_jql", "project = OLD")
+    client = FakeClient([SAMPLE_ISSUE])
+    result = ingest.run_sync(store, client, "project = NEW")
+    # With the stale token the fake serves an empty page; from page one it
+    # serves the issue — so ingested==1 proves the token was dropped.
+    assert result["ingested"] == 1
+    assert store.get_meta("sync_jql") == "project = NEW"
+    assert not store.get_meta("backfill_token")
+
+
+# ---------------------------------------------------------------------------
+# Full-resync support: seen-key tracking + state reset
+# ---------------------------------------------------------------------------
+
+def test_run_sync_reports_seen_keys(store):
+    result = ingest.run_sync(store, FakeClient([SAMPLE_ISSUE]), "project = INC")
+    assert result["seen_keys"] == {"INC-100"}
+
+
+def test_reset_sync_state_clears_watermark_and_resume_state(store):
+    store.set_watermark("2024-01-05T12:00:00Z")
+    store.set_meta("backfill_done", "1")
+    store.set_meta("backfill_token", "T1")
+    store.set_meta("sync_token", "T2")
+    store.set_meta("sync_pending_newest", "2024-01-06T00:00:00Z")
+    ingest.reset_sync_state(store)
+    assert not store.get_watermark()
+    for key in ("backfill_done", "backfill_token", "sync_token", "sync_pending_newest"):
+        assert not store.get_meta(key)

@@ -14,6 +14,11 @@ Masked-by-necessity fields (each with a reason, nothing else is masked):
                         the real computation.
   * the ``flaky-detective`` → ``flaky-stab`` CLI rename inside remediation /
     note strings (a documented, plan-mandated rename — Appendix C).
+  * ``last_failure_at`` separator — the unified handler normalizes the MAX()
+    aggregate through SQLite ``datetime()`` (review fix: raw string MAX
+    mis-orders mixed ``T``/space forms), so it emits ``YYYY-MM-DD HH:MM:SS``
+    where legacy string-MAXes the raw ``T`` form; only the separator is
+    masked, the instant itself is still asserted equal.
 """
 
 from __future__ import annotations
@@ -107,6 +112,17 @@ def _mask(payload: dict, fields: tuple[str, ...]) -> dict:
     return out
 
 
+def _normalize_last_failure_at(payload: dict) -> dict:
+    """Mask only the ``T``/space separator in ``top_offenders[].last_failure_at``
+    (see the module docstring); the timestamp value stays asserted."""
+    out = json.loads(json.dumps(payload))
+    for offender in out.get("top_offenders", []):
+        stamp = offender.get("last_failure_at")
+        if isinstance(stamp, str):
+            offender["last_failure_at"] = stamp.replace("T", " ")
+    return out
+
+
 @pytest.fixture
 def seeded_home(profile_env, legacy_th, unified_th):
     """One seeded history.db in the shared tmp HERMES_HOME (both worlds read it)."""
@@ -148,7 +164,7 @@ def test_module_failure_history_parity_explicit_since(seeded_home, legacy_th,
     legacy = json.loads(legacy_th._handle_module_failure_history(dict(call)))
     unified_pkg = importlib.import_module("hermes_flaky_stabilization.history")
     unified = json.loads(unified_pkg._handle_module_failure_history(dict(call)))
-    assert unified == legacy
+    assert _normalize_last_failure_at(unified) == _normalize_last_failure_at(legacy)
 
 
 def test_module_failure_history_parity_default_since(seeded_home, legacy_th, unified_th):
@@ -156,7 +172,9 @@ def test_module_failure_history_parity_default_since(seeded_home, legacy_th, uni
     legacy = json.loads(legacy_th._handle_module_failure_history(dict(call)))
     unified_pkg = importlib.import_module("hermes_flaky_stabilization.history")
     unified = json.loads(unified_pkg._handle_module_failure_history(dict(call)))
-    assert _mask(unified, ("window_start",)) == _mask(legacy, ("window_start",))
+    assert _mask(_normalize_last_failure_at(unified), ("window_start",)) == _mask(
+        _normalize_last_failure_at(legacy), ("window_start",)
+    )
 
 
 # --- is_flaky --------------------------------------------------------------------

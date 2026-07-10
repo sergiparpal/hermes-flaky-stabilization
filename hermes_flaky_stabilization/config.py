@@ -1,8 +1,21 @@
 """Unified configuration (plan Appendix B).
 
 One JSON file, ``<data_dir>/config.json``, with a per-stage section for each
-absorbed plugin plus the orchestrator. All keys are optional; a missing or
-malformed file degrades to :data:`DEFAULTS` (never raises). Legacy environment
+absorbed plugin plus the orchestrator. Precedence, lowest to highest:
+
+1. :data:`DEFAULTS` — every known key has a value here;
+2. the user file, merged per key: known keys are type-coerced against their
+   default (a type mismatch — including JSON ``null`` on a typed key —
+   degrades to the default; a known *section* that is not a JSON object
+   degrades to that section's defaults wholesale, with a warning). Unknown
+   sections and unknown keys inside known sections pass through untouched
+   (forward compatibility) — they are the only place non-object/mismatched
+   values survive;
+3. environment overrides (:data:`_ENV_OVERRIDES`), applied last so they win
+   even over a degraded section.
+
+All keys are optional; :func:`load_config` never raises — a missing or
+malformed file degrades to :data:`DEFAULTS`. Legacy environment
 variables keep working:
 
 * ``FLAKY_HEALER_*`` — consumed directly by the ported healer config module
@@ -17,6 +30,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -24,14 +38,21 @@ from typing import Any
 
 from . import paths
 
+logger = logging.getLogger(__name__)
+
 CONFIG_FILE_NAME = "config.json"
 
 DEFAULTS: dict[str, dict[str, Any]] = {
+    # Read by the history stage (its storage layer merges these over its own
+    # module defaults; db_path_override is validated to stay inside the
+    # Hermes home).
     "history": {
         "default_lookback_days": 30,
         "max_stack_trace_chars": 500,
         "db_path_override": None,
     },
+    # Read by detective/config.py (scan window/thresholds) and by the
+    # install-cron composition in cli.py (schedule/deliver/report_scope).
     "detective": {
         "window_days": 14,
         "min_fails": 3,
@@ -40,12 +61,16 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "deliver": "local",
         "report_scope": "changes-only",
     },
+    # enable_enrichment gates triage's history enrichment; log_roots/
+    # token_hosts/allow_private feed the triage log-fetch guardrails
+    # (HERMES_CI_TRIAGE_* env vars still override — see _ENV_OVERRIDES).
     "triage": {
         "enable_enrichment": True,
         "log_roots": None,
         "token_hosts": None,
         "allow_private": False,
     },
+    # Read by the healer stage config (FLAKY_HEALER_* env vars still override).
     "healer": {
         "burnin": "5:10",
         "sandbox": "auto",
@@ -55,9 +80,12 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "base_branch": "main",
         "allow_subprocess_pr": False,
     },
+    # default_max_files bounds validate_no_pii sweeps (orchestrator PII gate).
     "pii": {
         "default_max_files": 2000,
     },
+    # Read by incidents/config.py (sync transport + local index) and by
+    # incidents/write.py (enable_write / project_key / issue_type — D7).
     "jira": {
         "base_url": "",
         "email": "",
@@ -72,11 +100,14 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "project_key": "INC",
         "issue_type": "Bug",
     },
+    # Read by the incidents service (pre_llm_call context injection + its
+    # local-FTS prefetch bounds).
     "incidents": {
         "context_injection": True,
         "prefetch_limit": 3,
         "prefetch_timeout": 1.5,
     },
+    # Read by the orchestrator (fork policy, heal mode, PII gate — D9).
     "pipeline": {
         "default_heal_mode": "suggest",
         "heal_categories": ["flaky", "timeout"],
@@ -102,12 +133,17 @@ def config_path(data_dir: Path | None = None) -> Path:
 def _coerce(section: str, key: str, value: Any, default: Any) -> Any:
     """Keep a user value only when its type is compatible with the default.
 
-    ``None`` defaults accept anything (untyped/optional keys); a bool default
-    must not accept ``1``/``"true"`` from JSON silently — but int/float are
-    interchangeable. Type mismatches degrade to the default rather than raise.
+    ``None`` defaults accept anything (untyped/optional keys). For typed
+    defaults every mismatch degrades to the default rather than raising —
+    including JSON ``null``, so e.g. ``{"detective": {"schedule": null}}``
+    can never leak ``None`` into ``shlex.quote`` during install-cron. A bool
+    default must not accept ``1``/``"true"`` from JSON silently, but
+    int/float are interchangeable.
     """
-    if default is None or value is None:
+    if default is None:
         return value
+    if value is None:
+        return default
     if isinstance(default, bool):
         return value if isinstance(value, bool) else default
     if isinstance(default, int) and not isinstance(default, bool):
@@ -138,7 +174,11 @@ def load_config(data_dir: Path | None = None) -> dict[str, dict[str, Any]]:
     """User ``config.json`` merged over :data:`DEFAULTS`, env overrides applied.
 
     Unknown sections and unknown keys inside known sections are preserved
-    (forward compatibility); known keys are type-coerced against the default.
+    (forward compatibility); known keys are type-coerced against the default;
+    a known section that is not a JSON object keeps the defaults (readers
+    like ``status`` and the env-override loop index into known sections, so
+    a ``null``/list section must never replace the merged dict). Never
+    raises — malformed input degrades (module docstring).
     """
     cfg = copy.deepcopy(DEFAULTS)
     path = config_path(data_dir)
@@ -151,14 +191,21 @@ def load_config(data_dir: Path | None = None) -> dict[str, dict[str, Any]]:
         except Exception:
             user = {}
     for section, values in user.items():
-        if section in DEFAULTS and isinstance(values, dict):
-            for key, value in values.items():
-                if key in DEFAULTS[section]:
-                    cfg[section][key] = _coerce(section, key, value, DEFAULTS[section][key])
-                else:
-                    cfg[section][key] = value
-        else:
+        if section not in DEFAULTS:
+            # Unknown sections pass through untouched (forward compatibility);
+            # only they may hold non-object values.
             cfg[section] = values
+            continue
+        if not isinstance(values, dict):
+            logger.warning(
+                "config.json: known section %r is not a JSON object (got %s); "
+                "keeping defaults", section, type(values).__name__)
+            continue
+        for key, value in values.items():
+            if key in DEFAULTS[section]:
+                cfg[section][key] = _coerce(section, key, value, DEFAULTS[section][key])
+            else:
+                cfg[section][key] = value
     _apply_env_overrides(cfg)
     return cfg
 

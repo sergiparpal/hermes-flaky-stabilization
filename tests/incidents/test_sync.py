@@ -1,5 +1,6 @@
 """SyncScheduler: coalescing + debounce + lock (audit finding 5)."""
 
+import logging
 import threading
 
 from jira_incidents.sync import SyncScheduler
@@ -35,11 +36,20 @@ def test_debounce_skips_quick_resync():
     assert sum(runs) == 1
 
 
-def test_task_error_is_swallowed():
+def test_task_error_is_swallowed(caplog, monkeypatch):
+    """The swallow must be observable (daemon-thread exceptions never reach the
+    caller, so 'no raise' alone proves nothing): the scheduler logs a warning
+    and the exception never escapes to threading.excepthook."""
+    escaped = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: escaped.append(args))
+
     def boom():
         raise RuntimeError("background boom")
 
     s = SyncScheduler(boom, min_interval=0.0, name="t")
-    s.trigger()       # must not raise on the calling thread
-    s.join(1.0)
+    with caplog.at_level(logging.WARNING):
+        s.trigger()       # must not raise on the calling thread
+        s.join(1.0)
     assert not s.is_running()
+    assert not escaped, "task exception escaped the swallow to threading.excepthook"
+    assert any("background task failed" in r.getMessage() for r in caplog.records)

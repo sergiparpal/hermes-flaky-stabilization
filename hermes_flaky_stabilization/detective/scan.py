@@ -27,9 +27,11 @@ class ScanOutcome:
 
     * ``"unavailable"`` — test-history could not be read; ``message`` is the
       actionable reason (no snapshot was touched).
-    * ``"no_runs"``     — test-history is reachable but empty in the window; the
-      previous snapshot is intentionally preserved. ``on_record`` is how many
-      verdicts were kept; ``meta`` describes the (zero-examined) audit row.
+    * ``"no_runs"``     — test-history is reachable but nothing was *counted* in
+      the window (empty, or every row uncounted — e.g. all ``error`` with
+      ``include_errors`` off); the previous snapshot is intentionally preserved.
+      ``on_record`` is how many verdicts were kept; ``meta`` describes the
+      (zero-examined) audit row.
     * ``"ok"``          — a fresh snapshot was written. ``verdicts`` is the new
       set, ``newly_flaky``/``newly_resolved`` the diff vs the previous snapshot.
     """
@@ -70,12 +72,23 @@ def run_scan(store, *, window_days: int, min_fails: int, include_errors: bool,
     except query.TestHistoryUnavailable as exc:
         return ScanOutcome(kind="unavailable", message=str(exc))
 
-    if not read.rows:
-        # Reachable but empty window (e.g. every run aged past it). Do NOT overwrite
-        # the snapshot with an empty one: that would make every previously-flaky
-        # test report as "no longer flaky" and is_flaky answer "unknown" for
-        # everything. Keep the prior verdicts; record an audit row noting nothing
-        # was examined.
+    # Classify, then drop verdicts with zero counted runs: a test whose window
+    # holds only uncounted rows (e.g. every run is an `error` with
+    # include_errors off — a CI outage) carries no evidence and must never be
+    # persisted as "stable with 0 runs". A scan left with nothing counted at
+    # all is then treated exactly like an empty window below.
+    verdicts = [
+        v for v in detect.compute_verdicts(read.rows, now, window_days,
+                                           min_fails, include_errors)
+        if v.runs > 0
+    ]
+
+    if not verdicts:
+        # Reachable but nothing counted in the window (empty — e.g. every run aged
+        # past it — or every row uncounted). Do NOT overwrite the snapshot with an
+        # empty one: that would make every previously-flaky test report as "no
+        # longer flaky" and is_flaky answer "unknown" for everything. Keep the
+        # prior verdicts; record an audit row noting nothing was examined.
         on_record = sum(store.count_by_status().values())
         store.record_scan_run(
             window_days=window_days, min_fails=min_fails, include_errors=include_errors,
@@ -90,7 +103,6 @@ def run_scan(store, *, window_days: int, min_fails: int, include_errors: bool,
         return ScanOutcome(kind="no_runs", meta=meta, on_record=on_record,
                            verdicts=[], newly_flaky=[], newly_resolved=[])
 
-    verdicts = detect.compute_verdicts(read.rows, now, window_days, min_fails, include_errors)
     new_flaky_keys = {v.test_key for v in verdicts if v.status == domain.VERDICT_FLAKY}
 
     prev_flaky_keys = store.read_flaky_keys()          # BEFORE replace (for the diff)

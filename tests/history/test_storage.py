@@ -56,6 +56,59 @@ def test_db_path_override_outside_home_is_rejected(profile_env, tmp_path):
     assert not outside.parent.exists()  # rejected before any mkdir
 
 
+def _write_unified_history_section(home, section: dict) -> None:
+    """Write ``{"history": section}`` into the unified flaky-stabilization config."""
+    unified_dir = home / "flaky-stabilization"
+    unified_dir.mkdir(parents=True, exist_ok=True)
+    (unified_dir / "config.json").write_text(
+        json.dumps({"history": section}), encoding="utf-8"
+    )
+
+
+def test_unified_config_db_path_override_is_honored(profile_env):
+    # The unified <home>/flaky-stabilization/config.json `history` section is a
+    # live config source (plan D5), not dead keys: with no legacy
+    # test-history/config.json at all, its db_path_override must be honored.
+    target = profile_env / "flaky-stabilization" / "unified-history.db"
+    _write_unified_history_section(profile_env, {"db_path_override": str(target)})
+    storage.reset_for_tests()
+
+    conn = storage.get_connection()
+    assert storage.get_db_path().resolve() == target.resolve()
+    assert target.exists()
+    # Sanity: the schema was applied at the override location.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='test_cases'"
+    ).fetchone()[0] == 1
+
+
+def test_unified_history_section_wins_over_legacy(profile_env):
+    # Precedence: unified `history` section > legacy test-history/config.json.
+    legacy_target = profile_env / "legacy" / "history.db"
+    unified_target = profile_env / "unified" / "history.db"
+    (storage.get_storage_dir() / "config.json").write_text(
+        json.dumps({"db_path_override": str(legacy_target)}), encoding="utf-8"
+    )
+    _write_unified_history_section(profile_env, {"db_path_override": str(unified_target)})
+    storage.reset_for_tests()
+    assert storage.get_db_path().resolve() == unified_target.resolve()
+
+
+def test_unified_section_overrides_only_keys_it_sets(profile_env):
+    # A unified section that sets only an unrelated key must not clobber a
+    # legacy db_path_override with the unified default (None): key-by-key, only
+    # values explicitly written in the unified file take precedence — so the
+    # legacy file keeps working untouched underneath.
+    legacy_target = profile_env / "legacy" / "history.db"
+    (storage.get_storage_dir() / "config.json").write_text(
+        json.dumps({"db_path_override": str(legacy_target)}), encoding="utf-8"
+    )
+    _write_unified_history_section(profile_env, {"max_stack_trace_chars": 123})
+    storage.reset_for_tests()
+    assert storage.get_db_path().resolve() == legacy_target.resolve()
+    assert storage.get_config()["max_stack_trace_chars"] == 123
+
+
 def test_db_and_storage_dir_are_owner_only(db):
     # The DB holds captured test output (stack traces / failure messages) that can
     # carry sensitive data; it must not be world-readable on a shared host.

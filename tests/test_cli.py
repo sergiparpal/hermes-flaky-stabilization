@@ -88,6 +88,24 @@ def test_status_smoke(profile_env, capsys):
     assert "state.db" in out
 
 
+def test_jira_exit_code_propagates(profile_env, monkeypatch, capsys):
+    """AGREED CONTRACT: the incidents CLI entry point returns an int exit code
+    (0 success, 1 handled failure). run_cli must propagate it — a hard-coded 0
+    would let handled sync failures exit successfully, so the nightly cron
+    shim could never alert. None is tolerated as 0 (robust seam)."""
+    from hermes_flaky_stabilization.incidents import cli as incidents_cli
+
+    monkeypatch.setattr(incidents_cli, "hermes_jira_incidents_command",
+                        lambda args: 1)
+    rc, _out = _run(["jira", "sync"], capsys)
+    assert rc == 1
+
+    monkeypatch.setattr(incidents_cli, "hermes_jira_incidents_command",
+                        lambda args: None)
+    rc, _out = _run(["jira", "status"], capsys)
+    assert rc == 0
+
+
 def test_test_history_alias_exposes_history_cli(profile_env, history_reset, capsys):
     """The kept `test-history` CLI contract (plan D2): same subcommands, same
     behavior, registered as its own top-level command."""

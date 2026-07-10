@@ -211,6 +211,43 @@ def iso_to_jql(iso_ts: str) -> str | None:
     return None
 
 
+def _in_double_quotes(s: str, pos: int) -> bool:
+    """True when index *pos* of *s* falls inside a double-quoted region.
+
+    Simple quote-state scan honouring JQL's backslash escapes, so a literal
+    ``\\"`` inside a quoted string does not toggle the state.
+    """
+    in_q = False
+    i = 0
+    while i < pos:
+        ch = s[i]
+        if in_q and ch == "\\":
+            i += 2  # skip the escaped character
+            continue
+        if ch == '"':
+            in_q = not in_q
+        i += 1
+    return in_q
+
+
+def _split_order_by(jql: str) -> tuple[str, str]:
+    """Split *jql* into (where, order-by) at the real trailing ORDER BY.
+
+    The split point is the LAST ``order by`` occurrence outside double-quoted
+    regions — a quoted string literal like ``summary !~ "order by"`` must not
+    be split mid-string (that would splice the watermark into the literal and
+    produce permanently rejected JQL). Returns ``(jql, "")`` when there is no
+    unquoted ORDER BY.
+    """
+    last = -1
+    for m in re.finditer(r"\border\s+by\b", jql, flags=re.IGNORECASE):
+        if not _in_double_quotes(jql, m.start()):
+            last = m.start()
+    if last < 0:
+        return jql, ""
+    return jql[:last].strip(), jql[last:].strip()
+
+
 def apply_watermark(jql: str, watermark: str | None) -> str:
     """Inject an ``updated >= "<watermark>"`` clause, preserving any ORDER BY."""
     jql = (jql or "").strip()
@@ -218,13 +255,9 @@ def apply_watermark(jql: str, watermark: str | None) -> str:
     if not jql_dt:
         return jql
     clause = f'updated >= "{jql_dt}"'
-    # Split off a trailing ORDER BY (case-insensitive) so the clause lands in
-    # the WHERE portion, not after the sort.
-    m = re.search(r"\border\s+by\b", jql, flags=re.IGNORECASE)
-    if m:
-        where, order = jql[: m.start()].strip(), jql[m.start():].strip()
-    else:
-        where, order = jql, ""
+    # Split off the trailing ORDER BY (case-insensitive, quote-aware) so the
+    # clause lands in the WHERE portion, not after the sort.
+    where, order = _split_order_by(jql)
     if where:
         where = f"({where}) AND {clause}"
     else:
@@ -246,6 +279,42 @@ def _max_updated(rows: list[dict[str, Any]]) -> str | None:
 # silently truncated to the newest page).
 _META_BACKFILL_DONE = "backfill_done"
 _META_BACKFILL_TOKEN = "backfill_token"
+# Incremental-resume state (mirrors the backfill pair): an incremental run that
+# stops at max_pages persists its nextPageToken plus the newest `updated` seen
+# so far, and only advances the real watermark once a run exhausts the result
+# set. (Results arrive ORDER BY updated DESC, so advancing the watermark after
+# a truncated run would permanently skip the unfetched older-but-still-new
+# issues.)
+_META_SYNC_TOKEN = "sync_token"
+_META_SYNC_NEWEST = "sync_pending_newest"
+# The configured JQL the persisted resume tokens were minted against. Jira
+# nextPageTokens are query-bound (and expire), so an edited ``jira.jql``
+# invalidates them; storing the JQL lets the next run detect the change and
+# clear the tokens instead of 400-failing forever.
+_META_JQL = "sync_jql"
+# The store meta key holding the incremental watermark (see store.get_watermark).
+_META_WATERMARK = "sync_watermark"
+
+
+def reset_sync_state(store: Any) -> None:
+    """Clear the watermark and all backfill/resume state on *store*.
+
+    After this, the next :func:`run_sync` re-ingests everything from the first
+    page (used by ``flaky-stab jira sync --full``).
+    """
+    for key in (_META_WATERMARK, _META_BACKFILL_DONE, _META_BACKFILL_TOKEN,
+                _META_SYNC_TOKEN, _META_SYNC_NEWEST):
+        store.set_meta(key, "")
+
+
+def _is_client_error(exc: Exception) -> bool:
+    """True for a JiraError-shaped exception carrying a 4xx HTTP status.
+
+    Duck-typed on the ``status`` attribute so this module keeps its no-intra-
+    plugin-imports property (it unit-tests with a fake client alone).
+    """
+    status = getattr(exc, "status", None)
+    return isinstance(status, int) and 400 <= status < 500
 
 
 def run_sync(
@@ -275,38 +344,92 @@ def run_sync(
       completely across several syncs instead of being truncated to the newest
       page. On full exhaustion the backfill is marked done.
     * **Incremental** — once backfilled (or whenever a watermark already
-      exists), only issues ``updated >=`` the watermark are fetched.
+      exists), only issues ``updated >=`` the watermark are fetched. A run that
+      stops at ``max_pages`` does NOT advance the watermark (results arrive
+      newest-first, so that would skip the unfetched tail forever); instead it
+      persists its ``nextPageToken`` and the newest ``updated`` seen, and the
+      next run resumes from that token under the same watermark filter. The
+      watermark only advances once a run exhausts the result set.
 
-    Returns ``{"ingested", "pages", "watermark", "backfill_complete"}`` where
-    ``ingested`` counts rows that were new or actually changed (unchanged
-    re-fetches don't count). Per-issue mapping errors are swallowed;
-    transport/client errors propagate to the caller (the provider's background
-    thread, which logs and continues).
+    Resume tokens are query-bound and expire server-side: a change to *jql*
+    clears them proactively, and a 4xx from Jira on a persisted token clears it
+    and restarts that phase from the first page (logged as a warning).
+
+    Returns ``{"ingested", "pages", "watermark", "backfill_complete",
+    "seen_keys"}`` where ``ingested`` counts rows that were new or actually
+    changed (unchanged re-fetches don't count) and ``seen_keys`` is the set of
+    issue keys fetched during this run (used by the CLI's ``--full`` sweep).
+    Per-issue mapping errors are swallowed; transport/client errors propagate
+    to the caller (the provider's background thread, which logs and continues).
     """
+    jql = (jql or "").strip()
+
+    # An edited jira.jql invalidates any persisted resume token (they are
+    # query-bound); clear them so the next phase restarts from page one instead
+    # of 400-failing on a dead token forever.
+    stored_jql = store.get_meta(_META_JQL) or ""
+    if stored_jql and stored_jql != jql:
+        if store.get_meta(_META_BACKFILL_TOKEN) or store.get_meta(_META_SYNC_TOKEN):
+            logger.warning(
+                "jira.jql changed since the last sync; clearing persisted "
+                "resume tokens and restarting pagination from the first page")
+        store.set_meta(_META_BACKFILL_TOKEN, "")
+        store.set_meta(_META_SYNC_TOKEN, "")
+        store.set_meta(_META_SYNC_NEWEST, "")
+    store.set_meta(_META_JQL, jql)
+
     watermark = store.get_watermark() if incremental else None
     # Keyed solely on the explicit flag: a partial backfill also advances the
     # watermark (to retain the global-newest timestamp across runs), so the
     # watermark's presence must NOT by itself imply the backfill is complete.
     backfill_done = store.get_meta(_META_BACKFILL_DONE) == "1"
+    in_incremental = incremental and backfill_done
 
-    if incremental and backfill_done:
+    if in_incremental:
         effective_jql = apply_watermark(jql, watermark)
-        next_token: str | None = None
+        # Resume a previously truncated incremental run from its token; the
+        # watermark filter is identical because the watermark did not advance.
+        next_token: str | None = store.get_meta(_META_SYNC_TOKEN) or None
+        token_meta = _META_SYNC_TOKEN
+        pending_newest = store.get_meta(_META_SYNC_NEWEST) or None
     else:
         # Initial / resuming backfill: no watermark filter; resume from token.
-        effective_jql = (jql or "").strip()
+        effective_jql = jql
         next_token = store.get_meta(_META_BACKFILL_TOKEN) or None
+        token_meta = _META_BACKFILL_TOKEN
+        pending_newest = None
+
+    resumed_from_persisted_token = next_token is not None
 
     ingested = 0
     pages = 0
     newest = watermark
+    if pending_newest and (newest is None or pending_newest > newest):
+        newest = pending_newest
     exhausted = False
+    seen_keys: set[str] = set()
 
     while pages < max_pages:
-        resp = client.search(
-            effective_jql, fields=fields, max_results=page_size,
-            next_page_token=next_token,
-        )
+        try:
+            resp = client.search(
+                effective_jql, fields=fields, max_results=page_size,
+                next_page_token=next_token,
+            )
+        except Exception as e:
+            if resumed_from_persisted_token and pages == 0 and _is_client_error(e):
+                # The persisted resume token went stale (Jira expires them, and
+                # server-side query changes invalidate them). Clear it and
+                # restart this phase from the first page — otherwise every
+                # future run re-reads the same dead token and 400-fails before
+                # persisting anything.
+                logger.warning(
+                    "persisted Jira resume token rejected (%s); clearing it "
+                    "and restarting from the first page", e)
+                store.set_meta(token_meta, "")
+                next_token = None
+                resumed_from_persisted_token = False
+                continue
+            raise
         issues = resp.get("issues", []) if isinstance(resp, dict) else []
         if not issues:
             exhausted = True
@@ -322,6 +445,7 @@ def run_sync(
         # real index change — not the boundary issues every incremental sync
         # re-fetches and re-upserts idempotently.
         ingested += store.upsert_many(mapped)
+        seen_keys.update(row["key"] for row in mapped if row.get("key"))
         pages += 1
 
         page_newest = _max_updated(mapped)
@@ -333,11 +457,27 @@ def run_sync(
             exhausted = True
             break
 
-    if newest:
-        store.set_watermark(newest)
-
-    # Persist backfill progress so the next run resumes where this one stopped.
-    if not backfill_done:
+    if in_incremental:
+        # Only advance the watermark once the run has seen everything down to
+        # the old watermark; a truncated run persists its resume state instead.
+        if exhausted:
+            if newest:
+                store.set_watermark(newest)
+            store.set_meta(_META_SYNC_TOKEN, "")
+            store.set_meta(_META_SYNC_NEWEST, "")
+        else:
+            store.set_meta(_META_SYNC_TOKEN, next_token or "")
+            store.set_meta(_META_SYNC_NEWEST, newest or "")
+            logger.info(
+                "incremental sync paused after %d page(s) (max_pages=%d); "
+                "watermark held back, will resume next sync", pages, max_pages,
+            )
+    else:
+        # Backfill: advancing the watermark early is safe because the watermark
+        # is not used for filtering until the backfill is marked done.
+        if newest:
+            store.set_watermark(newest)
+        # Persist backfill progress so the next run resumes where this stopped.
         if exhausted:
             store.set_meta(_META_BACKFILL_DONE, "1")
             store.set_meta(_META_BACKFILL_TOKEN, "")
@@ -353,4 +493,5 @@ def run_sync(
         "pages": pages,
         "watermark": newest,
         "backfill_complete": backfill_done or exhausted,
+        "seen_keys": seen_keys,
     }

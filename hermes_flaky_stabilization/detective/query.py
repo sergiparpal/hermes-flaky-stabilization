@@ -21,6 +21,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 from . import domain, timeutil
 
@@ -95,8 +96,14 @@ _FALLBACK_CASES_SQL = (
 
 
 def read_only_uri(db_path) -> str:
-    """The ``mode=ro`` connection URI for ``db_path`` (read-only, never writable)."""
-    return f"file:{Path(db_path)}?mode=ro"
+    """The ``mode=ro`` connection URI for ``db_path`` (read-only, never writable).
+
+    The path is percent-encoded (SQLite decodes percent-escapes in URI
+    filenames): a raw ``#``, ``?``, or ``%`` would otherwise terminate or alter
+    the URI's path part, silently dropping ``mode=ro`` and opening — or even
+    creating — a *different* file read-write.
+    """
+    return f"file:{quote(str(Path(db_path)), safe='/')}?mode=ro"
 
 
 def read_source_schema_version(conn: sqlite3.Connection) -> int | None:
@@ -219,11 +226,15 @@ def _fallback_read(conn: sqlite3.Connection, cutoff: str) -> list[tuple]:
     ):
         if run_id in survivor_ids:
             raw.append((classname, name, file_path, status, eff_by_run[run_id]))
-    # Match the window-function path's ORDER BY (eff_ts, then case insertion order).
-    # The cases query already yields rows in c.id order; a stable sort on eff_ts
-    # promotes that to (eff_ts ASC, c.id ASC) so both read paths agree byte-for-byte.
+    # Normalize eff_ts BEFORE sorting: a numeric run_timestamp (from a malformed
+    # source DB) would otherwise make the sort key compare int/float to str and
+    # raise TypeError — the window-function path normalizes too, so both paths
+    # stay equivalent. Then match its ORDER BY (eff_ts, then case insertion
+    # order): the cases query already yields rows in c.id order; a stable sort on
+    # eff_ts promotes that to (eff_ts ASC, c.id ASC).
+    raw = _normalize_rows(raw)
     raw.sort(key=lambda r: r[4])
-    return _normalize_rows(raw)
+    return raw
 
 
 def _read_windowed(conn: sqlite3.Connection, cutoff: str) -> list[tuple]:

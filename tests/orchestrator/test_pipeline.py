@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+from pathlib import Path
 
 from hermes_flaky_stabilization.orchestrator import pipeline as pl
 from hermes_flaky_stabilization.orchestrator.gate import GateResult
@@ -30,8 +32,46 @@ def _triage_result(category: str) -> str:
     })
 
 
+def _real_heal_report(test_id: str, repo_dir: str, *, stable: bool, runs: int) -> dict:
+    """The healer's REAL report envelope, pinned to the actual dataclasses.
+
+    ``report["burnin"]`` is the sandbox aggregate's ``RunReport.to_dict()``
+    (``runs``/``passed``/``failed``/…) inside ``HealReport.to_dict()`` — NOT
+    the ``burn_in``/``repeats`` shape an earlier fake invented. Constructed
+    through the real classes when importable so contract drift fails loudly;
+    the fallback copies the exact real keys.
+    """
+    passed = runs if stable else max(runs - 1, 0)
+    failed = 0 if stable else min(runs, 1)
+    try:
+        from hermes_flaky_stabilization.healer.flaky_healer.healer import HealReport
+        from hermes_flaky_stabilization.healer.flaky_healer.sandbox.base import RunReport
+
+        burnin = RunReport(runs=runs, passed=passed, failed=failed,
+                           isolation="subprocess", duration_s=1.2,
+                           results=[]).to_dict()
+        return HealReport(test_id=test_id, repo_dir=repo_dir, burnin=burnin,
+                          stable=stable).to_dict()
+    except ImportError:  # pragma: no cover — pin the real keys if imports move
+        return {
+            "test_id": test_id, "repo_dir": repo_dir, "diagnosis": None,
+            "diagnosis_stage": None, "strategy": None, "ops": [],
+            "reproduced": None, "repro": None,
+            "burnin": {"runs": runs, "passed": passed, "failed": failed,
+                       "isolation": "subprocess", "duration_s": 1.2,
+                       "exit_codes": [], "timed_out_runs": 0,
+                       "last_stdout_tail": ""},
+            "stable": stable, "diff": "", "isolation": "subprocess",
+            "llm_calls": 0, "recipe_used": False, "recipe_match": None,
+            "recipe_signature": None, "recipe_fallback": False,
+            "confidence_note": "", "error": None, "duration_s": 1.2,
+        }
+
+
 def _stages(calls, *, category="flaky", heal_stable=True, heal_pr=False,
-            gate_ok=True, tracker_created=True):
+            heal_runs=3, gate_ok=True, tracker_created=True, report=None):
+    report_payload = REPORT if report is None else report
+
     def triage(call, incident_context=None):
         calls.append(("triage", call, incident_context))
         return _triage_result(category)
@@ -39,15 +79,15 @@ def _stages(calls, *, category="flaky", heal_stable=True, heal_pr=False,
     def heal(call):
         calls.append(("heal", call))
         payload = {"mode": call.get("mode"),
-                   "report": {"stable": heal_stable, "test_id": call["test_id"],
-                              "burn_in": {"repeats": 3, "failures": 0}}}
+                   "report": _real_heal_report(call["test_id"], call["repo_dir"],
+                                               stable=heal_stable, runs=heal_runs)}
         if heal_pr:
             payload["pr"] = {"url": "https://github.com/o/r/pull/1"}
         return json.dumps(payload)
 
     def bugreport(call):
         calls.append(("bugreport", call))
-        return json.dumps(REPORT)
+        return json.dumps(report_payload)
 
     def dedup(summary):
         calls.append(("dedup", summary))
@@ -274,6 +314,278 @@ def test_no_triage_falls_back_on_flaky_verdict(tmp_path):
     assert "skipped" in out["stage_results"]["triage"]
     assert out["outcome"] == "healed"  # detective verdict drove the fork
     assert any("detective verdict" in n for n in out["notes"])
+
+
+# --- loop 1 contract: the reader must consume the healer's REAL envelope --------------
+
+
+def test_burnin_feedback_reads_the_real_heal_envelope(tmp_path):
+    """Regression: _feed_back_burnin read report['burn_in']['repeats'] — keys
+    the healer never emits (real shape: report['burnin'] with runs/passed) —
+    so every stable heal fed back exactly ONE synthetic row and the note
+    reported a false count."""
+    calls = []
+    p, _ = _pipeline(calls, category="flaky", heal_stable=True, heal_runs=7)
+    out = p.run({"log_url_or_path": _log(tmp_path), "test_id": "t", "repo_dir": "."})
+    assert out["outcome"] == "healed"
+    synth = next(c for c in calls if c[0] == "ingest_synthetic")
+    cases = synth[1]["cases"]
+    assert len(cases) == 7                      # not 1: the real burn-in count
+    assert all(c["status"] == "passed" for c in cases)
+    assert any("7 green case row(s)" in n for n in out["notes"])
+
+
+# --- outbound ticket: title redaction + the egress canary (D7/D6.4b) ------------------
+
+
+def _write_disabled_config():
+    return {"pipeline": {"require_pii_gate": True,
+                         "heal_categories": ["flaky", "timeout"],
+                         "default_heal_mode": "suggest"},
+            "jira": {"enable_write": False}}
+
+
+def test_ticket_ready_title_is_redacted(tmp_path):
+    """Regression: the ticket_ready path redacted only the BODY; the title was
+    returned raw (and stored raw in the ledger) for hand-pasting into Jira."""
+    calls = []
+    dirty = dict(REPORT, title="Checkout broken on Safari, seen by ops@corp.com")
+    p, _ = _pipeline(calls, category="broken_test", report=dirty,
+                     config=_write_disabled_config())
+    out = p.run({"log_url_or_path": _log(tmp_path)})
+    assert out["outcome"] == "ticket_ready"
+    ticket = out["stage_results"]["tracker"]["ticket"]
+    assert "[redacted-email]" in ticket["title"]
+    # The tracker stage result (ledger-bound and outbound) never carries the raw
+    # address; the bugreport stage result deliberately keeps its own contract.
+    assert "ops@corp.com" not in json.dumps(out["stage_results"]["tracker"])
+
+
+def test_egress_canary_masks_scanner_only_pii_in_ready_ticket(tmp_path):
+    """Regression: a valid IBAN and a space-separated SSN pass redact_text but
+    are found by the plugin's own detectors — the egress canary must mask them
+    before the ticket leaves, and record that it fired."""
+    calls = []
+    dirty = dict(REPORT, summary=("Payment failed for IBAN GB82WEST12345698765432 "
+                                  "and SSN 123 45 6789."))
+    p, _ = _pipeline(calls, category="broken_test", report=dirty,
+                     config=_write_disabled_config())
+    out = p.run({"log_url_or_path": _log(tmp_path)})
+    assert out["outcome"] == "ticket_ready"
+    ticket = out["stage_results"]["tracker"]["ticket"]
+    assert "GB82WEST12345698765432" not in ticket["body"]
+    assert "123 45 6789" not in ticket["body"]
+    assert ticket["egress_masked"] is True
+    assert any("egress canary" in n for n in out["notes"])
+
+
+def test_egress_canary_applies_to_the_enabled_tracker_payload(tmp_path):
+    """The same canary must clean the payload handed to the tracker stage when
+    jira.enable_write is on."""
+    calls = []
+    dirty = dict(REPORT,
+                 title="Refund fails for IBAN GB82WEST12345698765432",
+                 summary="Customer SSN 123 45 6789 shown in the error page.")
+    p, _ = _pipeline(calls, category="broken_test", report=dirty)
+    out = p.run({"log_url_or_path": _log(tmp_path)})
+    assert out["outcome"] == "ticket_created"
+    tracker_call = next(c for c in calls if c[0] == "tracker")
+    sent = json.dumps(tracker_call[1])
+    assert "GB82WEST12345698765432" not in sent
+    assert "123 45 6789" not in sent
+    assert any("egress canary" in n for n in out["notes"])
+
+
+# --- evidence_paths validation (untrusted arg shapes) ----------------------------------
+
+
+def test_lone_string_evidence_path_is_one_path_not_chars(tmp_path):
+    """Regression: /stabilize stores every key=value as a STRING; list(str)
+    char-split it into single-character 'paths' and the gate walked '/'."""
+    calls = []
+    p, _ = _pipeline(calls, category="broken_test")
+    extra = str(tmp_path / "extra.log")
+    Path(extra).write_text("clean\n", encoding="utf-8")
+    log = _log(tmp_path)
+    out = p.run({"log_url_or_path": log, "evidence_paths": extra})
+    gate_call = next(c for c in calls if c[0] == "gate")
+    assert gate_call[1] == [extra, log]          # one path, not len(extra) chars
+    assert out["outcome"] == "ticket_created"
+
+
+def test_non_list_evidence_paths_is_a_clean_stage_error(tmp_path):
+    """Regression: a non-iterable evidence_paths raised TypeError out of run(),
+    losing every stage result and the ledger row."""
+    calls = []
+    p, ledger = _pipeline(calls, category="broken_test")
+    out = p.run({"log_url_or_path": _log(tmp_path), "evidence_paths": 7})
+    assert out["outcome"] == "needs_attention"
+    assert "error" in out["stage_results"]["pii"]
+    assert "skipped" in out["stage_results"]["tracker"]
+    assert not any(c[0] in ("gate", "tracker") for c in calls)
+    assert ledger and ledger[0]["branch"] == "bug"   # row still written
+    _assert_all_stage_keys(out)
+
+
+# --- required PII gate fails closed when the stage is missing --------------------------
+
+
+def test_missing_gate_stage_fails_closed_when_required(tmp_path):
+    """Regression: stages.gate=None with require_pii_gate=true proceeded to the
+    tracker with results['pii'] = {'skipped': ...} — fail OPEN."""
+    calls = []
+    stages = _stages(calls, category="broken_test")
+    stages.gate = None
+    ledger = []
+    p = pl.Pipeline(stages=stages,
+                    config={"pipeline": {"require_pii_gate": True},
+                            "jira": {"enable_write": True}},
+                    record_run=ledger.append)
+    out = p.run({"log_url_or_path": _log(tmp_path)})
+    assert out["outcome"] == "needs_attention"
+    assert out["stage_results"]["pii"]["ok"] is False
+    assert "skipped" in out["stage_results"]["tracker"]
+    assert not any(c[0] == "tracker" for c in calls)  # nothing was sent
+    assert ledger and ledger[0]["branch"] == "bug"
+
+
+def test_gate_disabled_by_config_still_proceeds(tmp_path):
+    calls = []
+    p, _ = _pipeline(calls, category="broken_test",
+                     config={"pipeline": {"require_pii_gate": False},
+                             "jira": {"enable_write": True}})
+    out = p.run({"log_url_or_path": _log(tmp_path)})
+    assert out["outcome"] == "ticket_created"
+    assert "skipped" in out["stage_results"]["pii"]
+    assert not any(c[0] == "gate" for c in calls)
+
+
+# --- evidence spooling: hostile build_id + spool failures -------------------------------
+
+
+def _fetch_stages(calls, **kw):
+    stages = _stages(calls, **kw)
+    stages.fetch_ci_logs = lambda call: json.dumps(
+        {"filtered_log": "E AssertionError: boom\n", "bytes_filtered": 22})
+    return stages
+
+
+def test_build_id_with_path_separator_is_sanitized(tmp_path):
+    """Regression: build_id='123/456' was interpolated raw into the spool
+    filename and raised FileNotFoundError out of run()."""
+    calls = []
+    ledger = []
+    p = pl.Pipeline(stages=_fetch_stages(calls, category="flaky"),
+                    config={"jira": {"enable_write": False}},
+                    record_run=ledger.append)
+    out = p.run({"build_id": "123/456", "repo": "o/r", "test_id": "t"})
+    evidence = out["stage_results"]["evidence"]
+    assert evidence["source"] == "fetch_ci_logs"
+    spooled = Path(evidence["log"])
+    assert spooled.name == "ci-log-123-456.log"
+    assert spooled.exists()
+    assert ledger  # the run completed and was recorded
+
+
+def test_spool_failure_is_an_evidence_stage_error_not_a_run_abort(monkeypatch):
+    calls = []
+    ledger = []
+    p = pl.Pipeline(stages=_fetch_stages(calls, category="flaky"),
+                    config={"jira": {"enable_write": False}},
+                    record_run=ledger.append)
+
+    def boom(self, text, build_id):
+        raise OSError("read-only spool")
+
+    monkeypatch.setattr(pl.Pipeline, "_spool_log", boom)
+    out = p.run({"build_id": "b1", "repo": "o/r", "test_id": "t"})
+    assert out["stage_results"]["evidence"] == {"error": "evidence spool failed (OSError)"}
+    assert out["outcome"] == "needs_attention"
+    assert ledger  # ledger row still written
+    _assert_all_stage_keys(out)
+
+
+# --- ledger: the branch is the fork decision, not a stage-shape guess -------------------
+
+
+def test_heal_branch_without_repo_dir_still_records_heal_branch(tmp_path):
+    """Regression: a heal-branch run that skipped the healer (no repo_dir)
+    recorded branch=NULL — undercounting exactly the failures one queries for."""
+    calls = []
+    p, ledger = _pipeline(calls, category="flaky")
+    out = p.run({"log_url_or_path": _log(tmp_path), "test_id": "t"})  # no repo_dir
+    assert out["outcome"] == "needs_attention"
+    assert "skipped" in out["stage_results"]["healer"]
+    assert ledger and ledger[0]["branch"] == "heal"
+
+
+# --- incidents→triage feedback failures must be visible ---------------------------------
+
+
+def test_incident_lookup_failure_is_logged_and_noted(tmp_path, caplog):
+    """Regression: incident_search errors were swallowed bare — invisible, and
+    indistinguishable from 'no similar incidents'."""
+    calls = []
+    p, _ = _pipeline(calls, category="broken_test")
+
+    def boom(query):
+        raise RuntimeError("fts index corrupt")
+
+    p.stages.incident_search = boom
+    with caplog.at_level(logging.WARNING,
+                         logger="hermes_flaky_stabilization.orchestrator.pipeline"):
+        out = p.run({"log_url_or_path": _log(tmp_path), "test_id": "t"})
+    assert any("incident-context lookup failed (RuntimeError)" in n
+               for n in out["notes"])
+    assert any("incident-context lookup failed" in r.message for r in caplog.records)
+    triage_call = next(c for c in calls if c[0] == "triage")
+    assert triage_call[2] is None                 # triage still ran, without hints
+    assert out["outcome"] == "ticket_created"     # ...and the run completed
+
+
+# --- /stabilize argument parsing ---------------------------------------------------------
+
+
+def _command_capture(monkeypatch):
+    captured: dict = {}
+
+    def fake_make_tool_handler(ctx, incidents_service):
+        def handler(args):
+            captured.update(args)
+            return json.dumps({"success": True, "outcome": "needs_attention",
+                               "stage_results": {}, "notes": []})
+        return handler
+
+    monkeypatch.setattr(pl, "make_tool_handler", fake_make_tool_handler)
+    return pl.make_command(None, None), captured
+
+
+def test_command_routes_path_double_colon_head_to_test_id(monkeypatch):
+    """Regression: the documented file_path::name form (with a path separator)
+    was misrouted as a log path because os.path.sep was checked first."""
+    command, captured = _command_capture(monkeypatch)
+    command("tests/login.spec.ts::checkout repo_dir=/tmp/x")
+    assert captured["test_id"] == "tests/login.spec.ts::checkout"
+    assert "log_url_or_path" not in captured
+
+
+def test_command_existing_file_with_double_colon_stays_log_path(tmp_path, monkeypatch):
+    command, captured = _command_capture(monkeypatch)
+    weird = tmp_path / "a::b.log"
+    weird.write_text("E boom\n", encoding="utf-8")
+    command(str(weird))
+    assert captured["log_url_or_path"] == str(weird)
+    assert "test_id" not in captured
+
+
+def test_command_splits_evidence_paths_into_a_list(monkeypatch):
+    """Regression: /stabilize stored evidence_paths as one string, which the
+    pipeline would previously char-split into nonsense."""
+    command, captured = _command_capture(monkeypatch)
+    command("some_test evidence_paths=/tmp/a.log,/tmp/b.log")
+    assert captured["evidence_paths"] == ["/tmp/a.log", "/tmp/b.log"]
+    command("some_test evidence_paths=/tmp/only.log")
+    assert captured["evidence_paths"] == ["/tmp/only.log"]
 
 
 # --- the real ingest_synthetic + lookup round trip (loop 1 end-to-end) ----------------

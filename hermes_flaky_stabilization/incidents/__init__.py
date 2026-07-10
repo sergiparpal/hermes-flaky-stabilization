@@ -161,6 +161,14 @@ class IncidentsService:
     def name(self) -> str:
         return NAME
 
+    @property
+    def store(self):
+        """The live IncidentStore, or None before initialization / when the
+        index is unavailable. Public seam for the orchestrator (dedup and
+        incident-context lookups) — external callers must not reach into
+        ``_store``."""
+        return self._store
+
     # -- availability (NO network) ------------------------------------------
 
     def is_available(self) -> bool:
@@ -191,13 +199,47 @@ class IncidentsService:
     # -- lifecycle -----------------------------------------------------------
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        """(Re)load config and (re)open the store/scheduler.
+
+        Idempotent across session starts: when already initialized with an
+        unchanged config and hermes_home (hence an unchanged db_path), the live
+        store and scheduler are REUSED — a re-init must never close the store
+        or replace the scheduler underneath an in-flight background sync (that
+        aborted the sync mid-write and immediately spawned a concurrent second
+        one). When the config/home did change, the old scheduler is joined with
+        a short timeout before the old store is closed.
+        """
         self._session_id = session_id or ""
-        self._hermes_home = kwargs.get("hermes_home") or config_mod.resolve_hermes_home()
+        hermes_home = kwargs.get("hermes_home") or config_mod.resolve_hermes_home()
         raw = (self._config_override if self._config_override is not None
-               else config_mod.load_config(self._hermes_home))
-        self._config = IncidentsConfig.from_dict(raw)
-        self._prefetch_timeout = self._config.prefetch_timeout
-        self._sync_min_interval = self._config.sync_min_interval
+               else config_mod.load_config(hermes_home))
+        new_config = IncidentsConfig.from_dict(raw)
+
+        # db_path derives from (config, hermes_home) only, so equality of both
+        # implies the same underlying database.
+        reuse = (self._initialized and self._store is not None
+                 and new_config == self._config and hermes_home == self._hermes_home)
+
+        self._hermes_home = hermes_home
+        self._config = new_config
+        self._prefetch_timeout = new_config.prefetch_timeout
+        self._sync_min_interval = new_config.sync_min_interval
+
+        agent_context = kwargs.get("agent_context", "primary")
+
+        if reuse:
+            # Same config + db: keep the live store and scheduler. The client
+            # is rebuilt (cheap, no I/O) so a token rotated in the environment
+            # is picked up between sessions.
+            self._client = self._build_client()
+            if self._client and self._store and agent_context in ("primary", "", None):
+                self._sync.trigger()
+            return
+
+        # Config/home changed (or first init): settle any in-flight sync before
+        # tearing down the store it writes to.
+        if self._sync is not None:
+            self._sync.join(SYNC_JOIN_TIMEOUT)
 
         db_path = self._effective_db_path()
         try:
@@ -215,7 +257,6 @@ class IncidentsService:
 
         # Skip writes for non-primary contexts (cron/subagent), mirroring the
         # legacy lifecycle contract.
-        agent_context = kwargs.get("agent_context", "primary")
         if self._client and self._store and agent_context in ("primary", "", None):
             # Kick off an initial background refresh — never block startup.
             self._sync.trigger()

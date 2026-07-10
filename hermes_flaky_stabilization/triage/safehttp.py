@@ -73,10 +73,22 @@ def safe_url(url: str) -> str:
 # --------------------------------------------------------------------------
 
 def _allow_private() -> bool:
-    """Whether RFC1918/private fetch destinations are permitted (opt-in)."""
-    return os.environ.get(_ALLOW_PRIVATE_ENV, "").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
+    """Whether RFC1918/private fetch destinations are permitted (opt-in).
+
+    Precedence: ``HERMES_CI_TRIAGE_ALLOW_PRIVATE`` env var (any non-empty
+    value, truthy or not, decides), then the unified config's
+    ``triage.allow_private``, then False. Fail-closed: any problem reading the
+    config keeps private ranges blocked.
+    """
+    raw = os.environ.get(_ALLOW_PRIVATE_ENV, "").strip()
+    if raw:
+        return raw.lower() in ("1", "true", "yes", "on")
+    try:
+        from .. import config as unified_config
+
+        return bool(unified_config.load_config()["triage"]["allow_private"])
+    except Exception:
+        return False
 
 
 def ip_blocked(ip) -> bool:

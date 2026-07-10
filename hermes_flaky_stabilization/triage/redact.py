@@ -25,11 +25,17 @@ _TOKEN_PATTERNS = [
     re.compile(r"\b(?:AKIA|ASIA|AGPA|AROA|AIPA|ANPA|ANVA)[A-Z0-9]{12,}\b"),  # AWS key id
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),          # Slack
     re.compile(r"\bAIza[0-9A-Za-z_\-]{35,}\b"),               # Google API key
-    re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"),                   # OpenAI-style secret key
+    # OpenAI/Anthropic-style secret keys, incl. hyphenated forms (sk-proj-…, sk-ant-…).
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
     re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),  # JWT
+    # PEM private-key blocks. The END marker is OPTIONAL: prefilter windowing
+    # and char/line caps routinely cut a block before its END line, and an
+    # unpaired BEGIN must still redact the key body (to end-of-text) rather
+    # than let raw key material through. The paired form matches first (the
+    # lazy `.*?` stops at the earliest END marker).
     re.compile(
         r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"
-        r".*?-----END (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----",
+        r".*?(?:-----END (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----|\Z)",
         re.DOTALL,
     ),
 ]

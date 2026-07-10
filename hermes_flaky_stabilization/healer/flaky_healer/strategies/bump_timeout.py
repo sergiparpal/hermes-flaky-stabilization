@@ -10,8 +10,11 @@ FACTOR = 3
 CAP_MS = 60_000
 
 # Accept TS numeric separators (idiomatic `25_000`); they are stripped before int().
-_TIMEOUT_RE = re.compile(r"timeout:\s*([\d_]+)")
-_SET_TIMEOUT_RE = re.compile(r"test\.setTimeout\(\s*([\d_]+)\s*\)")
+# `[ \t]` (never `\s`) so a match cannot span lines: this strategy anchors its
+# PatchOps to a single containing line, and a multi-line
+# `test.setTimeout(\n  60_000\n)` match would have no such line.
+_TIMEOUT_RE = re.compile(r"timeout:[ \t]*([\d_]+)")
+_SET_TIMEOUT_RE = re.compile(r"test\.setTimeout\([ \t]*([\d_]+)[ \t]*\)")
 
 
 def _int(token: str) -> int:
@@ -60,7 +63,11 @@ class BumpTimeout:
             new = _bumped(_int(m.group(1)))
             if new is None:
                 return []
-            line = next(ln for ln in test_source.splitlines() if m.group(0) in ln)
+            # Defense in depth: decline (never raise StopIteration) if no single
+            # line contains the match — an anchored PatchOp needs one.
+            line = next((ln for ln in test_source.splitlines() if m.group(0) in ln), None)
+            if line is None:
+                return []
             return [
                 PatchOp(
                     file=test_file,

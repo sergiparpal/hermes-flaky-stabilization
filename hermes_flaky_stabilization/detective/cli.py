@@ -253,6 +253,11 @@ def _print_manual_command(printable: str) -> None:
     print(_gateway_note())
 
 
+def _shim_source() -> Path:
+    """Path to the shim script shipped in the plugin checkout's ``scripts/`` dir."""
+    return Path(__file__).resolve().parents[2] / "scripts" / SHIM_NAME
+
+
 def _install_shim() -> Path:
     """Copy the shim into ``<hermes_home>/scripts/`` with mode 0700; return its path."""
     import shutil
@@ -265,7 +270,7 @@ def _install_shim() -> Path:
         os.chmod(scripts_dir, 0o700)
     except OSError:
         pass
-    shim_src = Path(__file__).resolve().parents[2] / "scripts" / SHIM_NAME
+    shim_src = _shim_source()
     shim_dst = scripts_dir / SHIM_NAME
     shutil.copyfile(shim_src, shim_dst)
     try:
@@ -278,9 +283,11 @@ def _install_shim() -> Path:
 def _cmd_install_cron(args) -> int:
     """Install the nightly no-agent cron job (the only sanctioned subprocess).
 
-    Steps, in execution order: (1) persist the resolved options into
-    ``config.json`` so the shim's ``scan`` uses them; (2) copy the shim into
-    ``~/.hermes/scripts/`` (0700); (3) create the job once via
+    Steps, in execution order: (0) verify the shim source exists, so a broken
+    install (e.g. site-packages without the checkout's ``scripts/``) fails
+    cleanly *before* anything is persisted; (1) persist the resolved options
+    into ``config.json`` so the shim's ``scan`` uses them; (2) copy the shim
+    into ``~/.hermes/scripts/`` (0700); (3) create the job once via
     ``hermes cron create``. If that CLI is missing or the gateway is not
     configured, this does **not** error — it prints the exact command plus a
     one-line gateway note. ``--no-create`` stops after step (2).
@@ -301,6 +308,15 @@ def _cmd_install_cron(args) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    # (0) verify the shim source BEFORE persisting anything: a missing source
+    # must not leave config.json already mutated for a job that never installs.
+    shim_src = _shim_source()
+    if not shim_src.exists():
+        print(f"error: cron shim source not found at {shim_src}; reinstall the "
+              f"plugin from a checkout that ships scripts/{SHIM_NAME}, or copy that "
+              "script into <hermes_home>/scripts/ yourself.", file=sys.stderr)
+        return 1
+
     # (1) persist resolved options so the scheduled `scan` uses them.
     config.write_config({
         "schedule": schedule, "deliver": deliver,
@@ -308,7 +324,12 @@ def _cmd_install_cron(args) -> int:
     })
 
     # (2) install the shim.
-    shim_dst = _install_shim()
+    try:
+        shim_dst = _install_shim()
+    except OSError as exc:
+        print(f"error: could not install the cron shim into <hermes_home>/scripts/: {exc}",
+              file=sys.stderr)
+        return 1
     print(f"installed shim: {shim_dst} (mode 0700)")
 
     printable = _printable_cron_command(schedule, deliver)

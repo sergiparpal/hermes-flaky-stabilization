@@ -109,18 +109,24 @@ def _walk_html(node):
 
     Nodes look like ``[TAG, {attrs}, ...children]``; delta back-references
     like ``[[1, 26]]`` contain no strings and are skipped safely.
+
+    Iterative with an explicit stack (preserving pre-order, left-to-right
+    traversal): a trace.zip is untrusted, and a deeply nested snapshot (a
+    ~1000-level DOM fits trivially inside the zip budget) must not blow the
+    interpreter recursion limit and kill the whole parse.
     """
-    if not isinstance(node, list) or not node:
-        return
-    if isinstance(node[0], str):
-        attrs = node[1] if len(node) > 1 and isinstance(node[1], dict) else None
-        yield node[0], (attrs or {})
-        children = node[2:] if attrs is not None else node[1:]
-        for child in children:
-            yield from _walk_html(child)
-    else:
-        for child in node:
-            yield from _walk_html(child)
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if not isinstance(current, list) or not current:
+            continue
+        if isinstance(current[0], str):
+            attrs = current[1] if len(current) > 1 and isinstance(current[1], dict) else None
+            yield current[0], (attrs or {})
+            children = current[2:] if attrs is not None else current[1:]
+            stack.extend(reversed(children))
+        else:
+            stack.extend(reversed(current))
 
 
 def _api_name(method: str, title: str | None) -> str:

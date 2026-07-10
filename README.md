@@ -78,10 +78,11 @@ retention, **enable_write: false**, project_key INC, issue_type Bug),
 `pipeline` (default_heal_mode suggest, heal_categories [flaky, timeout],
 require_pii_gate true — never set false in production).
 
-Legacy env vars keep working as overrides: `FLAKY_HEALER_*`,
-`HERMES_CI_TRIAGE_*`, `JIRA_BASE_URL`/`JIRA_EMAIL`,
-`HERMES_JIRA_STRICT_REDACTION`. Secrets live **only** in env:
-`GITHUB_TOKEN`, `JIRA_API_TOKEN`.
+Precedence: env var > `config.json` section > (for `history` only) the
+legacy `test-history/config.json` > built-in default. Legacy env vars keep
+working as overrides: `FLAKY_HEALER_*`, `HERMES_CI_TRIAGE_*`,
+`JIRA_BASE_URL`/`JIRA_EMAIL`, `HERMES_JIRA_STRICT_REDACTION`. Secrets live
+**only** in env: `GITHUB_TOKEN`, `JIRA_API_TOKEN`.
 
 ## Security model
 
@@ -92,10 +93,17 @@ Legacy env vars keep working as overrides: `FLAKY_HEALER_*`,
 2. **PR-only git flow through host approvals** — git/PR steps are
    `ctx.dispatch_tool` calls (`terminal`, `create_pull_request`), so the host
    approval/redaction/budget pipeline applies; pushes to default branches are
-   structurally impossible.
+   structurally impossible. The flow refuses to start on a dirty working
+   tree, cuts the fix branch from the burn-in-validated HEAD (`base` is the
+   PR target only; the validated sha is recorded in the PR body), treats any
+   host result that does not positively signal success as a failure, and on
+   any failure restores the original ref and deletes the fix branch.
 3. **Plugin-side approval escalation** — a `pre_tool_call` hook returns
-   `{"action": "approve"}` for `heal_flaky_test(mode=pr)` and every
-   `jira_create_incident` call (fail-closed at the host).
+   `{"action": "approve"}` for `heal_flaky_test(mode=pr)`, every
+   `jira_create_incident` call, and `stabilize_test_failure` whenever the
+   run could write (PR mode requested, or the Jira write path is live) —
+   fail-closed at the host, and fail-closed to escalation when the config
+   cannot be read.
 4. **PII gate before any external output** — `jira_create_incident` (and the
    pipeline's bug branch) refuse unless every referenced evidence file passes
    `validate_no_pii` (`clean && complete`) in the same call, and every
@@ -127,8 +135,12 @@ hermes flaky-stab install-cron --schedule "0 9 * * *" [--with-jira-sync]
 
 Installs a no-agent shim (`flaky-stab-scan.sh`) that runs
 `hermes flaky-stab scan --format cron` — silent on quiet nights, alerting on
-new flaky tests — and optionally a second job that refreshes the incident
-index. The gateway daemon must be running for jobs to fire.
+new flaky tests — and optionally a second job that runs
+`hermes flaky-stab jira sync --quiet` (silent when nothing changed; a broken
+sync exits non-zero so the job alerts). `hermes flaky-stab jira sync --full`
+re-ingests from scratch and, when the run completes untruncated, removes
+locally indexed incidents that no longer exist in Jira. The gateway daemon
+must be running for jobs to fire.
 
 ## Development
 

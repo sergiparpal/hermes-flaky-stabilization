@@ -183,6 +183,59 @@ def test_scan_empty_window_preserves_previous_verdicts(profile_env, capsys):
         assert store.get_verdict("pkg.Mod::test_flaky")["status"] == domain.VERDICT_FLAKY
 
 
+def test_scan_all_uncounted_window_preserves_previous_verdicts(profile_env, capsys):
+    # First, a normal scan records the flaky verdict.
+    _seed_test_history(profile_env)
+    assert _run(["scan", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["scan"]["flaky_found"] == 1
+
+    # Re-seed with an in-window run whose every case is `error`. With
+    # --no-include-errors the window has rows yet zero *counted* runs (a CI
+    # outage): the scan must behave exactly like an empty window — keep the
+    # snapshot, audit tests_examined=0 — never wipe the verdicts to
+    # all-stable-with-0-runs and fire false "no longer flaky" alerts.
+    th = profile_env / "test-history" / "history.db"
+    th.unlink()
+    build_test_history_db(th, [{"source_file": "outage.xml", "run_timestamp": _days_ago(1),
+                                "cases": [
+        {"classname": "pkg.Mod", "name": "test_flaky", "file_path": "src/mod.py",
+         "status": "error"},
+        {"classname": "pkg.Mod", "name": "test_stable", "file_path": "src/mod.py",
+         "status": "error"},
+    ]}])
+
+    assert _run(["scan", "--no-include-errors", "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["scan"]["tests_examined"] == 0
+    assert payload["changes"]["newly_resolved"] == []   # no false "no longer flaky"
+    with storage.Storage() as store:
+        # The earlier flaky verdict survives (not overwritten as stable-with-0-runs).
+        assert store.get_verdict("pkg.Mod::test_flaky")["status"] == domain.VERDICT_FLAKY
+        assert store.last_scan_run()["tests_examined"] == 0
+
+
+def test_scan_zero_run_verdicts_are_not_persisted(profile_env, capsys):
+    # One test has only an uncounted `error` row, the other real runs: the scan
+    # proceeds, but the zero-run test must not be stored at all — otherwise
+    # is_flaky would answer "stable" with 0 runs on zero evidence.
+    th_dir = profile_env / "test-history"
+    th_dir.mkdir(parents=True, exist_ok=True)
+    build_test_history_db(th_dir / "history.db", [
+        {"source_file": "run.xml", "run_timestamp": _days_ago(1), "cases": [
+            {"classname": "pkg.Mod", "name": "test_ok", "file_path": "src/mod.py",
+             "status": "passed"},
+            {"classname": "pkg.Mod", "name": "test_err_only", "file_path": "src/mod.py",
+             "status": "error"},
+        ]},
+    ])
+    assert _run(["scan", "--no-include-errors", "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["scan"]["tests_examined"] == 1
+    with storage.Storage() as store:
+        assert store.get_verdict("pkg.Mod::test_ok") is not None
+        assert store.get_verdict("pkg.Mod::test_err_only") is None
+
+
 # ---------------------------------------------------------------------------
 # scan — test-history unavailable
 # ---------------------------------------------------------------------------

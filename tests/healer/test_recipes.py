@@ -269,8 +269,12 @@ class TestRecipeFailureFallback:
         assert len(sandbox.calls) == 3, "reproduce once, burn-in twice (recipe + fallback)"
 
         recipe = store.get_recipe(sig)
-        assert recipe.failures == 1, "failed recipe burn-in must be recorded"
         assert recipe.strategy == "testid_selector", "fallback success refreshes the recipe"
+        # The failed burn-in was recorded against the OLD (bump_timeout) body;
+        # replacing the body resets the counters so the new patch is not charged
+        # with (or ranked by) history it never earned.
+        assert (recipe.hits, recipe.successes, recipe.failures) == (0, 0, 0)
+        assert recipe.last_used_ts is None
 
 
 class TestSkillExport:

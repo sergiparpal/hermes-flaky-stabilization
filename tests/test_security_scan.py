@@ -59,9 +59,10 @@ def test_subprocess_only_in_pinned_allowlist():
 
 
 def test_allowlist_entries_exist():
-    """A stale allowlist entry hides a real regression — prune it."""
+    """A stale allowlist entry hides a real regression — prune it.
+
+    Every entry must exist on disk, no carve-outs: the healer shipped in
+    Phase 4, so its entries are held to the same standard as everyone else's.
+    """
     for rel in SUBPROCESS_ALLOWLIST:
-        # healer lands in Phase 4; tolerate its listed-but-not-yet-ported files.
-        if rel.startswith("healer/"):
-            continue
         assert (PACKAGE / rel).exists(), f"allowlisted module missing: {rel}"

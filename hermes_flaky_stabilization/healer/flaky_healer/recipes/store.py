@@ -15,13 +15,30 @@ logic below is verbatim from hermes-flaky-healer.
 from __future__ import annotations
 
 import json
+import logging
+import re
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .signature import relaxed_key
+from .signature import is_degenerate, relaxed_key
+
+logger = logging.getLogger(__name__)
+
+# Mirrors handlers._TOKEN_VALUE_RE (importing it would cycle: handlers imports
+# this module). Applied to the repr() audit fallback so a non-serializable
+# payload can never smuggle a raw credential into the audit table.
+_TOKEN_VALUE_RE = re.compile(
+    r"(?:gh[poursa]_[A-Za-z0-9]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}"
+    r"|xox[baprs]-[A-Za-z0-9-]{10,}"
+    r"|AKIA[0-9A-Z]{16}"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}"
+    r"|[Bb]earer\s+[A-Za-z0-9._\-]{12,})"
+)
 
 # Informational: the legacy store's last schema version (the unified state.db
 # supersedes it; kept because callers/tests reference the constant).
@@ -125,7 +142,8 @@ class HealerStore:
         try:
             encoded = json.dumps(payload)
         except TypeError:
-            encoded = json.dumps({"repr": repr(payload)[:2000]})
+            masked = _TOKEN_VALUE_RE.sub("***", repr(payload))
+            encoded = json.dumps({"repr": masked[:2000]})
         with closing(self._connect()) as conn, conn:
             conn.execute(
                 "INSERT INTO audit(ts, event, payload_json) VALUES(?,?,?)",
@@ -146,6 +164,16 @@ class HealerStore:
 
     # -- recipes ----------------------------------------------------------------
 
+    # ON CONFLICT: the recipe BODY (strategy + patch_ops) is refreshed; the
+    # hits/successes/failures counters and last_used_ts describe how the STORED
+    # body performed, so they only survive when the body is unchanged — a
+    # replaced body starts from zero rather than inheriting rank earned (or
+    # failures suffered) by the previous patch. `IS NOT` is NULL-safe.
+    _RECIPE_BODY_CHANGED = (
+        "(excluded.patch_ops_json IS NOT recipes.patch_ops_json"
+        " OR excluded.strategy IS NOT recipes.strategy)"
+    )
+
     def upsert_recipe(
         self,
         signature: str,
@@ -155,6 +183,14 @@ class HealerStore:
         patch_ops: list[dict],
         signature_parts: dict,
     ) -> None:
+        if signature_parts and is_degenerate(signature_parts):
+            # An all-empty signature (no error, no failing action — e.g. the
+            # trace of a passing retry) hashes to a constant under which
+            # unrelated failures would collide; never persist a recipe for it.
+            logger.debug(
+                "skipping recipe upsert for %s: degenerate signature parts", signature[:8]
+            )
+            return
         blob = json.dumps({"diagnosis": diagnosis, "signature_parts": signature_parts})
         ops = json.dumps(patch_ops)
         rkey = relaxed_key(signature_parts) if signature_parts else None
@@ -164,7 +200,14 @@ class HealerStore:
                 " patch_ops_json, relaxed_key) VALUES(?,?,?,?,?,?)"
                 " ON CONFLICT(signature) DO UPDATE SET diagnosis_json=excluded.diagnosis_json,"
                 " strategy=excluded.strategy, patch_ops_json=excluded.patch_ops_json,"
-                " relaxed_key=excluded.relaxed_key",
+                " relaxed_key=excluded.relaxed_key,"
+                f" hits=CASE WHEN {self._RECIPE_BODY_CHANGED} THEN 0 ELSE recipes.hits END,"
+                f" successes=CASE WHEN {self._RECIPE_BODY_CHANGED} THEN 0"
+                "  ELSE recipes.successes END,"
+                f" failures=CASE WHEN {self._RECIPE_BODY_CHANGED} THEN 0"
+                "  ELSE recipes.failures END,"
+                f" last_used_ts=CASE WHEN {self._RECIPE_BODY_CHANGED} THEN NULL"
+                "  ELSE recipes.last_used_ts END",
                 (signature, _now(), blob, strategy, ops, rkey),
             )
 

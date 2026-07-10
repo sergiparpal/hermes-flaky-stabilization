@@ -24,6 +24,13 @@ from .base import (
     tail,
 )
 
+# docker-CLI exit codes that mean the CONTAINER NEVER RAN the test command:
+# 125 = the docker daemon/CLI itself errored, 126 = the command cannot be
+# invoked, 127 = the command was not found. Recording these as ordinary test
+# failures would fabricate "reproduced" verdicts and unfairly charge recipes,
+# so they abort the heal as infrastructure errors instead.
+_DOCKER_INFRA_EXIT_CODES = frozenset({125, 126, 127})
+
 
 class DockerSandbox:
     isolation = "docker"
@@ -112,6 +119,12 @@ class DockerSandbox:
         start = time.monotonic()
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+            if proc.returncode in _DOCKER_INFRA_EXIT_CODES:
+                raise SandboxError(
+                    "docker sandbox infrastructure failure (docker exited "
+                    f"{proc.returncode}; the test never ran): "
+                    f"{tail(proc.stderr or proc.stdout, 500)}"
+                )
             return RunResult(
                 exit_code=proc.returncode,
                 duration_s=time.monotonic() - start,

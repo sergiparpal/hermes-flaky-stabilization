@@ -90,11 +90,42 @@ def get_db_path() -> Path:
 # ---------------------------------------------------------------------------
 
 
-def get_config() -> dict[str, Any]:
-    """Resolved config: user ``config.json`` merged over ``DEFAULT_CONFIG``.
+def _unified_overrides() -> dict[str, Any]:
+    """``history``-section keys explicitly set in the unified plugin config.
 
-    Cached after first read. A malformed config file degrades to defaults
-    rather than raising.
+    The unified ``<hermes_home>/flaky-stabilization/config.json`` (plan D5)
+    carries a ``history`` section too. Only keys the user actually wrote there
+    may override the layers below — ``load_config`` fills every section with
+    defaults, so key presence is taken from the raw file while the values come
+    from ``load_config`` (which type-coerces them). Any failure degrades to
+    "no overrides" so a broken unified config can never take down the keystone
+    tools.
+    """
+    try:
+        from .. import config as unified_config
+
+        path = unified_config.config_path()
+        if not path.exists():
+            return {}
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        section = raw.get("history") if isinstance(raw, dict) else None
+        if not isinstance(section, dict):
+            return {}
+        resolved = unified_config.load_config().get("history", {})
+        return {k: resolved[k] for k in section if k in resolved}
+    except Exception:
+        return {}
+
+
+def get_config() -> dict[str, Any]:
+    """Resolved config, cached after first read.
+
+    Precedence (highest wins): the ``history`` section of the unified
+    ``flaky-stabilization/config.json`` (only keys explicitly set there), then
+    the legacy ``test-history/config.json``, then ``DEFAULT_CONFIG``. A
+    malformed file at either location degrades to the layers below rather than
+    raising, and nothing changes for existing installs until a unified
+    ``history`` section is written.
     """
     global _config
     if _config is not None:
@@ -108,7 +139,7 @@ def get_config() -> dict[str, Any]:
                 user_cfg = loaded
         except Exception:
             user_cfg = {}
-    _config = {**DEFAULT_CONFIG, **user_cfg}
+    _config = {**DEFAULT_CONFIG, **user_cfg, **_unified_overrides()}
     return _config
 
 

@@ -10,6 +10,9 @@ first occurrence of ``old`` at-or-after the anchor, ``insert_before`` inserts
 from __future__ import annotations
 
 import difflib
+import os
+import shutil
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -94,11 +97,40 @@ def _iter_targets(root: Path | str, ops: list[PatchOp]):
 
 
 def _changed_text(target: Path, file_ops: list[PatchOp]) -> tuple[str, str]:
-    before = target.read_text()
+    # JS/TS sources are UTF-8 by convention; never depend on the host locale
+    # (under LANG=C an implicit-encoding read of a non-ASCII spec raises).
+    before = target.read_text(encoding="utf-8")
     after = before
     for op in file_ops:
         after = _apply_to_text(after, op)
     return before, after
+
+
+def _write_text_breaking_links(target: Path, text: str) -> None:
+    """Write ``text`` to ``target`` via a sibling temp file + ``os.replace``.
+
+    The sandbox copy may HARDLINK the user's original files (see
+    ``FLAKY_HEALER_HARDLINK_COPY`` / ``sandbox.base.copy_project``): an
+    in-place ``open(..., "w")`` would O_TRUNC the shared inode and silently
+    rewrite the user's real repo — violating the D6 sandbox-only-modification
+    guarantee. ``os.replace`` atomically points the sandbox path at a NEW
+    inode, so the original file (and any concurrent run sharing the inode)
+    is never touched. The original file mode is preserved.
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=f".{target.name}.", suffix=".flaky-healer.tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        shutil.copymode(target, tmp_name)
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def compute_changes(root: Path | str, ops: list[PatchOp]) -> dict[str, tuple[str, str]]:
@@ -115,11 +147,15 @@ def compute_changes(root: Path | str, ops: list[PatchOp]) -> dict[str, tuple[str
 
 
 def apply_ops(root: Path | str, ops: list[PatchOp]) -> dict[str, tuple[str, str]]:
-    """Apply ops to files under root; returns {relpath: (before, after)}."""
+    """Apply ops to files under root; returns {relpath: (before, after)}.
+
+    Writes go through :func:`_write_text_breaking_links` so a hardlinked
+    sandbox copy can never mutate the file it was linked from.
+    """
     changes: dict[str, tuple[str, str]] = {}
     for rel, target, file_ops in _iter_targets(root, ops):
         before, after = _changed_text(target, file_ops)
-        target.write_text(after)
+        _write_text_breaking_links(target, after)
         changes[rel] = (before, after)
     return changes
 

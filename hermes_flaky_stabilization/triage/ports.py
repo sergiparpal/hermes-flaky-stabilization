@@ -1,12 +1,11 @@
-"""Typed ports for the Hermes capabilities this plugin depends on.
+"""Typed ports for the Hermes capabilities this stage depends on.
 
-The plugin follows a ports-and-adapters shape: ``__init__.register`` is the only
-adapter that touches Hermes, and it *injects* the host's ``llm`` and
-``dispatch_tool`` into the otherwise pure-stdlib pipeline. Those capabilities
-used to cross the boundary as bare ``Any`` / ``Callable``; this module names the
-narrow surface each one must satisfy (Interface Segregation — depend only on the
-methods actually called) so the contract is explicit, type-checkable, and easy
-to fake in tests.
+The stage follows a ports-and-adapters shape: ``__init__.register`` is the only
+adapter that touches Hermes, and it *injects* the host's ``llm`` into the
+otherwise pure-stdlib pipeline. That capability used to cross the boundary as a
+bare ``Any``; this module names the narrow surface it must satisfy (Interface
+Segregation — depend only on the methods actually called) so the contract is
+explicit, type-checkable, and easy to fake in tests.
 
 These are :class:`typing.Protocol` definitions: structural, import-only, and
 stdlib. They impose no runtime requirement on the real Hermes objects — the host
@@ -15,7 +14,7 @@ stdlib. They impose no runtime requirement on the real Hermes objects — the ho
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
 
 
@@ -54,17 +53,3 @@ class LlmPort(Protocol):
         timeout: float | None = ...,
         purpose: str | None = ...,
     ) -> StructuredResult: ...
-
-
-@runtime_checkable
-class ToolDispatcher(Protocol):
-    """Invoke another registered tool by name with a JSON-ish argument map.
-
-    Matches ``ctx.dispatch_tool`` and returns whatever that tool returns —
-    typically a JSON string, occasionally a decoded object. The optional
-    enrichment path is the only caller.
-    """
-
-    def __call__(
-        self, name: str, arguments: Mapping[str, Any], **kwargs: Any
-    ) -> Any: ...

@@ -204,6 +204,48 @@ class TestPrefetch:
 
 
 # ---------------------------------------------------------------------------
+# initialize() idempotence — a session start must not close the live store or
+# replace the scheduler underneath an in-flight background sync.
+# ---------------------------------------------------------------------------
+
+class TestInitializeIdempotent:
+    def test_reinitialize_with_unchanged_config_reuses_store_and_scheduler(
+            self, provider, tmp_home):
+        store, sched = provider._store, provider._sync
+        provider._store.upsert({"key": "INC-1", "summary": "seeded", "status": "Open"})
+        provider.initialize(session_id="second-session", hermes_home=tmp_home,
+                            platform="cli")
+        assert provider._store is store
+        assert provider._sync is sched
+        # the live store was not closed underneath us
+        assert provider._store.get("INC-1") is not None
+
+    def test_on_session_start_reuses_live_store(self, provider):
+        store, sched = provider._store, provider._sync
+        provider.on_session_start("another-session")
+        assert provider._store is store
+        assert provider._sync is sched
+
+    def test_changed_config_rebuilds_store(self, tmp_home):
+        cfg_dir = os.path.join(tmp_home, "flaky-stabilization")
+        os.makedirs(cfg_dir, exist_ok=True)
+        cfg_file = os.path.join(cfg_dir, "config.json")
+        with open(cfg_file, "w") as f:
+            json.dump({"jira": {"base_url": "https://x.atlassian.net"}}, f)
+        p = IncidentsService()  # no override -> config re-read from disk
+        p.initialize(session_id="s1", hermes_home=tmp_home, platform="cli")
+        old_store = p._store
+        try:
+            with open(cfg_file, "w") as f:
+                json.dump({"jira": {"base_url": "https://y.atlassian.net"}}, f)
+            p.initialize(session_id="s2", hermes_home=tmp_home, platform="cli")
+            assert p._store is not old_store
+            assert p._store is not None
+        finally:
+            p.shutdown()
+
+
+# ---------------------------------------------------------------------------
 # sync_turn — non-blocking, never raises (Phase 3 / §3.6)
 # ---------------------------------------------------------------------------
 

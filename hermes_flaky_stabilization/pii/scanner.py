@@ -203,6 +203,12 @@ def _mask_pii(text: str) -> str:
     return "".join(out)
 
 
+# Public seam: the orchestrator's egress canary masks residual PII in
+# assembled ticket text through this alias (external callers must not
+# import the underscore name).
+mask_pii = _mask_pii
+
+
 def _safe_error_field(value: str) -> str:
     """Render an untrusted value for an error message: masked, then bounded.
 

@@ -178,8 +178,14 @@ def _aggregate_counts(root, suites, cases: list[ParsedCase]) -> tuple[int, int, 
     aggregate attributes, then counts derived from the parsed cases."""
 
     def suite_sum(key: str) -> int | None:
-        present = [v for v in (_to_int(s.get(key)) for s in suites) if v is not None]
-        return sum(present) if present else None
+        # Trust the suite attributes only when EVERY suite carries the key: a
+        # partial sum would undercount (suite A tests="3" plus an attribute-less
+        # suite B with 4 cases must not yield total==3 for a 7-case run) while
+        # suppressing the case-derived fallback below.
+        values = [_to_int(s.get(key)) for s in suites]
+        if not values or any(v is None for v in values):
+            return None
+        return sum(values)
 
     def resolve(key: str, status: str | tuple[str, ...]) -> int:
         val = suite_sum(key)

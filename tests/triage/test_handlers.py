@@ -1,4 +1,4 @@
-"""handlers: end-to-end pipeline with mocked llm / dispatch_tool."""
+"""handlers: end-to-end pipeline with a mocked llm."""
 
 from __future__ import annotations
 
@@ -238,3 +238,146 @@ def test_llm_error_is_logged(tmp_path, tmp_hermes_home, caplog):
     with caplog.at_level(logging.WARNING):
         handlers.triage_pipeline_failure({"log_url_or_path": path}, llm=llm)
     assert any("heuristic fallback" in r.getMessage() for r in caplog.records)
+
+
+def test_non_json_llm_output_logs_warning(tmp_path, tmp_hermes_home, caplog):
+    """Regression: content_type != 'json' fell back with NO log line, so a host
+    misintegration silently degraded every call to 0.3-confidence heuristics."""
+    import logging
+
+    path = _write(tmp_path, "x.log", "ModuleNotFoundError: No module named 'x'\n")
+    llm = FakeLlm(parsed=None, content_type="text")
+    with caplog.at_level(logging.WARNING):
+        data = json.loads(handlers.triage_pipeline_failure(
+            {"log_url_or_path": path}, llm=llm))
+    assert data["classification_method"] == "heuristic"
+    assert any(
+        "content_type" in r.getMessage() and "'text'" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_out_of_taxonomy_category_logs_warning(tmp_path, tmp_hermes_home, caplog):
+    """Regression: an out-of-taxonomy category fell back silently; the warning
+    must name the offending category."""
+    import logging
+
+    path = _write(tmp_path, "x.log", "No space left on device\n")
+    llm = FakeLlm(parsed={"category": "cosmic_rays", "confidence": 0.9,
+                          "summary": "x"})
+    with caplog.at_level(logging.WARNING):
+        data = json.loads(handlers.triage_pipeline_failure(
+            {"log_url_or_path": path}, llm=llm))
+    assert data["category"] == "infra"
+    assert data["classification_method"] == "heuristic"
+    assert any("cosmic_rays" in r.getMessage() for r in caplog.records)
+
+
+# --------------------------------------------------------------------------
+# Low-signal tail excerpt: character cap (a line cap alone is no bound)
+# --------------------------------------------------------------------------
+
+def test_low_signal_single_line_log_is_char_capped(tmp_path, tmp_hermes_home):
+    """Regression: a huge single-line low-signal log (CR progress bars,
+    minified output) went whole through redaction, the signature regexes and
+    into the LLM call — _tail_excerpt had no character cap."""
+    from hermes_plugins.hermes_ci_triage import prefilter
+
+    # One line, ~90k chars, no failure keyword anywhere.
+    log = "HEADzz " + "ok " * 30_000 + "TAILzz"
+    path = _write(tmp_path, "huge.log", log)
+    llm = FakeLlm(parsed={"category": "infra", "confidence": 0.6,
+                          "summary": "s", "evidence": [],
+                          "suggested_action": "a"})
+    data = json.loads(handlers.triage_pipeline_failure(
+        {"log_url_or_path": path}, llm=llm))
+    assert data["success"] is True
+    assert data["log_stats"]["low_signal"] is True
+    assert data["log_stats"]["truncated"] is True
+    # The excerpt handed to the LLM is capped, tail-kept, and carries the note.
+    excerpt_block = llm.calls[0]["input"][-1]["text"]
+    assert len(excerpt_block) <= (
+        prefilter.DEFAULT_CHAR_CAP + len(prefilter.TRUNCATION_NOTE) + 100
+    )
+    assert prefilter.TRUNCATION_NOTE in excerpt_block
+    assert "TAILzz" in excerpt_block   # errors cluster at the end — keep the tail
+    assert "HEADzz" not in excerpt_block
+
+
+def test_tail_excerpt_small_log_unchanged():
+    """Small low-signal logs are untouched — no note, no truncation."""
+    from hermes_plugins.hermes_ci_triage import prefilter
+
+    raw = "\n".join(f"step {i} ok" for i in range(10))
+    out = handlers._tail_excerpt(raw)
+    assert out == raw
+    assert prefilter.TRUNCATION_NOTE not in out
+
+
+# --------------------------------------------------------------------------
+# Enrichment query seeding must skip prefilter-injected marker lines
+# --------------------------------------------------------------------------
+
+def test_top_signal_line_skips_prefilter_markers():
+    """Regression: the truncation note contains the word 'failure', so it is a
+    'failure line' — and it is the excerpt's first line, so every truncated
+    excerpt used the note itself as the history query."""
+    from hermes_plugins.hermes_ci_triage import enrichment, prefilter
+
+    # Premise of the bug: the note itself matches the failure-line detector.
+    assert prefilter.is_failure_line(prefilter.TRUNCATION_NOTE)
+    excerpt = (
+        prefilter.TRUNCATION_NOTE + "\n"
+        "        ... (42 lines omitted) ...\n"
+        "        ⟪ previous line repeated 7 more times ⟫\n"
+        "AssertionError: boom in test_checkout\n"
+    )
+    assert enrichment.top_signal_line(excerpt) == "AssertionError: boom in test_checkout"
+
+
+def test_top_signal_line_marker_only_excerpt_yields_no_query():
+    from hermes_plugins.hermes_ci_triage import enrichment, prefilter
+
+    excerpt = prefilter.TRUNCATION_NOTE + "\n        ... (5 lines omitted) ...\n"
+    assert enrichment.top_signal_line(excerpt) == ""
+    assert enrichment.enrich(excerpt) is None  # empty query → no lookup at all
+
+
+def test_enrichment_works_on_truncated_excerpt(tmp_path, tmp_hermes_home, seeded_history):
+    """End-to-end: a truncated big log still enriches from a real signal line,
+    not from the truncation note the prefilter prepends."""
+    lines = []
+    for i in range(1000):
+        lines.append(f"collecting batch {i}")
+        lines.append("FAILED test_checkout_flow")
+    path = _write(tmp_path, "big.log", "\n".join(lines) + "\n")
+    out = handlers.triage_pipeline_failure(
+        {"log_url_or_path": path}, llm=None, enable_enrichment=True)
+    data = json.loads(out)
+    assert data["success"] is True
+    assert data["log_stats"]["truncated"] is True
+    assert data.get("enrichment", {}).get("source") == "test_failure_lookup"
+
+
+# --------------------------------------------------------------------------
+# fetch_truncated surfaces in log_stats (remote tail-kept fetch only)
+# --------------------------------------------------------------------------
+
+def test_fetch_truncated_flag_surfaces_in_log_stats(tmp_hermes_home, monkeypatch):
+    monkeypatch.setattr(
+        handlers.logfetch, "fetch_with_stats",
+        lambda target, **kw: ("AssertionError: boom\n", {"fetch_truncated": True}),
+    )
+    data = json.loads(handlers.triage_pipeline_failure(
+        {"log_url_or_path": "https://logs.example/big"}, llm=None))
+    assert data["success"] is True
+    assert data["log_stats"]["fetch_truncated"] is True
+
+
+def test_local_fetch_has_no_truncated_flag(tmp_path, tmp_hermes_home):
+    """Local reads hard-fail on oversize instead of truncating; the key is
+    omitted so the envelope stays parity-identical with the legacy plugin."""
+    path = _write(tmp_path, "x.log", "AssertionError: boom\n")
+    data = json.loads(handlers.triage_pipeline_failure(
+        {"log_url_or_path": path}, llm=None))
+    assert "fetch_truncated" not in data["log_stats"]

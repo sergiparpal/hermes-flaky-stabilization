@@ -230,3 +230,149 @@ def test_fetch_dispatches_local(tmp_path):
 def test_fetch_empty_rejected():
     with pytest.raises(logfetch.LogFetchError):
         logfetch.fetch("   ")
+
+
+# --------------------------------------------------------------------------
+# Remote byte cap: tail-biased + fetch_truncated flag
+# --------------------------------------------------------------------------
+
+class _ChunkedResp:
+    """Context-manager response yielding the given chunks one read at a time."""
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def read(self, _n):
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_remote_oversize_keeps_tail_and_flags(monkeypatch):
+    """Regression: a remote log over the cap was silently HEAD-truncated —
+    dropping the failure at the end — with no truncation indication."""
+    monkeypatch.setattr(logfetch, "MAX_LOG_BYTES", 64)
+    monkeypatch.setattr(safehttp, "is_blocked_address", lambda host: False)
+    body = b"HEADMARK " + b"x" * 200 + b" TAILMARK"
+    cap = _CaptureOpener(data=body)
+    monkeypatch.setattr(safehttp, "build_opener", lambda ctx: cap)
+    text, stats = logfetch.fetch_with_stats("https://logs.example/big")
+    assert stats["fetch_truncated"] is True
+    assert text.endswith("TAILMARK")     # the failure end of the log survives
+    assert "HEADMARK" not in text
+    assert len(text.encode()) <= 64
+
+
+def test_read_capped_tail_bias_multi_chunk(monkeypatch):
+    monkeypatch.setattr(logfetch, "MAX_LOG_BYTES", 10)
+    data, truncated = logfetch._read_capped(_ChunkedResp([b"aaaa", b"bbbb", b"cccc", b"dd"]))
+    assert truncated is True
+    assert data == b"aaaabbbbccccdd"[-10:]
+
+
+def test_read_capped_under_cap_not_truncated(monkeypatch):
+    monkeypatch.setattr(logfetch, "MAX_LOG_BYTES", 64)
+    data, truncated = logfetch._read_capped(_ChunkedResp([b"small body"]))
+    assert truncated is False
+    assert data == b"small body"
+
+
+def test_fetch_with_stats_local_not_truncated(tmp_path):
+    p = tmp_path / "x.log"
+    p.write_text("ERROR boom\n", encoding="utf-8")
+    text, stats = logfetch.fetch_with_stats(str(p))
+    assert "ERROR boom" in text
+    assert stats["fetch_truncated"] is False
+
+
+# --------------------------------------------------------------------------
+# Unified-config wiring (env var > triage config section > defaults)
+# --------------------------------------------------------------------------
+
+def _write_config(cfg_dir, triage_cfg):
+    import json
+
+    (cfg_dir / "config.json").write_text(
+        json.dumps({"triage": triage_cfg}), encoding="utf-8"
+    )
+
+
+def test_log_roots_from_unified_config(tmp_path, monkeypatch, isolated_unified_config):
+    """Regression: `triage.log_roots` in config.json was dead — an operator
+    setting it believed an allowlist was active when it wasn't."""
+    monkeypatch.delenv("HERMES_CI_TRIAGE_LOG_ROOTS", raising=False)
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    inside = allowed / "build.log"
+    inside.write_text("ERROR boom\n", encoding="utf-8")
+    outside = tmp_path / "secret.log"
+    outside.write_text("ERROR boom\n", encoding="utf-8")
+    _write_config(isolated_unified_config, {"log_roots": [str(allowed)]})
+    assert "ERROR boom" in logfetch.read_local(str(inside))
+    with pytest.raises(logfetch.LogFetchError):
+        logfetch.read_local(str(outside))
+
+
+def test_log_roots_env_overrides_config(tmp_path, monkeypatch, isolated_unified_config):
+    env_root = tmp_path / "envroot"
+    env_root.mkdir()
+    cfg_root = tmp_path / "cfgroot"
+    cfg_root.mkdir()
+    in_env = env_root / "a.log"
+    in_env.write_text("ERROR boom\n", encoding="utf-8")
+    in_cfg = cfg_root / "b.log"
+    in_cfg.write_text("ERROR boom\n", encoding="utf-8")
+    _write_config(isolated_unified_config, {"log_roots": [str(cfg_root)]})
+    monkeypatch.setenv("HERMES_CI_TRIAGE_LOG_ROOTS", str(env_root))
+    assert "ERROR boom" in logfetch.read_local(str(in_env))
+    with pytest.raises(logfetch.LogFetchError):
+        logfetch.read_local(str(in_cfg))  # env wins; the config root is inactive
+
+
+def test_token_hosts_from_unified_config(monkeypatch, isolated_unified_config):
+    """Regression: `triage.token_hosts` in config.json was dead."""
+    monkeypatch.delenv("HERMES_CI_TRIAGE_TOKEN_HOSTS", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
+    monkeypatch.setattr(safehttp, "is_blocked_address", lambda host: False)
+    _write_config(isolated_unified_config, {"token_hosts": ["ghe.corp.example"]})
+    cap = _CaptureOpener()
+    monkeypatch.setattr(safehttp, "build_opener", lambda ctx: cap)
+    logfetch.fetch_remote("https://ghe.corp.example/raw/log")
+    auth = next(v for k, v in cap.request.headers.items() if k.lower() == "authorization")
+    assert auth == "Bearer secret-token"
+
+
+def test_token_hosts_env_overrides_config(monkeypatch, isolated_unified_config):
+    monkeypatch.setenv("HERMES_CI_TRIAGE_TOKEN_HOSTS", "other.example")
+    monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
+    monkeypatch.setattr(safehttp, "is_blocked_address", lambda host: False)
+    _write_config(isolated_unified_config, {"token_hosts": ["ghe.corp.example"]})
+    cap = _CaptureOpener()
+    monkeypatch.setattr(safehttp, "build_opener", lambda ctx: cap)
+    logfetch.fetch_remote("https://ghe.corp.example/raw/log")
+    # Env var set → the config list is ignored entirely.
+    assert not any(k.lower() == "authorization" for k in cap.request.headers)
+
+
+def test_allow_private_from_unified_config(monkeypatch, isolated_unified_config):
+    """Regression: `triage.allow_private` in config.json was dead."""
+    import ipaddress
+
+    monkeypatch.delenv("HERMES_CI_TRIAGE_ALLOW_PRIVATE", raising=False)
+    _write_config(isolated_unified_config, {"allow_private": True})
+    assert safehttp.ip_blocked(ipaddress.ip_address("10.0.0.5")) is False
+    # Metadata/loopback stay blocked regardless of the opt-in.
+    assert safehttp.ip_blocked(ipaddress.ip_address("127.0.0.1")) is True
+    assert safehttp.ip_blocked(ipaddress.ip_address("169.254.169.254")) is True
+
+
+def test_allow_private_env_overrides_config(monkeypatch, isolated_unified_config):
+    import ipaddress
+
+    _write_config(isolated_unified_config, {"allow_private": True})
+    monkeypatch.setenv("HERMES_CI_TRIAGE_ALLOW_PRIVATE", "0")
+    assert safehttp.ip_blocked(ipaddress.ip_address("10.0.0.5")) is True
