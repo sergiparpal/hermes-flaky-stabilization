@@ -27,6 +27,8 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
+from . import _patterns
+
 # Hard cap on the amount of text a single redaction pass will scan. Incident
 # fields are normally small; an abnormally large field (pathological or
 # hostile) could otherwise turn the regex sweep into a CPU sink on the
@@ -81,7 +83,8 @@ _NAME_STOPWORDS = frozenset({
 })
 
 
-def _re(pattern: str, flags: int = 0) -> re.Pattern[str]:
+def _compile(pattern: str, flags: int = 0) -> re.Pattern[str]:
+    # Named `_compile` (not `_re`, which read as a typo next to `import re`).
     return re.compile(pattern, flags)
 
 
@@ -91,43 +94,45 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # --- Credentials embedded in URLs (user:pass@host) -------------------
     # IGNORECASE so an uppercase scheme (HTTPS://user:pass@…) is caught too;
     # the captured scheme keeps its original case via the \1 backreference.
-    (_re(r"\b([a-z][a-z0-9+.\-]*://)[^/\s:@]+:[^/\s:@]+@", re.IGNORECASE),
+    (_compile(r"\b([a-z][a-z0-9+.\-]*://)[^/\s:@]+:[^/\s:@]+@", re.IGNORECASE),
      r"\1" + URL_CRED_TOKEN + "@"),
 
     # --- Secrets / tokens / keys ----------------------------------------
     # Atlassian API tokens (current "ATATT…" and legacy "ATCTT…" prefixes).
-    (_re(r"\bAT[A-Z]TT[A-Za-z0-9_\-=.]{8,}"), SECRET_TOKEN),
+    (_compile(r"\bAT[A-Z]TT[A-Za-z0-9_\-=.]{8,}"), SECRET_TOKEN),
     # Atlassian OAuth / connect JWT-ish and generic Bearer tokens.
-    (_re(r"\bBearer\s+[A-Za-z0-9._\-]{10,}", re.IGNORECASE), SECRET_TOKEN),
+    (_compile(r"\bBearer\s+[A-Za-z0-9._\-]{10,}", re.IGNORECASE), SECRET_TOKEN),
     # AWS access key ids.
-    (_re(r"\bAKIA[0-9A-Z]{16}\b"), SECRET_TOKEN),
+    (_compile(r"\bAKIA[0-9A-Z]{16}\b"), SECRET_TOKEN),
     # Private key blocks.
-    (_re(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), SECRET_TOKEN),
+    (_compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), SECRET_TOKEN),
     # Labelled secrets: api_key=..., token: ..., password = ...
     # The value runs to the end of the line so multi-word / space-containing
     # secrets ("password: hunter two three") are redacted whole rather than
     # leaking everything after the first space. Over-redaction here is the safe
     # direction; the label still requires an explicit ':'/'=' separator so
     # ordinary prose ("the password was rotated") is untouched.
-    (_re(r"(?i)\b(api[_-]?key|api[_-]?token|access[_-]?token|auth[_-]?token|token|secret|password|passwd|pwd|client[_-]?secret)\b\s*[:=]\s*[\"']?[^\r\n]+",
+    (_compile(r"(?i)\b(api[_-]?key|api[_-]?token|access[_-]?token|auth[_-]?token|token|secret|password|passwd|pwd|client[_-]?secret)\b\s*[:=]\s*[\"']?[^\r\n]+",
          ), lambda m: _label_replace(m, SECRET_TOKEN)),
 
     # --- Email addresses -------------------------------------------------
-    # Local class is `\w` (Unicode) + specials, length-bounded to keep the sweep
-    # linear, so internationalized local parts (josé@…, иван@…) are redacted too.
-    (_re(r"\b[\w.%+\-]{1,64}@[\w.\-]{1,255}\.[A-Za-z]{2,}\b"), EMAIL_TOKEN),
+    # Composed from the shared EMAIL_BODY (see _patterns.py for the length-bound /
+    # Unicode-local-part rationale). This path is recall-biased, so the TLD bound
+    # is {2,} and the pattern is \b-anchored — DELIBERATELY not the {2,24}, un-
+    # anchored form the detector uses (see _patterns.py); do not merge them.
+    (_compile(r"\b" + _patterns.EMAIL_BODY + r"[A-Za-z]{2,}\b"), EMAIL_TOKEN),
 
     # --- Government / financial identifiers -----------------------------
     # US SSN. Space- and dash-separated (env dumps and prose use either); the
     # separator class is [ \t\-] so the match cannot span a newline.
-    (_re(r"\b\d{3}[ \t\-]\d{2}[ \t\-]\d{4}\b"), SSN_TOKEN),
+    (_compile(r"\b\d{3}[ \t\-]\d{2}[ \t\-]\d{4}\b"), SSN_TOKEN),
     # Credit-card-like 13–16 digit groups (with optional spaces/dashes).
     # Anchored to start and end on a digit so a trailing separator (and the
     # following word) is not swallowed into the match.
-    (_re(r"\b\d(?:[ \-]?\d){12,15}\b"), CARD_TOKEN),
+    (_compile(r"\b\d(?:[ \-]?\d){12,15}\b"), CARD_TOKEN),
 
     # --- IPv4 addresses --------------------------------------------------
-    (_re(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b"), IP_TOKEN),
+    (_compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b"), IP_TOKEN),
 
     # --- IPv6 addresses --------------------------------------------------
     # Full and every `::`-compressed form. All quantifiers are bounded ({1,7}),
@@ -135,7 +140,7 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # not assert cleanly next to a leading/trailing ':') keep it from splicing a
     # match out of an adjacent hex run; a `HH:MM:SS` timestamp (3 groups, single
     # colons) and a MAC (6 groups, no `::`) do not match.
-    (_re(r"(?<![\w:.])(?:"
+    (_compile(r"(?<![\w:.])(?:"
          r"(?:[A-Fa-f0-9]{1,4}:){7}[A-Fa-f0-9]{1,4}"
          r"|(?:[A-Fa-f0-9]{1,4}:){1,7}:"
          r"|(?:[A-Fa-f0-9]{1,4}:){1,6}:[A-Fa-f0-9]{1,4}"
@@ -151,11 +156,11 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # International (+CC ...) and separated domestic forms with 7–15 digits.
     # The separator class is space/tab (not \s) so the match cannot span a
     # newline and swallow the following line of unrelated text.
-    (_re(r"(?<![\w.])\+\d[\d \t().\-]{6,}\d"), PHONE_TOKEN),
-    (_re(r"(?<![\w.])\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}\b"), PHONE_TOKEN),
+    (_compile(r"(?<![\w.])\+\d[\d \t().\-]{6,}\d"), PHONE_TOKEN),
+    (_compile(r"(?<![\w.])\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}\b"), PHONE_TOKEN),
 
     # --- Labelled personal names ----------------------------------------
-    (_re(r"(?i)\b(reporter|reported by|assignee|assigned to|owner|contact|requested by|requester|caller|created by|creator)\b\s*[:\-]?\s+([A-Z][\w'\-]+(?:\s+[A-Z][\w'\-]+){0,3})"),
+    (_compile(r"(?i)\b(reporter|reported by|assignee|assigned to|owner|contact|requested by|requester|caller|created by|creator)\b\s*[:\-]?\s+([A-Z][\w'\-]+(?:\s+[A-Z][\w'\-]+){0,3})"),
         lambda m: f"{m.group(1)}: {NAME_TOKEN}"),
 ]
 
@@ -169,13 +174,27 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
 
 # Control characters (C0/C1) other than tab/newline can hide content from a
 # human reviewer or smuggle formatting; strip them from model-facing text.
-_CONTROL_CHARS_RE = _re(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+_CONTROL_CHARS_RE = _compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 # A line that begins with a chat/role marker ("System:", "Assistant:") is a
 # classic injection trying to forge a conversation turn. Neutralise only the
 # delimiter (turn the ':' into ' -') so the text is preserved but can no longer
 # read as a role boundary.
-_ROLE_MARKER_RE = _re(r"(?im)^([ \t]*)(system|assistant|user|developer|human|ai|tool)([ \t]*):")
+_ROLE_MARKER_RE = _compile(r"(?im)^([ \t]*)(system|assistant|user|developer|human|ai|tool)([ \t]*):")
+
+
+def _coerce_str(text: Any) -> str:
+    """Coerce untrusted input to a string: ``None`` -> ``""``, else ``str(text)``.
+
+    The single source of the "None means empty, everything else is stringified"
+    rule shared by the model-facing helpers, so the four entry points can't drift
+    on how a non-string reaches the regex sweep. The empty-input early return
+    stays at each call site — two of the callers return ``""`` on empty, the
+    other two do not, so that decision is theirs to make.
+    """
+    if text is None:
+        return ""
+    return text if isinstance(text, str) else str(text)
 
 
 def neutralize_untrusted(text: Any) -> str:
@@ -186,10 +205,7 @@ def neutralize_untrusted(text: Any) -> str:
     conversation turn. Orthogonal to PII redaction (applied separately) and, like
     it, never raises — this is on the model-facing path.
     """
-    if text is None:
-        return ""
-    if not isinstance(text, str):
-        text = str(text)
+    text = _coerce_str(text)
     if not text:
         return ""
     try:
@@ -218,10 +234,7 @@ def redact_text(text: Any) -> str:
     never raises — redaction must not be a source of failures on the
     model-facing path.
     """
-    if text is None:
-        return ""
-    if not isinstance(text, str):
-        text = str(text)
+    text = _coerce_str(text)
     if not text:
         return ""
     # Bound the work: keep the redaction sweep linear even on a hostile,
@@ -354,7 +367,7 @@ def contains_pii(text: Any) -> bool:
     """True if :func:`redact_text` would change *text* (i.e. PII detected)."""
     if text is None:
         return False
-    original = text if isinstance(text, str) else str(text)
+    original = _coerce_str(text)
     return redact_text(original) != original
 
 
@@ -367,5 +380,5 @@ def neutralization_needed(text: Any) -> bool:
     """
     if text is None:
         return False
-    original = text if isinstance(text, str) else str(text)
+    original = _coerce_str(text)
     return neutralize_untrusted(original) != original

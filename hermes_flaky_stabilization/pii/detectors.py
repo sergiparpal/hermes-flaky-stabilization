@@ -22,10 +22,13 @@ exhaustive — do not treat it as "no personal data whatsoever"):
   matched: ``.`` collides with versions/IPs/decimals far more than it helps
   (see ``_PHONE_RE``). The redactor's phone pass is the wider net.
 """
+import functools
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from operator import attrgetter
+
+from . import _patterns
 
 
 @dataclass(frozen=True)
@@ -137,14 +140,11 @@ def _card_ok(raw: str) -> bool:
 
 # ── detectors ────────────────────────────────────────────────────────────────
 
-# Quantifiers are length-bounded (RFC 5321: local part <=64, domain <=255) so a
-# long run of local-part characters with no '@' cannot trigger quadratic
-# backtracking — an unbounded `[...]+@` is O(n^2) on such input and hangs the
-# scan on ordinary blobs (base64url, JWTs, tokens all sit in the local class).
-# The local class is `\w` (Unicode word chars — `str` patterns are Unicode by
-# default) plus the RFC specials, so an internationalized (EAI/IDN) local part
-# such as `josé@…` or `иван@…` is not silently treated as clean by the gate.
-_EMAIL_RE = re.compile(r"[\w.%+\-]{1,64}@[\w.\-]{1,255}\.[A-Za-z]{2,24}")
+# Composed from the shared EMAIL_BODY (see _patterns.py for the length-bound /
+# Unicode-local-part rationale) plus this module's own TLD bound. The {2,24}
+# upper bound and the absence of \b anchors are DELIBERATELY not shared with the
+# redactor's email pattern (which uses {2,} and wraps in \b) — see _patterns.py.
+_EMAIL_RE = re.compile(_patterns.EMAIL_BODY + r"[A-Za-z]{2,24}")
 _CARD_RE = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
 _IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]){11,30}\b")
 # Both the NIE prefix and the control letter accept either case; ``dni_nie_ok``
@@ -327,6 +327,11 @@ def _mask_keeping_separators(raw: str, keep: int) -> str:
     return "".join(out)
 
 
+# phone, us_ssn and us_itin all reveal the last 4 digits with separators intact.
+# One named partial so the three registry rows can't drift to different `keep`s.
+_mask_last4_with_separators = functools.partial(_mask_keeping_separators, keep=4)
+
+
 def _mask_stripping_separators(raw: str, keep: int) -> str:
     """Drop every separator, then star out all but the last *keep* digits.
 
@@ -393,12 +398,9 @@ _REGISTRY: tuple[Detector, ...] = (
     Detector("iban", find_iban, priority=1, mask=_mask_iban),
     Detector("spanish_dni_nie", find_spanish_dni_nie, priority=4,
              mask=lambda r: _mask_tail(r, keep=1)),  # reveal only the control letter
-    Detector("phone", find_phone, priority=7,
-             mask=lambda r: _mask_keeping_separators(r, keep=4)),
-    Detector("us_ssn", find_us_ssn, priority=2,
-             mask=lambda r: _mask_keeping_separators(r, keep=4)),
-    Detector("us_itin", find_us_itin, priority=3,
-             mask=lambda r: _mask_keeping_separators(r, keep=4)),
+    Detector("phone", find_phone, priority=7, mask=_mask_last4_with_separators),
+    Detector("us_ssn", find_us_ssn, priority=2, mask=_mask_last4_with_separators),
+    Detector("us_itin", find_us_itin, priority=3, mask=_mask_last4_with_separators),
     # No checksum and no fixed width, so reveal the least of any type.
     Detector("passport", find_passport, priority=5,
              mask=lambda r: _mask_tail(r, keep=2)),
@@ -466,6 +468,40 @@ def _drop_contained(matches: list[Match]) -> list[Match]:
 _span_key = attrgetter("start", "end")  # C-level; a lambda here is a hot-loop cost
 
 
+def _collides(
+    p: int,
+    starts: list[int],
+    ends: list[int],
+    claimed: bytearray,
+    total: int,
+) -> bool:
+    """True if span *p* overlaps any already-``claimed`` span.
+
+    ``_drop_contained`` has left ``starts`` and ``ends`` both non-decreasing, so
+    the spans overlapping *p* sit contiguously around it and the check only has
+    to walk outward while the neighbours still reach across — a couple of
+    comparisons unless PII is genuinely stacked. Extracted so the claim loop
+    reads as its intent (claim in confidence order, skip collisions) and the two
+    mirror-image walks cannot drift apart.
+    """
+    start, end = starts[p], ends[p]
+    # Leftward: ends are non-decreasing, so the first neighbour that stops short
+    # of *start* proves every one before it does too. A duplicate span sorts
+    # adjacent and reaches across, so it collides — as it should.
+    q = p - 1
+    while q >= 0 and ends[q] > start:
+        if claimed[q]:
+            return True
+        q -= 1
+    # Rightward: starts are non-decreasing, so the mirror argument holds.
+    q = p + 1
+    while q < total and starts[q] < end:
+        if claimed[q]:
+            return True
+        q += 1
+    return False
+
+
 def _claim_non_overlapping(matches: list[Match]) -> list[Match]:
     """Let matches claim their span in confidence order; skip any that collide.
 
@@ -506,24 +542,7 @@ def _claim_non_overlapping(matches: list[Match]) -> list[Match]:
         key=lambda p: (priorities[p], starts[p] - ends[p], starts[p]),
     )
     for p in by_confidence:
-        start, end = starts[p], ends[p]
-        collides = False
-        # Leftward: ends are non-decreasing, so the first neighbour that stops
-        # short of *start* proves every one before it does too. A duplicate span
-        # sorts adjacent and reaches across, so it collides — as it should.
-        q = p - 1
-        while q >= 0 and ends[q] > start:
-            if claimed[q]:
-                collides = True
-                break
-            q -= 1
-        # Rightward: starts are non-decreasing, so the mirror argument holds.
-        q = p + 1
-        while not collides and q < total and starts[q] < end:
-            if claimed[q]:
-                collides = True
-            q += 1
-        if not collides:
+        if not _collides(p, starts, ends, claimed, total):
             claimed[p] = 1
     return [m for p, m in enumerate(ordered) if claimed[p]]  # ordered by start
 

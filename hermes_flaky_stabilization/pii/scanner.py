@@ -9,8 +9,9 @@ import os
 import time
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from functools import cache
-from typing import Any
+from typing import Any, BinaryIO
 
 # Unified-plugin adaptation: the legacy dual-import shim is gone — the package
 # gives this module a stable import root, so the relative import is the only
@@ -80,13 +81,7 @@ def _ocr_image(path: str) -> str:
     import pytesseract
     from PIL import Image
 
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        fh = os.fdopen(fd, "rb")
-    except BaseException:
-        os.close(fd)  # fdopen didn't adopt the fd; close the raw one
-        raise
-    with fh, Image.open(fh) as img:
+    with _open_nofollow(path) as fh, Image.open(fh) as img:
         width, height = img.size
         if width * height > MAX_IMAGE_PIXELS:
             raise ValueError(f"image exceeds the {MAX_IMAGE_PIXELS}-pixel cap")
@@ -100,6 +95,23 @@ def _is_image(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in IMAGE_EXTENSIONS
 
 
+def _open_nofollow(path: str) -> BinaryIO:
+    """Open *path* for reading, refusing to follow a final-component symlink.
+
+    ``O_NOFOLLOW`` closes the TOCTOU window: a symlink swapped in after the
+    escape check is rejected at open time rather than followed out of the scan
+    root. Raises ``OSError`` on failure (the symlink case included). Shared by
+    the OCR reader and the byte reader so the raw-fd cleanup — closing the fd
+    that ``fdopen`` did not adopt — has one correct implementation.
+    """
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)  # fdopen didn't adopt the fd; close the raw one
+        raise
+
+
 def _read_capped(path: str) -> tuple[bytes | None, bool]:
     """Read up to the byte cap. Returns (data, truncated); (None, False) if unreadable.
 
@@ -107,13 +119,8 @@ def _read_capped(path: str) -> tuple[bytes | None, bool]:
     (TOCTOU) is refused at open time rather than followed out of the scan root.
     """
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fh = _open_nofollow(path)
     except OSError:
-        return None, False
-    try:
-        fh = os.fdopen(fd, "rb")
-    except OSError:
-        os.close(fd)  # fdopen didn't adopt the fd; close the raw one
         return None, False
     try:
         with fh:
@@ -332,17 +339,11 @@ def _target_error(target: str, real_target: str) -> dict[str, Any] | None:
     return None
 
 
-def _validate_params(
-    target: Any,
-    types: Any,
-    max_files: Any,
-) -> dict[str, Any] | None:
-    """Return a structured error, or None if every param is acceptable.
+# How many unknown detector names to echo before collapsing the rest to a count.
+_MAX_UNKNOWN_TYPES_SHOWN = 3
 
-    Runs before any filesystem access — all three params are untrusted.
-    """
-    valid = list(detectors.DETECTOR_NAMES)
 
+def _validate_target(target: Any) -> dict[str, Any] | None:
     if not isinstance(target, str) or not target.strip():
         return _error(
             "target must be a non-empty string path.",
@@ -354,47 +355,152 @@ def _validate_params(
             f"target is longer than {MAX_TARGET_LEN} characters.",
             "Pass 'target' as a path to a file or directory.",
         )
-
-    if types is not None:
-        if not isinstance(types, list) or not all(isinstance(t, str) for t in types):
-            return _error("types must be a list of detector-name strings.", _TYPES_REMEDIATION)
-        if not types:
-            # An explicit empty list is ambiguous (scan nothing? scan all?) and a
-            # fail-open hazard for a gate — reject it rather than guess.
-            return _error("types must contain at least one detector name.", _TYPES_REMEDIATION)
-        if len(types) > MAX_TYPES or any(len(t) > MAX_TYPE_NAME_LEN for t in types):
-            return _error(
-                f"types must hold at most {MAX_TYPES} names of at most "
-                f"{MAX_TYPE_NAME_LEN} characters.",
-                _TYPES_REMEDIATION,
-            )
-        unknown = [t for t in types if t not in detectors.DETECTOR_NAMES]
-        if unknown:
-            # `types` is untrusted, so it is masked and bounded exactly like
-            # `target`: an unknown "detector name" may be anything at all, and it
-            # reaches both the result dict and the handler's log line.
-            shown = ", ".join(_safe_error_field(t) for t in unknown[:3])
-            if len(unknown) > 3:
-                shown += f", … ({len(unknown) - 3} more)"
-            return _error(
-                f"unknown detector types: {shown}",
-                f"Valid detectors: {valid}.",
-            )
-
-    if max_files is not None:
-        if not isinstance(max_files, int) or isinstance(max_files, bool) or max_files <= 0:
-            return _error(
-                "max_files must be a positive integer.",
-                "Omit 'max_files' or pass a positive integer file cap.",
-            )
-        if max_files > MAX_MAX_FILES:
-            # A bound the caller can raise is not a bound; the caller is a model.
-            return _error(
-                f"max_files must be at most {MAX_MAX_FILES}.",
-                f"Omit 'max_files' (default {DEFAULT_MAX_FILES}) or pass a smaller cap.",
-            )
-
     return None
+
+
+def _validate_types(types: Any) -> dict[str, Any] | None:
+    if types is None:
+        return None
+    if not isinstance(types, list) or not all(isinstance(t, str) for t in types):
+        return _error("types must be a list of detector-name strings.", _TYPES_REMEDIATION)
+    if not types:
+        # An explicit empty list is ambiguous (scan nothing? scan all?) and a
+        # fail-open hazard for a gate — reject it rather than guess.
+        return _error("types must contain at least one detector name.", _TYPES_REMEDIATION)
+    if len(types) > MAX_TYPES or any(len(t) > MAX_TYPE_NAME_LEN for t in types):
+        return _error(
+            f"types must hold at most {MAX_TYPES} names of at most "
+            f"{MAX_TYPE_NAME_LEN} characters.",
+            _TYPES_REMEDIATION,
+        )
+    unknown = [t for t in types if t not in detectors.DETECTOR_NAMES]
+    if unknown:
+        # `types` is untrusted, so it is masked and bounded exactly like
+        # `target`: an unknown "detector name" may be anything at all, and it
+        # reaches both the result dict and the handler's log line.
+        shown = ", ".join(_safe_error_field(t) for t in unknown[:_MAX_UNKNOWN_TYPES_SHOWN])
+        if len(unknown) > _MAX_UNKNOWN_TYPES_SHOWN:
+            shown += f", … ({len(unknown) - _MAX_UNKNOWN_TYPES_SHOWN} more)"
+        return _error(
+            f"unknown detector types: {shown}",
+            f"Valid detectors: {list(detectors.DETECTOR_NAMES)}.",
+        )
+    return None
+
+
+def _validate_max_files(max_files: Any) -> dict[str, Any] | None:
+    if max_files is None:
+        return None
+    if not isinstance(max_files, int) or isinstance(max_files, bool) or max_files <= 0:
+        return _error(
+            "max_files must be a positive integer.",
+            "Omit 'max_files' or pass a positive integer file cap.",
+        )
+    if max_files > MAX_MAX_FILES:
+        # A bound the caller can raise is not a bound; the caller is a model.
+        return _error(
+            f"max_files must be at most {MAX_MAX_FILES}.",
+            f"Omit 'max_files' (default {DEFAULT_MAX_FILES}) or pass a smaller cap.",
+        )
+    return None
+
+
+def _validate_params(
+    target: Any,
+    types: Any,
+    max_files: Any,
+) -> dict[str, Any] | None:
+    """Return a structured error, or None if every param is acceptable.
+
+    Runs before any filesystem access — all three params are untrusted. Split
+    into one validator per param so each is independently testable; the first
+    rejection wins, in the original order (target, then types, then max_files).
+    """
+    return (
+        _validate_target(target)
+        or _validate_types(types)
+        or _validate_max_files(max_files)
+    )
+
+
+# ── per-file scan ─────────────────────────────────────────────────────────────
+
+@dataclass
+class _FileScan:
+    """The outcome of scanning one file — the loop's per-iteration state made
+    explicit instead of mutated through closure flags.
+
+    Exactly one of ``rows``/``skip`` carries content: a scanned file yields
+    ``rows`` (and ``scanned=True``); a skipped or failed file yields a ``skip``
+    entry. ``bytes_truncated`` and ``findings_capped`` feed the run-level
+    ``truncated`` verdict.
+    """
+
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    skip: dict[str, Any] | None = None
+    bytes_truncated: bool = False
+    findings_capped: bool = False
+    scanned: bool = False
+
+
+def _scan_one_file(
+    full_path: str,
+    index: int,
+    real_target: str,
+    is_file_target: bool,
+    types: list[str] | None,
+    ocr_ready: Callable[[], bool],
+    findings_budget: int,
+) -> _FileScan:
+    """Scan a single file. NEVER raises.
+
+    One hostile or pathological file must not sink the gate: a raise here would
+    otherwise discard the findings of every earlier file and leave the caller a
+    bare "scan failed". A failure degrades to a ``scan_failed`` skip, which keeps
+    the earlier findings and — because it leaves ``skipped`` non-empty — still
+    forces ``complete: false``, so a caller gating on ``clean and complete``
+    refuses to attach the evidence. The exception is deliberately not logged:
+    its message could quote the raw bytes that caused it.
+    """
+    # A PII-free stand-in, used if masking the path is itself what fails: at
+    # that point no part of the name is known safe to put in the result.
+    display = f"<file #{index}>"
+    # Kept outside the assignment below so a later raise (in the detectors) still
+    # reports it: a hit byte cap is known before the detectors run and holds
+    # whether or not this file then fails ("some bytes in scope were never scanned").
+    file_truncated = False
+    try:
+        display = _safe_display_path(full_path, real_target, is_file_target)
+
+        # Symlink-escape guard (directory walk only; an explicitly targeted file
+        # was chosen by the caller). Resolve once and open the *resolved* target
+        # rather than the walk path, so a symlink swapped in after this check
+        # can't be followed out of the scan root.
+        if is_file_target:
+            safe_path = full_path
+        else:
+            safe_path = _resolve_within(full_path, real_target)
+            if safe_path is None:
+                return _FileScan(skip={"file": display, "reason": "symlink_escape"})
+
+        # Only read regular files. Opening a FIFO/socket/device (or a broken
+        # symlink) for reading could block the scan indefinitely.
+        if not os.path.isfile(safe_path):
+            return _FileScan(skip={"file": display, "reason": "not_regular_file"})
+
+        text, skip_reason, file_truncated = _extract_text(safe_path, ocr_ready)
+        if skip_reason is not None:
+            # _extract_text reports truncated=False on every skip path, so no
+            # bytes were dropped here.
+            return _FileScan(skip={"file": display, "reason": skip_reason})
+
+        rows, findings_capped = _findings_for_file(text, types, display, findings_budget)
+    except Exception:
+        return _FileScan(skip={"file": display, "reason": "scan_failed"},
+                         bytes_truncated=file_truncated)
+
+    return _FileScan(rows=rows, bytes_truncated=file_truncated,
+                     findings_capped=findings_capped, scanned=True)
 
 
 # ── public entry point ───────────────────────────────────────────────────────
@@ -441,63 +547,25 @@ def scan(
     timed_out = False
     deadline = time.monotonic() + MAX_SCAN_SECONDS
 
-    for index, full in enumerate(files):
+    for index, full_path in enumerate(files):
         # Nothing else bounds the loop's wall clock: `max_files` x
         # `MAX_BYTES_PER_FILE` is 20 GB of text through 8 detectors, and only the
         # OCR call has a timeout of its own.
         if time.monotonic() > deadline:
             timed_out = True
             break
-        # A PII-free stand-in, used if masking the path is itself what fails: at
-        # that point no part of the name is known safe to put in the result.
-        display = f"<file #{index}>"
-        try:
-            display = _safe_display_path(full, real_target, is_file_target)
-
-            # Symlink-escape guard (directory walk only; an explicitly targeted
-            # file was chosen by the caller). Resolve once and open the *resolved*
-            # target rather than the walk path, so a symlink swapped in after this
-            # check can't be followed out of the scan root.
-            if is_file_target:
-                safe_path = full
-            else:
-                safe_path = _resolve_within(full, real_target)
-                if safe_path is None:
-                    skipped.append({"file": display, "reason": "symlink_escape"})
-                    continue
-
-            # Only read regular files. Opening a FIFO/socket/device (or a broken
-            # symlink) for reading could block the scan indefinitely.
-            if not os.path.isfile(safe_path):
-                skipped.append({"file": display, "reason": "not_regular_file"})
-                continue
-
-            text, skip_reason, file_truncated = _extract_text(safe_path, ocr_ready)
-            if skip_reason is not None:
-                skipped.append({"file": display, "reason": skip_reason})
-                continue
-            # Recorded as soon as it is known, not after the detectors run: a cap
-            # was hit whether or not the scan of this file goes on to fail, and
-            # `truncated` means exactly "some bytes in scope were never scanned".
-            bytes_truncated = bytes_truncated or file_truncated
-
-            rows, findings_capped = _findings_for_file(
-                text, types, display, MAX_FINDINGS - len(findings)
-            )
-        except Exception:
-            # One hostile or pathological file must not sink the gate: without
-            # this, a raise on file N discards the findings of files 1..N-1 and
-            # the caller sees a bare "scan failed". Degrading to a skip keeps
-            # those findings and, because `skipped` is non-empty, forces
-            # `complete: false` — so a caller gating on `clean and complete`
-            # still refuses to attach the evidence. The exception is deliberately
-            # not logged: its message could quote the raw bytes that caused it.
-            skipped.append({"file": display, "reason": "scan_failed"})
+        outcome = _scan_one_file(
+            full_path, index, real_target, is_file_target,
+            types, ocr_ready, MAX_FINDINGS - len(findings),
+        )
+        bytes_truncated = bytes_truncated or outcome.bytes_truncated
+        if outcome.skip is not None:
+            skipped.append(outcome.skip)
             continue
-
         scanned += 1
-        findings.extend(rows)
-        if findings_capped:
+        findings.extend(outcome.rows)
+        if outcome.findings_capped:
+            findings_capped = True
             break
 
     truncated = files_truncated or bytes_truncated or findings_capped or timed_out
