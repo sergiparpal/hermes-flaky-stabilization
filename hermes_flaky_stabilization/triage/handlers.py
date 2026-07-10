@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 
 # How many tail lines to classify when the log carries no clear failure signal.
 _NO_SIGNAL_TAIL_LINES = 60
+# Decimal places the confidence is rounded to in the response envelope. Fixed to
+# keep the emitted JSON parity-identical with the legacy plugin's precision.
+_CONFIDENCE_DECIMALS = 3
 # Unified-plugin adaptation (plan D4/Appendix C): patterns live in the
 # consolidated state.db (tables triage_patterns/_fts), not the legacy
 # cache/ci_triage_patterns.db.
@@ -99,17 +102,13 @@ def _tail_excerpt(raw: str, n_lines: int = _NO_SIGNAL_TAIL_LINES) -> str:
     redaction, every signature regex, and into the LLM call. Cap by
     :data:`prefilter.DEFAULT_CHAR_CAP`, keeping the TAIL (errors cluster at
     the end), with the standard truncation note.
+
+    The char-cap-and-note step is :func:`prefilter.tail_with_note` — the same
+    rule prefilter applies to its own excerpt, shared so the two cannot drift.
     """
     lines = prefilter.strip_ansi(raw).split("\n")
     excerpt = "\n".join(lines[-n_lines:])
-    if len(excerpt) > prefilter.DEFAULT_CHAR_CAP:
-        excerpt = excerpt[-prefilter.DEFAULT_CHAR_CAP:]
-        # Snap to a clean line boundary when one exists (same rule as prefilter).
-        first_nl = excerpt.find("\n")
-        if 0 <= first_nl < len(excerpt) - 1:
-            excerpt = excerpt[first_nl + 1:]
-        excerpt = prefilter.TRUNCATION_NOTE + "\n" + excerpt
-    return excerpt
+    return prefilter.tail_with_note(excerpt, prefilter.DEFAULT_CHAR_CAP)
 
 
 def _open_and_lookup(
@@ -134,6 +133,59 @@ def _open_and_lookup(
             except Exception:
                 pass
         return None, None
+
+
+def _build_payload(
+    result: dict[str, Any],
+    *,
+    prior: dict[str, Any] | None,
+    prior_occurrences: int,
+    project: str,
+    signature: str | None,
+    stats: dict[str, object],
+    low_signal: bool,
+    fetch_stats: dict[str, object],
+    enrichment_data: Any | None,
+    incident_context: Any | None,
+) -> dict[str, Any]:
+    """Assemble the success-envelope payload from the pipeline's outputs.
+
+    Extracted from the orchestrator's tail so the exact key set, insertion
+    order (which fixes the emitted JSON order), and conditional-inclusion rules
+    live in one place. Keeping it here — rather than inline in the sequential
+    orchestrator — stops the parity-with-the-legacy-plugin envelope from
+    drifting when the orchestrator flow is edited.
+    """
+    payload: dict[str, Any] = {
+        "category": result["category"],
+        "confidence": round(float(result.get("confidence", 0.0)), _CONFIDENCE_DECIMALS),
+        "summary": result.get("summary", ""),
+        "evidence": result.get("evidence", []),
+        "suggested_action": result.get("suggested_action", ""),
+        "classification_method": result.get("method", "llm"),
+        "prior_seen": prior is not None,
+        "prior_occurrences": prior_occurrences,
+        "project": project,
+        "signature": signature or "",
+        "log_stats": {
+            "original_bytes": stats.get("original_bytes", 0),
+            "hit_count": stats.get("hit_count", 0),
+            "truncated": stats.get("truncated", False),
+            "low_signal": low_signal,
+        },
+    }
+    # Only present when a remote body exceeded the fetch cap and the tail was
+    # kept (key omitted otherwise — the envelope stays parity-identical with
+    # the legacy plugin for untruncated fetches).
+    if fetch_stats.get("fetch_truncated"):
+        payload["log_stats"]["fetch_truncated"] = True
+    if prior is not None and prior.get("fuzzy"):
+        payload["prior_match"] = "fuzzy"
+    if enrichment_data is not None:
+        payload["enrichment"] = enrichment_data
+    if incident_context is not None:
+        payload["incident_context"] = incident_context
+    return payload
 
 
 # --------------------------------------------------------------------------
@@ -240,33 +292,15 @@ def triage_pipeline_failure(
             store.close()
 
     # --- respond ---------------------------------------------------------
-    payload: dict[str, Any] = {
-        "category": result["category"],
-        "confidence": round(float(result.get("confidence", 0.0)), 3),
-        "summary": result.get("summary", ""),
-        "evidence": result.get("evidence", []),
-        "suggested_action": result.get("suggested_action", ""),
-        "classification_method": result.get("method", "llm"),
-        "prior_seen": prior is not None,
-        "prior_occurrences": prior_occurrences,
-        "project": project,
-        "signature": signature or "",
-        "log_stats": {
-            "original_bytes": stats.get("original_bytes", 0),
-            "hit_count": stats.get("hit_count", 0),
-            "truncated": stats.get("truncated", False),
-            "low_signal": low_signal,
-        },
-    }
-    # Only present when a remote body exceeded the fetch cap and the tail was
-    # kept (key omitted otherwise — the envelope stays parity-identical with
-    # the legacy plugin for untruncated fetches).
-    if fetch_stats.get("fetch_truncated"):
-        payload["log_stats"]["fetch_truncated"] = True
-    if prior is not None and prior.get("fuzzy"):
-        payload["prior_match"] = "fuzzy"
-    if enrichment_data is not None:
-        payload["enrichment"] = enrichment_data
-    if incident_context is not None:
-        payload["incident_context"] = incident_context
-    return _ok(payload)
+    return _ok(_build_payload(
+        result,
+        prior=prior,
+        prior_occurrences=prior_occurrences,
+        project=project,
+        signature=signature,
+        stats=stats,
+        low_signal=low_signal,
+        fetch_stats=fetch_stats,
+        enrichment_data=enrichment_data,
+        incident_context=incident_context,
+    ))

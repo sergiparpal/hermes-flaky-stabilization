@@ -86,7 +86,7 @@ def heuristic_classify(excerpt: str) -> dict[str, Any]:
     for category, pattern in _HEURISTIC_RULES:
         match = pattern.search(text)
         if match:
-            line = _line_for(text, match.start())
+            line = _line_containing(text, match.start())
             return {
                 "category": category,
                 "confidence": _HEURISTIC_CONFIDENCE,
@@ -108,7 +108,7 @@ def heuristic_classify(excerpt: str) -> dict[str, Any]:
     }
 
 
-def _line_for(text: str, pos: int) -> str:
+def _line_containing(text: str, pos: int) -> str:
     start = text.rfind("\n", 0, pos) + 1
     end = text.find("\n", pos)
     if end == -1:

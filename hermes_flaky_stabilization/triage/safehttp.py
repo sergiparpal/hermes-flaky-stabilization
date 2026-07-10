@@ -80,6 +80,9 @@ def _allow_private() -> bool:
     ``triage.allow_private``, then False. Fail-closed: any problem reading the
     config keeps private ranges blocked.
     """
+    # Same env-then-unified-config shape as logfetch._env_or_config_list, but as
+    # the lower layer this module must not import logfetch — so the idiom is
+    # deliberately not shared (dependency direction forbids reuse).
     raw = os.environ.get(_ALLOW_PRIVATE_ENV, "").strip()
     if raw:
         return raw.lower() in ("1", "true", "yes", "on")

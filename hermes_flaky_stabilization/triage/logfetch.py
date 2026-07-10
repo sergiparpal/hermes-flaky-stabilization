@@ -80,6 +80,31 @@ def _config_triage() -> dict:
         return {}
 
 
+def _env_or_config_list(env_var: str, config_key: str, sep: str) -> list[str]:
+    """A list-valued setting from an env var, falling back to the unified config.
+
+    The shape shared by :func:`_token_hosts` and :func:`_log_roots`: the
+    ``HERMES_CI_TRIAGE_*`` *env var* wins (highest precedence, split on *sep*);
+    only when it is unset/blank is ``triage.<config_key>`` consulted, accepting
+    either a *sep*-separated string or an already-split list. Returns the raw
+    items in order — per-item stripping, casing, filtering and path resolution
+    stay with each caller, which is exactly where the two legitimately differ,
+    so extracting only this common core cannot make them drift.
+
+    (``safehttp._allow_private`` is the bool cousin of this idiom but lives one
+    layer down and must not import ``logfetch``, so it cannot share this.)
+    """
+    raw = os.environ.get(env_var, "")
+    if raw.strip():
+        return raw.split(sep)
+    cfg_val = _config_triage().get(config_key)
+    if isinstance(cfg_val, str):
+        return cfg_val.split(sep)
+    if isinstance(cfg_val, list):
+        return [str(v) for v in cfg_val]
+    return []
+
+
 def _safe_path(path: str) -> str:
     """Basename only — don't echo the full local path back to the caller."""
     try:
@@ -123,18 +148,7 @@ _DEFAULT_TOKEN_HOSTS = ("api.github.com", "raw.githubusercontent.com")
 
 def _token_hosts() -> set:
     hosts = set(_DEFAULT_TOKEN_HOSTS)
-    raw = os.environ.get("HERMES_CI_TRIAGE_TOKEN_HOSTS", "")
-    if raw.strip():
-        extra = raw.split(",")
-    else:
-        cfg_val = _config_triage().get("token_hosts")
-        if isinstance(cfg_val, str):
-            extra = cfg_val.split(",")
-        elif isinstance(cfg_val, list):
-            extra = [str(h) for h in cfg_val]
-        else:
-            extra = []
-    for h in extra:
+    for h in _env_or_config_list("HERMES_CI_TRIAGE_TOKEN_HOSTS", "token_hosts", ","):
         h = h.strip().lower()
         if h:
             hosts.add(h)
@@ -194,19 +208,8 @@ def _log_roots() -> list:
     config's ``triage.log_roots`` (a list, or an ``os.pathsep``-separated
     string), then no restriction.
     """
-    raw = os.environ.get(_LOG_ROOTS_ENV, "")
-    if raw.strip():
-        parts = raw.split(os.pathsep)
-    else:
-        cfg_val = _config_triage().get("log_roots")
-        if isinstance(cfg_val, str):
-            parts = cfg_val.split(os.pathsep)
-        elif isinstance(cfg_val, list):
-            parts = [str(p) for p in cfg_val]
-        else:
-            parts = []
     roots = []
-    for part in parts:
+    for part in _env_or_config_list(_LOG_ROOTS_ENV, "log_roots", os.pathsep):
         part = part.strip()
         if part:
             roots.append(os.path.realpath(os.path.expanduser(part)))

@@ -166,6 +166,28 @@ def _collapse_runs(block: list[str]) -> list[str]:
 # Public API
 # --------------------------------------------------------------------------
 
+def tail_with_note(text: str, char_cap: int) -> str:
+    """Tail-truncate *text* to *char_cap*, snapping to a clean line boundary.
+
+    Three steps, applied only when *text* overflows the cap: keep the LAST
+    ``char_cap`` characters (the failure clusters at the end of a CI log, so the
+    tail is what matters), drop the now-partial leading line so the excerpt
+    begins on a clean boundary, then prepend :data:`TRUNCATION_NOTE`. Text
+    within the cap is returned unchanged (no note).
+
+    Shared by :func:`prefilter` (its char-cap stage) and
+    ``handlers._tail_excerpt`` (the low-signal fallback), which each previously
+    inlined this identical rule — extracting it keeps the two from drifting.
+    """
+    if len(text) > char_cap:
+        text = text[-char_cap:]
+        first_nl = text.find("\n")
+        if 0 <= first_nl < len(text) - 1:
+            text = text[first_nl + 1:]
+        text = TRUNCATION_NOTE + "\n" + text
+    return text
+
+
 def prefilter(
     raw_text: str,
     *,
@@ -209,26 +231,22 @@ def prefilter(
         parts.extend(_collapse_runs(lines[start:end]))
         prev_end = end
 
-    truncated = False
-
     # Line cap — keep the tail (failures cluster at the end).
-    if len(parts) > line_cap:
+    line_truncated = len(parts) > line_cap
+    if line_truncated:
         parts = parts[-line_cap:]
-        truncated = True
 
     excerpt = "\n".join(parts)
 
-    # Char cap — keep the tail, then snap to a clean line boundary.
-    if len(excerpt) > char_cap:
-        excerpt = excerpt[-char_cap:]
-        first_nl = excerpt.find("\n")
-        if 0 <= first_nl < len(excerpt) - 1:
-            excerpt = excerpt[first_nl + 1:]
-        truncated = True
-
-    if truncated:
+    # Char cap — keep the tail, snap to a clean line boundary, prepend the note
+    # (see :func:`tail_with_note`). It adds the note only when the char cap
+    # binds, so a line-cap-only truncation still needs the note added below.
+    char_truncated = len(excerpt) > char_cap
+    excerpt = tail_with_note(excerpt, char_cap)
+    if line_truncated and not char_truncated:
         excerpt = TRUNCATION_NOTE + "\n" + excerpt
 
+    truncated = line_truncated or char_truncated
     stats["truncated"] = truncated
     stats["excerpt_lines"] = excerpt.count("\n") + 1 if excerpt else 0
     stats["excerpt_chars"] = len(excerpt)
