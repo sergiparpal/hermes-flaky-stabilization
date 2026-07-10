@@ -701,31 +701,6 @@ class Pipeline:
 # ---------------------------------------------------------------------------
 
 
-def _record_run_state_db(row: dict[str, Any]) -> None:
-    from contextlib import closing
-    from datetime import UTC, datetime
-
-    from ..storage import state
-
-    with closing(state.connect()) as conn, conn:
-        conn.execute(
-            "INSERT INTO pipeline_runs (ts, trigger, test_id, project, triage_category,"
-            " branch, outcome, stage_results_json, duration_s)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
-            (
-                datetime.now(UTC).isoformat(timespec="seconds"),
-                row.get("trigger", "tool"),
-                row.get("test_id"),
-                row.get("project"),
-                row.get("triage_category"),
-                row.get("branch"),
-                row.get("outcome", ""),
-                row.get("stage_results_json", "{}"),
-                row.get("duration_s"),
-            ),
-        )
-
-
 def build_pipeline(ctx, incidents_service) -> Pipeline:
     """Bind the real stage implementations (direct in-package calls — the only
     dispatch_tool use stays inside the healer's git/PR flow, plan D3/D6.2)."""
@@ -737,6 +712,7 @@ def build_pipeline(ctx, incidents_service) -> Pipeline:
     from ..healer import handlers as healer_handlers
     from ..incidents import write as incidents_write
     from ..pii import gate as gate_mod
+    from ..storage import pipeline_runs
 
     cfg = unified_config.load_config()
 
@@ -770,7 +746,7 @@ def build_pipeline(ctx, incidents_service) -> Pipeline:
             incident_search=incident_search,
         ),
         config=cfg,
-        record_run=_record_run_state_db,
+        record_run=pipeline_runs.record_run,
     )
 
 

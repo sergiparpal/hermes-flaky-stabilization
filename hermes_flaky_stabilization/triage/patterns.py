@@ -30,133 +30,27 @@ with any DB path the caller supplies.
 
 from __future__ import annotations
 
-import hashlib
-import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 from ..storage import state
+from .signatures import (
+    FUZZY_CANDIDATES,
+    fts5_available,
+    fuzzy_tokens,
+    sample_tokens,
+)
+from .signatures import (
+    compute_signature as compute_signature,  # re-exported: patterns.compute_signature
+)
 
 DEFAULT_RETENTION_DAYS = 180
 DEFAULT_MAX_ROWS_PER_PROJECT = 500
 _SAMPLE_CHARS = 4000   # bounded excerpt stored per pattern for fuzzy lookup
 
-# --------------------------------------------------------------------------
-# Signature normalisation
-# --------------------------------------------------------------------------
-
-# ORDER MATTERS: rules run top-to-bottom, so specific patterns must precede
-# general ones (timestamps before clock times; long hex blobs before the
-# bare-integer catch-all). Reordering can let a greedy rule mask a precise one.
-_NORMALISERS = [
-    # ISO-8601-ish timestamps: 2026-05-31T17:04:01.123Z / 2026-05-31 17:04:01
-    (re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?"), "<TS>"),
-    # clock times: 17:04:01 / 17:04:01.123
-    (re.compile(r"\b\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\b"), "<TS>"),
-    # UUIDs
-    (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "<UUID>"),
-    # hex addresses: 0xdeadbeef
-    (re.compile(r"\b0x[0-9a-fA-F]+\b"), "<ADDR>"),
-    # long hex blobs (git sha, content hashes) — 7+ hex chars
-    (re.compile(r"\b[0-9a-fA-F]{7,}\b"), "<HEX>"),
-    # temp paths
-    (re.compile(r"(?:/tmp|/var/folders|/var/tmp|/private/var/folders)/[^\s:'\"]+"), "<TMP>"),
-    # explicit line/offset markers: 'line 1234', 'offset 42', ':123:45'
-    (re.compile(r"\b(?:line|offset|byte)\s+\d+\b", re.IGNORECASE), r"<POS>"),
-    (re.compile(r":\d+:\d+\b"), ":<POS>"),
-    (re.compile(r":\d+\b"), ":<POS>"),
-    # any remaining bare integer run
-    (re.compile(r"\b\d+\b"), "<N>"),
-]
-
-
-def normalize_signature_text(text: str) -> str:
-    """Normalise volatile tokens so equivalent failures share a signature."""
-    out = text or ""
-    for pattern, repl in _NORMALISERS:
-        out = pattern.sub(repl, out)
-    # collapse whitespace so reflowed/indented variants converge
-    out = re.sub(r"[ \t]+", " ", out)
-    out = re.sub(r"\n{2,}", "\n", out)
-    return out.strip()
-
-
-def compute_signature(excerpt: str) -> str | None:
-    """Return a stable SHA-1 hex signature for a (pre-filtered) excerpt.
-
-    Returns ``None`` for a *degenerate* excerpt — one whose volatile tokens
-    normalise away to nothing (blank/whitespace-only, or pure timestamps/IDs).
-    Such an excerpt hashes to the empty-string signature, which would collide
-    across every such log, so it must not be stored or looked up. Returning
-    ``None`` keeps that rule inside the store instead of forcing the caller to
-    re-derive it by testing the normalised text for emptiness.
-    """
-    normalised = normalize_signature_text(excerpt)
-    if not normalised:
-        return None
-    # Non-cryptographic content fingerprint (dedup key), hence usedforsecurity=False.
-    return hashlib.sha1(
-        normalised.encode("utf-8", "replace"), usedforsecurity=False
-    ).hexdigest()
-
 
 def _iso_now(now: datetime | None = None) -> str:
     return (now or datetime.now(UTC)).isoformat()
-
-
-def fts5_available() -> bool:
-    """Probe whether the bundled sqlite3 supports FTS5 (no side effects)."""
-    try:
-        conn = sqlite3.connect(":memory:")
-    except sqlite3.Error:
-        return False
-    try:
-        conn.execute("CREATE VIRTUAL TABLE _fts5_probe USING fts5(c)")
-        return True
-    except sqlite3.Error:
-        return False
-    finally:
-        conn.close()
-
-
-_FTS_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,}")
-
-# Ubiquitous failure vocabulary — present in virtually every CI log, so a fuzzy
-# match on one of these alone is meaningless (it would surface the project's
-# most-seen pattern as a "similar" prior for any unrelated failure). Excluded
-# from the fuzzy query and from the overlap count.
-_FUZZY_STOPWORDS = frozenset({
-    "error", "errors", "errored",
-    "fail", "fails", "failed", "failing", "failure", "failures",
-    "exception", "exceptions",
-})
-
-# How many fuzzy candidates to inspect for genuine token overlap.
-_FUZZY_CANDIDATES = 10
-
-
-def _fuzzy_tokens(excerpt: str, limit: int = 12) -> list[str]:
-    """Pick salient alphanumeric tokens from an excerpt for an FTS query.
-
-    Stopwords (ubiquitous failure vocabulary) are excluded: they carry no
-    similarity signal and would let any log fuzzy-match any pattern.
-    """
-    seen: dict[str, None] = {}
-    for tok in _FTS_TOKEN_RE.findall(normalize_signature_text(excerpt)):
-        low = tok.lower()
-        if low in _FUZZY_STOPWORDS:
-            continue
-        if low not in seen:
-            seen[low] = None
-        if len(seen) >= limit:
-            break
-    return list(seen)
-
-
-def _sample_tokens(sample: str) -> set[str]:
-    """The stored sample's token set, derived the same way as the query tokens."""
-    return {t.lower() for t in _FTS_TOKEN_RE.findall(normalize_signature_text(sample or ""))}
 
 
 class PatternStore:
@@ -178,20 +72,18 @@ class PatternStore:
         self.db_path = str(db_path)
         self.retention_days = retention_days
         self.max_rows_per_project = max_rows_per_project
-        if self.db_path != ":memory:":
-            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path)
-        self.conn.row_factory = sqlite3.Row
+        # The shared private-WAL recipe owns precreate-0600 + connect + WAL (this
+        # store used to open a plain, unhardened connection of its own).
+        from ..storage.db import open_private
+
+        self.conn = open_private(self.db_path)
         self.fts = fts5_available() if fts is None else bool(fts)
         self._init_schema()
 
     # -- schema ------------------------------------------------------------
 
     def _init_schema(self) -> None:
-        try:
-            self.conn.execute("PRAGMA journal_mode=WAL")
-        except sqlite3.Error:
-            pass
+        # WAL is applied by the shared connection recipe (open_private).
         # Base tables (``triage_patterns`` + index + the FTS mirror) and the
         # migration ladder are owned by the shared state layer; the DDL used to
         # be duplicated here, so a future ``state`` migration never reached a DB
@@ -246,7 +138,7 @@ class PatternStore:
     def _fuzzy_lookup(
         self, project: str, excerpt: str
     ) -> dict[str, object] | None:
-        tokens = _fuzzy_tokens(excerpt)
+        tokens = fuzzy_tokens(excerpt)
         if not tokens:
             return None
         # A "similar" prior must share real signal with the excerpt: at least
@@ -262,11 +154,11 @@ class PatternStore:
                     "JOIN triage_patterns p ON p.project=f.project AND p.signature=f.signature "
                     "WHERE f.project=? AND triage_patterns_fts MATCH ? "
                     "ORDER BY bm25(triage_patterns_fts) LIMIT ?",
-                    (project, match, _FUZZY_CANDIDATES),
+                    (project, match, FUZZY_CANDIDATES),
                 ).fetchall()
             else:
                 clauses = " OR ".join("sample LIKE ?" for _ in tokens)
-                params = [project] + [f"%{t}%" for t in tokens] + [_FUZZY_CANDIDATES]
+                params = [project] + [f"%{t}%" for t in tokens] + [FUZZY_CANDIDATES]
                 rows = self.conn.execute(
                     f"SELECT * FROM triage_patterns WHERE project=? AND ({clauses}) "
                     "ORDER BY occurrences DESC LIMIT ?",
@@ -278,7 +170,7 @@ class PatternStore:
             # Candidates arrive best-relevance-first (bm25); take the first
             # with enough genuine overlap.
             for row in rows:
-                if len(_sample_tokens(row["sample"]) & set(tokens)) >= min_overlap:
+                if len(sample_tokens(row["sample"]) & set(tokens)) >= min_overlap:
                     return self._row_to_dict(row, fuzzy=True)
             return None
         # LIKE fallback has no relevance ranking — approximate it: most shared
@@ -286,7 +178,7 @@ class PatternStore:
         best = None
         best_key = (0, 0)
         for row in rows:
-            overlap = len(_sample_tokens(row["sample"]) & set(tokens))
+            overlap = len(sample_tokens(row["sample"]) & set(tokens))
             if overlap < min_overlap:
                 continue
             key = (overlap, row["occurrences"])

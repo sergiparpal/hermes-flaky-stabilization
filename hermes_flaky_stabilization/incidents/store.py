@@ -99,13 +99,17 @@ class IncidentStore:
             # mode applies only when the directory is newly created; we do not
             # forcibly re-chmod a pre-existing (possibly shared) profile dir.
             os.makedirs(parent, mode=0o700, exist_ok=True)
-        # Create the DB file owner-only *before* SQLite opens it, so incident
-        # PII is never briefly exposed at the default umask.
-        paths.precreate_private(self.db_path)
-        # check_same_thread=False because ingest/prefetch run on daemon
+        # The shared private-WAL recipe owns precreate-0600 + connect + WAL; the
+        # cache-tuning pragmas (safe under WAL for a rebuildable index) ride as
+        # extras. check_same_thread=False because ingest/prefetch run on daemon
         # threads; all access is guarded by self._lock.
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+        from ..storage.db import open_private
+
+        self._conn = open_private(
+            self.db_path,
+            check_same_thread=False,
+            extra_pragmas=("PRAGMA synchronous=NORMAL", "PRAGMA temp_store=MEMORY"),
+        )
         self._lock = threading.RLock()
         # Cached row count, invalidated on every write that changes the
         # incident set. count() is hit once per turn by system_prompt_block(),
@@ -114,33 +118,16 @@ class IncidentStore:
         # True when the FTS5 mirror could be created; False on an FTS5-less
         # SQLite build (search() then uses the LIKE fallback).
         self.fts_available: bool = False
-        self._configure_connection()
         self._init_schema()
         # Enforce 0600 on the db and any sidecar files SQLite may have created.
         # Runs after _init_schema so the WAL/-shm files (created by the first
         # write transaction in WAL mode) are locked down too.
         paths.harden_db_files(self.db_path)
 
-    # -- connection tuning ---------------------------------------------------
-
-    def _configure_connection(self) -> None:
-        """Apply SQLite pragmas suited to a rebuildable local cache.
-
-        WAL lets the background ingest writer and the read paths (prefetch /
-        search / count) proceed without blocking each other; synchronous=NORMAL
-        is safe under WAL and drops a per-commit fsync. Full durability is
-        unnecessary here — the index is always reconstructable from Jira.
-        """
-        try:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA temp_store=MEMORY")
-        except sqlite3.Error as e:
-            logger.debug("store: could not apply performance pragmas: %s", e)
-
-    # At-rest hardening lives in ``paths`` (precreate_private / harden_db_files)
-    # so the ``0600``-before-connect and WAL/-shm/-journal sidecar rules have one
-    # owner; this store used to carry its own copies of both.
+    # Connection tuning (WAL + synchronous/temp_store) and at-rest hardening live
+    # in the shared recipe (storage.db.open_private) and ``paths`` respectively,
+    # so the connect/0600/sidecar rules have one owner; this store used to carry
+    # its own copies of all three.
 
     # -- schema --------------------------------------------------------------
 

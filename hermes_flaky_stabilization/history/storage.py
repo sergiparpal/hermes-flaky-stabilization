@@ -183,18 +183,22 @@ def get_connection() -> sqlite3.Connection:
     global _connection
     if _connection is None:
         from .. import paths
+        from ..storage.db import open_private
         from .schema import apply_schema  # lazy import (hard-constraint #2)
 
         db_path = get_db_path()
-        # Own the file 0600 *before* SQLite opens it, closing the create-at-umask
-        # → chmod window during which captured test output would be exposed.
-        paths.precreate_private(db_path)
-        conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA recursive_triggers = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA case_sensitive_like = ON")
+        # The shared private-WAL recipe owns precreate-0600 + connect + WAL; the
+        # history-specific pragmas (FK cascade → FTS triggers; case-sensitive LIKE
+        # for the idx_cases_module range seek) ride as extras.
+        conn = open_private(
+            db_path,
+            check_same_thread=False,
+            extra_pragmas=(
+                "PRAGMA foreign_keys = ON",
+                "PRAGMA recursive_triggers = ON",
+                "PRAGMA case_sensitive_like = ON",
+            ),
+        )
         apply_schema(conn)
         # Owner-only: the DB can hold sensitive captured test output. Harden the
         # DB *and* its WAL/-shm/-journal sidecars — created by the first write in

@@ -4,14 +4,17 @@ Importing this package registers the three MVP strategies.
 """
 
 from . import await_state, bump_timeout, testid_selector  # noqa: F401 (registration)
-from .base import (  # noqa: F401
-    REGISTRY,
+from .base import CauseMatchStrategy, Strategy  # noqa: F401
+from .patchops import (  # noqa: F401
     PatchOp,
-    Strategy,
     StrategyError,
     apply_ops,
-    candidate_strategies,
     compute_changes,
-    get_strategy,
     unified_diff,
+)
+from .registry import (  # noqa: F401
+    REGISTRY,
+    candidate_strategies,
+    get_strategy,
+    register_strategy,
 )
