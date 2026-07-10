@@ -64,9 +64,25 @@ INCIDENT_COLUMNS = (
 # invalidates the provider's prefetch cache.
 _CONTENT_COLUMNS = tuple(c for c in INCIDENT_COLUMNS if c != "key")
 
+# Max keys bound into a single ``IN (...)``/``executemany`` statement. Stays well
+# under SQLite's default 999-variable limit (SQLITE_MAX_VARIABLE_NUMBER) so a
+# large key list never overflows it.
+_SQLITE_VAR_CHUNK = 400
+
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _chunked(seq, size=_SQLITE_VAR_CHUNK):
+    """Yield successive ``size``-length slices of *seq*.
+
+    Extracted so the two ``IN (...)`` batching loops (``_changed_rows`` and
+    ``delete_keys_not_in``) share one chunk size and cannot drift apart — both
+    must stay well under SQLite's default 999-variable statement limit.
+    """
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
 
 
 class IncidentStore:
@@ -320,9 +336,7 @@ class IncidentStore:
         keys = [r["key"] for r in rows]
         existing: dict[str, sqlite3.Row] = {}
         col_list = ", ".join(_CONTENT_COLUMNS)
-        chunk_size = 400  # stay well under SQLite's default 999-variable limit
-        for i in range(0, len(keys), chunk_size):
-            chunk = keys[i:i + chunk_size]
+        for chunk in _chunked(keys):
             placeholders = ",".join("?" * len(chunk))
             cur = self._conn.execute(
                 f"SELECT key, {col_list} FROM incidents WHERE key IN ({placeholders})",
@@ -435,11 +449,11 @@ class IncidentStore:
         tokens = self._tokens(query)[: self._LIKE_MAX_TOKENS]
         if not tokens:
             return []
-        hay = ("lower(coalesce(key,'') || ' ' || coalesce(summary,'') || ' ' || "
-               "coalesce(status,'') || ' ' || coalesce(root_cause,'') || ' ' || "
-               "coalesce(body,''))")
-        term = f"(CASE WHEN {hay} LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END)"
-        score = " + ".join([term] * len(tokens))
+        haystack_sql = ("lower(coalesce(key,'') || ' ' || coalesce(summary,'') || ' ' || "
+                        "coalesce(status,'') || ' ' || coalesce(root_cause,'') || ' ' || "
+                        "coalesce(body,''))")
+        token_match_case = f"(CASE WHEN {haystack_sql} LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END)"
+        score_expr = " + ".join([token_match_case] * len(tokens))
         params: list[Any] = [
             "%" + t.lower().replace("\\", r"\\").replace("%", r"\%").replace("_", r"\_") + "%"
             for t in tokens
@@ -451,7 +465,7 @@ class IncidentStore:
                     f"""
                     SELECT key, summary, status, root_cause,
                            reporter, assignee, created, updated, body
-                    FROM (SELECT *, ({score}) AS _score FROM incidents)
+                    FROM (SELECT *, ({score_expr}) AS _score FROM incidents)
                     WHERE _score > 0
                     ORDER BY _score DESC, updated DESC
                     LIMIT ?
@@ -558,9 +572,7 @@ class IncidentStore:
                 self._conn.executemany(
                     self._FTS_DELETE_SQL,
                     [self._fts_delete_params(k) for k in to_delete])
-            chunk_size = 400  # stay well under SQLite's default variable limit
-            for i in range(0, len(to_delete), chunk_size):
-                chunk = to_delete[i:i + chunk_size]
+            for chunk in _chunked(to_delete):
                 placeholders = ",".join("?" * len(chunk))
                 self._conn.execute(
                     f"DELETE FROM incidents WHERE key IN ({placeholders})", chunk)

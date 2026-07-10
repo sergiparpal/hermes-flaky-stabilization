@@ -137,9 +137,6 @@ def build_ticket(args: dict[str, Any], jira_section: dict[str, Any]) -> dict[str
 
 def handle_create_incident(args: dict[str, Any], **kwargs: Any) -> str:
     """Tool handler. Always returns a JSON string; never echoes the request body."""
-    from pathlib import Path
-
-    from .. import config as unified_config
     from ..orchestrator import gate
 
     if not isinstance(args, dict):
@@ -155,8 +152,8 @@ def handle_create_incident(args: dict[str, Any], **kwargs: Any) -> str:
                       "Pass the issue description as 'body'.")
 
     home = config_mod.resolve_hermes_home()
-    cfg = unified_config.load_config(Path(home) / "flaky-stabilization")
-    jira_section = cfg.get("jira") if isinstance(cfg.get("jira"), dict) else {}
+    cfg = config_mod.load_unified_config(home)
+    jira_section = config_mod._section(cfg, "jira")
 
     # Gate 1 (config): write-back is off by default (plan D7).
     if not jira_section.get("enable_write"):
@@ -211,13 +208,9 @@ def check_fn() -> bool:
     try:
         if not config_mod.resolve_token():
             return False
-        from pathlib import Path
-
-        from .. import config as unified_config
-
         home = config_mod.resolve_hermes_home()
-        cfg = unified_config.load_config(Path(home) / "flaky-stabilization")
-        jira_section = cfg.get("jira") if isinstance(cfg.get("jira"), dict) else {}
+        cfg = config_mod.load_unified_config(home)
+        jira_section = config_mod._section(cfg, "jira")
         return bool(jira_section.get("enable_write"))
     except Exception:
         return False

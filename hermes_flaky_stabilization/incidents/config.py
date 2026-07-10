@@ -243,6 +243,41 @@ def resolve_hermes_home() -> str:
     return str(paths.get_hermes_home())
 
 
+def _section(cfg: dict[str, Any], name: str) -> dict[str, Any]:
+    """Return ``cfg[name]`` when it is a dict, else ``{}``.
+
+    Config sections (``jira``, ``incidents``) are optional and, if a user
+    hand-edits the JSON, may be absent or the wrong type; every read site wants
+    "the section as a dict, empty when missing/malformed". Centralising the
+    ``isinstance`` guard here (and reading ``cfg.get`` once) keeps that check
+    from being re-spelled — and drifting — at each call site.
+    """
+    value = cfg.get(name)
+    return value if isinstance(value, dict) else {}
+
+
+def load_unified_config(home: str) -> dict[str, Any]:
+    """Load the unified plugin config dict for *home*'s data dir.
+
+    Centralises the ``unified_config.load_config(<home>/<data-dir>)`` idiom the
+    provider, the write-back tool, and this module all need, so the deferred
+    ``..config`` import and the data-dir join live in one place and the
+    ``flaky-stabilization`` directory name is spelled once (via
+    ``paths.DATA_DIR_NAME``) rather than copied as a literal at each site — the
+    extraction is what stops those literals from drifting apart.
+
+    The imports are deferred (not module-level) to honour this module's "no
+    Hermes at import time / never import ``incidents.__init__``" constraint:
+    ``..config`` and ``..paths`` are touched only when config is actually read.
+    """
+    from pathlib import Path
+
+    from .. import config as unified_config
+    from .. import paths
+
+    return unified_config.load_config(Path(home) / paths.DATA_DIR_NAME)
+
+
 def load_config(hermes_home: str) -> dict[str, Any]:
     """Load the raw non-secret config dict for :meth:`IncidentsConfig.from_dict`.
 
@@ -257,16 +292,12 @@ def load_config(hermes_home: str) -> dict[str, Any]:
     read from the file (the token lives only in the env var).
     """
     try:
-        from pathlib import Path
-
-        from .. import config as unified_config
-
-        cfg = unified_config.load_config(Path(hermes_home) / "flaky-stabilization")
+        cfg = load_unified_config(hermes_home)
     except Exception as e:
         logger.warning("%s: failed to read unified config: %s", NAME, e)
         return {}
-    jira = cfg.get("jira") if isinstance(cfg.get("jira"), dict) else {}
-    inc = cfg.get("incidents") if isinstance(cfg.get("incidents"), dict) else {}
+    jira = _section(cfg, "jira")
+    inc = _section(cfg, "incidents")
     return {
         "jira_base_url": jira.get("base_url", ""),
         "jira_email": jira.get("email", ""),

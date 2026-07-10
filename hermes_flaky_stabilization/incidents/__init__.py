@@ -211,20 +211,7 @@ class IncidentsService:
         """
         self._session_id = session_id or ""
         hermes_home = kwargs.get("hermes_home") or config_mod.resolve_hermes_home()
-        raw = (self._config_override if self._config_override is not None
-               else config_mod.load_config(hermes_home))
-        new_config = IncidentsConfig.from_dict(raw)
-
-        # db_path derives from (config, hermes_home) only, so equality of both
-        # implies the same underlying database.
-        reuse = (self._initialized and self._store is not None
-                 and new_config == self._config and hermes_home == self._hermes_home)
-
-        self._hermes_home = hermes_home
-        self._config = new_config
-        self._prefetch_timeout = new_config.prefetch_timeout
-        self._sync_min_interval = new_config.sync_min_interval
-
+        reuse = self._reload_config(hermes_home)
         agent_context = kwargs.get("agent_context", "primary")
 
         if reuse:
@@ -232,8 +219,7 @@ class IncidentsService:
             # is rebuilt (cheap, no I/O) so a token rotated in the environment
             # is picked up between sessions.
             self._client = self._build_client()
-            if self._client and self._store and agent_context in ("primary", "", None):
-                self._sync.trigger()
+            self._maybe_trigger_initial_sync(agent_context)
             return
 
         # Config/home changed (or first init): settle any in-flight sync before
@@ -241,7 +227,53 @@ class IncidentsService:
         if self._sync is not None:
             self._sync.join(SYNC_JOIN_TIMEOUT)
 
-        db_path = self._effective_db_path()
+        # db_path is computed *after* _reload_config set the new config/home, and
+        # _reopen_store closes the old store before opening the new one.
+        self._reopen_store(self._effective_db_path())
+
+        self._client = self._build_client()
+        self._sync = SyncScheduler(
+            self._sync_once, min_interval=self._sync_min_interval, name=f"{NAME}-sync")
+        self._initialized = True
+
+        # Kick off an initial background refresh — never block startup. Skips
+        # non-primary contexts (cron/subagent), mirroring the legacy lifecycle.
+        self._maybe_trigger_initial_sync(agent_context)
+
+    def _reload_config(self, hermes_home: str) -> bool:
+        """Reload config for *hermes_home* and refresh the config-derived fields.
+
+        Returns whether the live store/scheduler may be **reused**: True iff we
+        were already initialized against the same (config, hermes_home) — hence
+        the same db_path, which derives from those two alone — so the caller must
+        not tear down a store/scheduler an in-flight sync is still writing to.
+
+        The reuse decision is computed *before* the instance fields are
+        overwritten, because it compares the incoming config/home against the
+        ones currently stored. Extracting the comparison and the field
+        assignment together keeps them from drifting out of that order.
+        """
+        raw = (self._config_override if self._config_override is not None
+               else config_mod.load_config(hermes_home))
+        new_config = IncidentsConfig.from_dict(raw)
+        # db_path derives from (config, hermes_home) only, so equality of both
+        # implies the same underlying database.
+        reuse = (self._initialized and self._store is not None
+                 and new_config == self._config and hermes_home == self._hermes_home)
+        self._hermes_home = hermes_home
+        self._config = new_config
+        self._prefetch_timeout = new_config.prefetch_timeout
+        self._sync_min_interval = new_config.sync_min_interval
+        return reuse
+
+    def _reopen_store(self, db_path: str) -> None:
+        """Close the current store (if any) and open a fresh one at *db_path*.
+
+        Only reached on the non-reuse path, where config/home changed: the old
+        store must be closed before the new one opens. A failure to open leaves
+        ``self._store`` as None (read tools then report the index unavailable)
+        rather than raising out of initialize().
+        """
         try:
             if self._store is not None:
                 self._store.close()
@@ -250,15 +282,28 @@ class IncidentsService:
             logger.warning("%s: failed to open store at %s: %s", NAME, db_path, e)
             self._store = None
 
-        self._client = self._build_client()
-        self._sync = SyncScheduler(
-            self._sync_once, min_interval=self._sync_min_interval, name=f"{NAME}-sync")
-        self._initialized = True
+    @staticmethod
+    def _is_writable_context(agent_context) -> bool:
+        """Whether *agent_context* is one this stage may run background writes for.
 
-        # Skip writes for non-primary contexts (cron/subagent), mirroring the
-        # legacy lifecycle contract.
-        if self._client and self._store and agent_context in ("primary", "", None):
-            # Kick off an initial background refresh — never block startup.
+        The "primary" context is the user's foreground agent session; "" and
+        None count as primary too (older callers / direct construction that omit
+        the kwarg). Non-primary contexts (cron shims, subagents) still get
+        read-only reuse of an existing index but must not trigger a sync —
+        mirroring the legacy memory-slot lifecycle, which only wrote from the
+        primary agent.
+        """
+        return agent_context in ("primary", "", None)
+
+    def _maybe_trigger_initial_sync(self, agent_context) -> None:
+        """Fire a non-blocking background refresh when this context may write.
+
+        Both initialize() paths (store reused vs freshly reopened) end the same
+        way: trigger the scheduler only when a client and store exist and the
+        agent context is writable. Collapsing the two identical tails here keeps
+        them from diverging. Never blocks startup — the scheduler debounces.
+        """
+        if self._client and self._store and self._is_writable_context(agent_context):
             self._sync.trigger()
 
     def ensure_initialized(self, session_id: str = "") -> None:
@@ -430,12 +475,8 @@ class IncidentsService:
     def _context_injection_enabled(self) -> bool:
         """The ``incidents.context_injection`` gate (unified config, default on)."""
         try:
-            from pathlib import Path
-
-            from .. import config as unified_config
-
             home = self._hermes_home or config_mod.resolve_hermes_home()
-            cfg = unified_config.load_config(Path(home) / "flaky-stabilization")
+            cfg = config_mod.load_unified_config(home)
             return bool(cfg["incidents"]["context_injection"])
         except Exception:
             return True

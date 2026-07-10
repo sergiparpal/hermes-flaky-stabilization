@@ -146,17 +146,13 @@ def _cmd_sync(home: str, raw: dict[str, Any], *, full: bool = False,
             # so the nightly cron shim can alert.
             print(f"Sync failed: {e}", file=sys.stderr)
             return 1
-        removed = 0
-        if full:
-            if result.get("backfill_complete"):
-                removed = store.delete_keys_not_in(result.get("seen_keys") or set())
-            else:
-                print("Full sync was truncated by max_pages before seeing every "
-                      "issue — skipping deletion of unseen local incidents; "
-                      "run `jira sync` again to finish re-indexing.")
+        removed = _reconcile_full_sync(store, result) if full else 0
         changed = bool(result["ingested"] or removed)
         incomplete = not result.get("backfill_complete", True)
-        if not quiet or changed or incomplete:
+        # Report unless this is a quiet cron tick with nothing to say; a quiet run
+        # still speaks up when something changed or the backfill is unfinished.
+        should_report = changed or incomplete or not quiet
+        if should_report:
             print(f"Sync complete: ingested {result['ingested']} incident(s) "
                   f"over {result['pages']} page(s). Watermark: {result['watermark']}")
             if removed:
@@ -167,4 +163,20 @@ def _cmd_sync(home: str, raw: dict[str, Any], *, full: bool = False,
         return 0
     finally:
         store.close()
+
+
+def _reconcile_full_sync(store: IncidentStore, result: dict[str, Any]) -> int:
+    """After a ``--full`` run, delete local incidents Jira no longer returns.
+
+    Deletion is safe ONLY when the run enumerated every live issue (was not
+    truncated by ``max_pages``); a truncated run has not seen the tail, so
+    dropping "unseen" locals would be false deletions. Returns the count
+    removed, and prints its own skip notice when it cannot safely reconcile.
+    """
+    if result.get("backfill_complete"):
+        return store.delete_keys_not_in(result.get("seen_keys") or set())
+    print("Full sync was truncated by max_pages before seeing every "
+          "issue — skipping deletion of unseen local incidents; "
+          "run `jira sync` again to finish re-indexing.")
+    return 0
 
