@@ -16,29 +16,16 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .. import redact as redact_mod
 from .signature import is_degenerate, relaxed_key
 
 logger = logging.getLogger(__name__)
-
-# Mirrors handlers._TOKEN_VALUE_RE (importing it would cycle: handlers imports
-# this module). Applied to the repr() audit fallback so a non-serializable
-# payload can never smuggle a raw credential into the audit table.
-_TOKEN_VALUE_RE = re.compile(
-    r"(?:gh[poursa]_[A-Za-z0-9]{20,}"
-    r"|github_pat_[A-Za-z0-9_]{20,}"
-    r"|xox[baprs]-[A-Za-z0-9-]{10,}"
-    r"|AKIA[0-9A-Z]{16}"
-    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
-    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}"
-    r"|[Bb]earer\s+[A-Za-z0-9._\-]{12,})"
-)
 
 # Informational: the legacy store's last schema version (the unified state.db
 # supersedes it; kept because callers/tests reference the constant).
@@ -142,8 +129,9 @@ class HealerStore:
         try:
             encoded = json.dumps(payload)
         except TypeError:
-            masked = _TOKEN_VALUE_RE.sub("***", repr(payload))
-            encoded = json.dumps({"repr": masked[:2000]})
+            # Last line of defence: a non-serializable payload must never
+            # smuggle a raw credential into the audit table via its repr().
+            encoded = json.dumps(redact_mod.repr_fallback(payload))
         with closing(self._connect()) as conn, conn:
             conn.execute(
                 "INSERT INTO audit(ts, event, payload_json) VALUES(?,?,?)",

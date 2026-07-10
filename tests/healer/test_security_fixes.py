@@ -11,7 +11,7 @@ import zipfile
 import handlers
 import pytest
 from conftest import FIXTURES, TOY_APP, FakeSandbox, FakeTransport, make_run_report
-from flaky_healer import config, zipsafe
+from flaky_healer import config, redact, zipsafe
 from flaky_healer.ci.base import CIError
 from flaky_healer.ci.github_actions import GitHubActionsCI
 from flaky_healer.sandbox.docker import DockerSandbox
@@ -231,22 +231,46 @@ class TestValueRedaction:
     REAL_LOOKING = "ghp_" + "a" * 36  # shape of a real classic PAT (pragma: allowlist secret)
 
     def test_token_in_command_string_is_masked(self):
-        out = handlers._redact({"command": f"git push https://{self.REAL_LOOKING}@github.com"})
+        out = redact.redact({"command": f"git push https://{self.REAL_LOOKING}@github.com"})
         assert self.REAL_LOOKING not in out["command"]
         assert "***" in out["command"]
 
     def test_bearer_value_is_masked(self):
-        out = handlers._redact({"header": "Authorization: Bearer sk-livetoken-abcdef123456"})
+        out = redact.redact({"header": "Authorization: Bearer sk-livetoken-abcdef123456"})
         assert "sk-livetoken-abcdef123456" not in out["header"]
 
     def test_token_in_positional_string_is_masked(self):
-        out = handlers._redact([f"deploy with {self.REAL_LOOKING}"])
+        out = redact.redact([f"deploy with {self.REAL_LOOKING}"])
         assert self.REAL_LOOKING not in out[0]
 
     def test_plain_text_is_left_alone(self):
-        assert handlers._redact({"command": "git push origin main"}) == {
+        assert redact.redact({"command": "git push origin main"}) == {
             "command": "git push origin main"
         }
+
+    def test_handlers_and_recipe_store_share_one_pattern(self):
+        """The token pattern used to be copy-pasted into recipes/store.py with a
+        comment noting that importing handlers would cycle. Both consumers must
+        now resolve to the SAME compiled object, so a newly-supported credential
+        format can never be added to one path and forgotten on the other."""
+        from flaky_healer.recipes import store as recipe_store
+
+        assert handlers.redact_mod is redact
+        assert recipe_store.redact_mod is redact
+        assert handlers.redact_mod.TOKEN_VALUE_RE is recipe_store.redact_mod.TOKEN_VALUE_RE
+
+    def test_repr_fallback_masks_tokens_in_unserializable_payload(self):
+        """Both the handler and the store route their json.dumps TypeError
+        fallback through repr_fallback; it must mask token-shaped text."""
+
+        class Opaque:
+            def __repr__(self):
+                return f"<Opaque token={TestValueRedaction.REAL_LOOKING}>"
+
+        out = redact.repr_fallback(Opaque())
+        assert self.REAL_LOOKING not in out["repr"]
+        assert "***" in out["repr"]
+        assert len(out["repr"]) <= redact.AUDIT_REPR_LIMIT
 
 
 # --- H2: subprocess sandbox is not auto-promoted to a PR --------------------

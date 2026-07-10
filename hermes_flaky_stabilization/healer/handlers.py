@@ -11,18 +11,39 @@ import functools
 import io
 import json
 import logging
-import re
 import zipfile
 import zlib
 
 try:
-    from .flaky_healer import config, diagnose, gitflow, healer, logfilter, trace, zipsafe
+    from .flaky_healer import (
+        config,
+        diagnose,
+        gitflow,
+        healer,
+        logfilter,
+        trace,
+        zipsafe,
+    )
+    from .flaky_healer import (
+        redact as redact_mod,
+    )
     from .flaky_healer.ci import base as ci_base
     from .flaky_healer.ci import github_actions
     from .flaky_healer.recipes import signature as signature_mod
     from .flaky_healer.recipes.store import HealerStore
 except ImportError:  # flat import context (tests, path-loaded module)
-    from flaky_healer import config, diagnose, gitflow, healer, logfilter, trace, zipsafe
+    from flaky_healer import (
+        config,
+        diagnose,
+        gitflow,
+        healer,
+        logfilter,
+        trace,
+        zipsafe,
+    )
+    from flaky_healer import (
+        redact as redact_mod,
+    )
     from flaky_healer.ci import base as ci_base
     from flaky_healer.ci import github_actions
     from flaky_healer.recipes import signature as signature_mod
@@ -92,7 +113,7 @@ def _scrub_ci_secrets(text: str) -> str:
         try:
             from triage.redact import redact as _redact_secrets
         except Exception:
-            return _TOKEN_VALUE_RE.sub("***", text)
+            return redact_mod.mask_tokens(text)
     return _redact_secrets(text)
 
 
@@ -525,50 +546,14 @@ def _heal_command(args=None, ctx=None, **kwargs) -> str:
 # --------------------------------------------------------------------------
 
 
-_SENSITIVE_KEY_RE = re.compile(
-    r"(token|secret|password|passwd|authorization|api[_-]?key|access[_-]?key|bearer)", re.I
-)
-
-# Token-shaped *values* — masked even under an innocent key or embedded in a
-# free-form string (e.g. a token pasted into a dispatched `command`), which the
-# key-name check alone would miss.
-_TOKEN_VALUE_RE = re.compile(
-    r"(?:gh[poursa]_[A-Za-z0-9]{20,}"
-    r"|github_pat_[A-Za-z0-9_]{20,}"
-    r"|xox[baprs]-[A-Za-z0-9-]{10,}"
-    r"|AKIA[0-9A-Z]{16}"
-    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
-    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}"
-    r"|[Bb]earer\s+[A-Za-z0-9._\-]{12,})"
-)
-
-
-def _redact(obj):
-    """Mask credentials before they hit the audit log: by key name (a key that
-    looks like a credential masks its whole value) and by value shape (a
-    token-shaped substring is masked wherever it appears)."""
-    if isinstance(obj, dict):
-        return {
-            k: ("***" if isinstance(k, str) and _SENSITIVE_KEY_RE.search(k) else _redact(v))
-            for k, v in obj.items()
-        }
-    if isinstance(obj, list | tuple):
-        return [_redact(v) for v in obj]
-    if isinstance(obj, str):
-        return _TOKEN_VALUE_RE.sub("***", obj)
-    return obj
-
-
 def _audit_event(event: str, args: tuple, kwargs: dict, ctx=None) -> None:
-    payload = {"args": _redact(list(args)), "kwargs": _redact(kwargs)}
+    payload = {"args": redact_mod.redact(list(args)), "kwargs": redact_mod.redact(kwargs)}
     try:
         json.dumps(payload)
     except TypeError:
         # Repr the REDACTED payload, never the raw inputs: raw args next to a
-        # non-serializable object would bypass _SENSITIVE_KEY_RE. Objects that
-        # survive _redact untouched may still embed credentials in their repr,
-        # so mask token-shaped values once more before storing.
-        payload = {"repr": _TOKEN_VALUE_RE.sub("***", repr(payload))[:2000]}
+        # non-serializable object would bypass the sensitive-key check.
+        payload = redact_mod.repr_fallback(payload)
     _store_for(ctx).audit(event, payload)
     log.debug("audit %s: %s", event, json.dumps(payload)[:500])
 
