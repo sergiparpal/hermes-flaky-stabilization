@@ -129,6 +129,42 @@ def _resolve_home() -> str:
     return str(paths.get_hermes_home())
 
 
+# ---------------------------------------------------------------------------
+# Public ports — the stable surface the orchestrator depends on, so it never
+# imports the private ``_resolve_home`` / ``_enable_enrichment`` helpers or the
+# internal ``enrichment`` / ``prefilter`` modules (Phase 1: formalize boundaries).
+# ---------------------------------------------------------------------------
+
+
+def run_triage(call, *, llm=None, incident_context=None) -> str:
+    """Classify one CI failure — the orchestrator's triage-stage port.
+
+    Resolves the Hermes home and the enrichment gate from the unified config
+    (the caller supplies only ``llm`` and the optional incident hints), then
+    calls the classifier. Returns the tool's JSON string.
+    """
+    return handlers.triage_pipeline_failure(
+        call if isinstance(call, dict) else {},
+        llm=llm,
+        hermes_home=_resolve_home(),
+        enable_enrichment=_enable_enrichment(),
+        incident_context=incident_context,
+    )
+
+
+def signal_query(raw_text: str) -> str:
+    """The top failure-signal line of raw log text (``""`` when none).
+
+    The orchestrator's seed for its incident-context lookup: prefilter the log
+    to its failure-relevant excerpt, then pick the most representative line —
+    without the orchestrator reaching into ``triage.prefilter``/``enrichment``.
+    """
+    from . import enrichment, prefilter
+
+    excerpt, _stats = prefilter.prefilter(raw_text)
+    return enrichment.top_signal_line(excerpt)
+
+
 def register(ctx: Any) -> None:
     """Plugin entry point — register the triage tool."""
     _check_version()

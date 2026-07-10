@@ -113,6 +113,7 @@ def run_cli(args) -> int:
 
 
 def _cmd_migrate(args) -> int:
+    from .healer.flaky_healer.recipes.signature import relaxed_key
     from .storage import migrate_legacy
 
     overrides = {}
@@ -121,7 +122,10 @@ def _cmd_migrate(args) -> int:
 
         overrides["flaky_healer"] = Path(args.healer_db)
     try:
-        reports = migrate_legacy.migrate(dry_run=args.dry_run, overrides=overrides)
+        # Inject the healer's relaxed-key backfill here (the composition root),
+        # so storage/migrate_legacy never imports a stage.
+        reports = migrate_legacy.migrate(
+            dry_run=args.dry_run, overrides=overrides, relaxed_key_fn=relaxed_key)
     except migrate_legacy.MigrationError as exc:
         # e.g. a read-only ATTACH the SQLite build refused — abort loudly
         # rather than risk touching a legacy source (D4 rollback promise).

@@ -191,7 +191,8 @@ def test_migrate_backfills_v1_recipe_relaxed_key(legacy_home):
     )
 
     home, _counts, parts = legacy_home
-    migrate_legacy.migrate(home)
+    # relaxed_key is injected (as the CLI does) — migrate no longer imports it.
+    migrate_legacy.migrate(home, relaxed_key_fn=relaxed_key)
     with closing(state.connect()) as conn:
         row = conn.execute(
             "SELECT relaxed_key FROM recipes WHERE signature='legacy-sig'").fetchone()

@@ -195,6 +195,50 @@ def _handle_module_failure_history(params, **kwargs):
 
 
 # ---------------------------------------------------------------------------
+# Public ports — the stable surface siblings/orchestrator depend on, so they
+# never import the private ``_handle_*`` handlers or the internal
+# ``queries``/``storage`` modules directly (Phase 1: formalize boundaries).
+# ---------------------------------------------------------------------------
+
+
+def failure_lookup(test_id: str) -> dict:
+    """The ``test_failure_lookup`` tool result (parsed envelope) for *test_id*.
+
+    The orchestrator's history-stage port: identical to invoking the tool and
+    parsing it, but through a stable public name.
+    """
+    return json.loads(_handle_test_failure_lookup({"test_id": test_id}))
+
+
+def failure_history(test_id: str, limit: int = domain.DEFAULT_LIMIT) -> dict:
+    """Raw failure-history lookup (no tool envelope) for *test_id*.
+
+    The in-package port for triage enrichment: returns
+    ``queries.test_failure_lookup``'s dict directly so enrichment depends on
+    this signature rather than on history's internal query/storage modules.
+    """
+    from . import queries
+    from .storage import get_config, get_connection
+
+    conn = get_connection()
+    return queries.test_failure_lookup(
+        conn, test_id=test_id, limit=limit, config=get_config()
+    )
+
+
+def ingest_synthetic(**kwargs) -> int:
+    """Write a synthetic run into ``history.db`` and return its run id.
+
+    The healer burn-in feedback port (loop 1, D9): the orchestrator calls this
+    instead of reaching into ``history.ingest``/``history.storage``.
+    """
+    from . import ingest as _ingest
+    from . import storage as _storage
+
+    return _ingest.ingest_synthetic_run(_storage.get_connection(), **kwargs)
+
+
+# ---------------------------------------------------------------------------
 # Registration entry point
 # ---------------------------------------------------------------------------
 

@@ -7,7 +7,9 @@ import json
 
 from _doubles import FakePluginContext
 
-from hermes_flaky_stabilization.orchestrator import dedup, gate, hooks
+from hermes_flaky_stabilization.incidents import dedup
+from hermes_flaky_stabilization.orchestrator import hooks
+from hermes_flaky_stabilization.pii import gate
 
 # --- pre_tool_call escalation (D6.3) ------------------------------------------------
 

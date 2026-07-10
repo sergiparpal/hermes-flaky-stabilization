@@ -172,6 +172,21 @@ def _handle_is_flaky(params, *, store=None, **kwargs):
 
 
 # ---------------------------------------------------------------------------
+# Public port — the stable surface the orchestrator depends on, so it never
+# imports the private ``_handle_is_flaky`` handler (Phase 1: formalize boundaries).
+# ---------------------------------------------------------------------------
+
+
+def flaky_verdict(test_id: str) -> dict:
+    """The ``is_flaky`` tool result (parsed) for *test_id*.
+
+    The orchestrator's detective-stage port: identical to invoking the tool and
+    parsing it, but through a stable public name.
+    """
+    return json.loads(_handle_is_flaky({"test_id": test_id}))
+
+
+# ---------------------------------------------------------------------------
 # Registration entry point
 # ---------------------------------------------------------------------------
 

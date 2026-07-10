@@ -28,8 +28,10 @@ re-runs, so running migrate twice adds nothing.
 
 from __future__ import annotations
 
+import functools
 import json
 import sqlite3
+from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -187,21 +189,29 @@ def _copy_triage(conn: sqlite3.Connection, report: SourceReport) -> None:
         )
 
 
-def _healer_relaxed_key(diagnosis_json: str | None) -> str | None:
-    """The legacy v1→v2 backfill knowledge (plan Phase 4/7): recover
-    signature_parts from the stored blob and compute the indexed relaxed key;
-    rows without parts stay NULL (invisible to relaxed matching)."""
-    from ..healer.flaky_healer.recipes.signature import relaxed_key
+def _healer_relaxed_key(
+    diagnosis_json: str | None,
+    relaxed_key_fn: Callable[[dict], str | None] | None,
+) -> str | None:
+    """The legacy v1→v2 backfill (plan Phase 4/7): recover signature_parts from
+    the stored blob and compute the indexed relaxed key via the INJECTED healer
+    function. Rows without parts — or when no function is injected — stay NULL
+    (invisible to relaxed matching, the legacy semantics for un-backfilled rows).
 
+    The healer's ``relaxed_key`` is injected (by the CLI composition root) rather
+    than imported here, so this infrastructure module never depends on a stage."""
+    if relaxed_key_fn is None:
+        return None
     try:
         blob = json.loads(diagnosis_json or "{}")
     except Exception:
         return None
     parts = blob.get("signature_parts") or {} if "diagnosis" in blob else {}
-    return relaxed_key(parts) if parts else None
+    return relaxed_key_fn(parts) if parts else None
 
 
-def _copy_healer(conn: sqlite3.Connection, report: SourceReport) -> None:
+def _copy_healer(conn: sqlite3.Connection, report: SourceReport, *,
+                 relaxed_key_fn: Callable[[dict], str | None] | None = None) -> None:
     tables = _legacy_tables(conn)
     if "runs" in tables:
         report.tables["healer_runs"] = _copy_select(
@@ -218,7 +228,7 @@ def _copy_healer(conn: sqlite3.Connection, report: SourceReport) -> None:
             data = dict(row)
             rkey = data.get("relaxed_key") if has_relaxed else None
             if rkey is None:
-                rkey = _healer_relaxed_key(data.get("diagnosis_json"))
+                rkey = _healer_relaxed_key(data.get("diagnosis_json"), relaxed_key_fn)
             cur = conn.execute(
                 "INSERT OR IGNORE INTO recipes (signature, created_ts, diagnosis_json,"
                 " strategy, patch_ops_json, hits, successes, failures, last_used_ts,"
@@ -286,17 +296,28 @@ def _provenance_key(name: str) -> str:
 
 
 def migrate(home: Path | None = None, *, dry_run: bool = False,
-            overrides: dict[str, Path] | None = None) -> list[SourceReport]:
+            overrides: dict[str, Path] | None = None,
+            relaxed_key_fn: Callable[[dict], str | None] | None = None,
+            ) -> list[SourceReport]:
     """Run the copy migration; return one report per legacy source.
 
     ``overrides`` may repoint individual source paths (e.g. a healer data dir
-    that was relocated via ``FLAKY_HEALER_DATA_DIR``).
+    that was relocated via ``FLAKY_HEALER_DATA_DIR``). ``relaxed_key_fn`` is the
+    healer's ``recipes.signature.relaxed_key`` — injected by the CLI so this
+    infrastructure module never imports a stage; when absent, legacy recipes are
+    copied with a NULL ``relaxed_key`` (the un-backfilled legacy semantics).
     """
     home = Path(home) if home else paths.get_hermes_home()
     sources = default_sources(home)
     for name, path in (overrides or {}).items():
         if name in sources and path:
             sources[name] = Path(path)
+
+    # Bind the injected healer backfill into the healer copier so the uniform
+    # (conn, report) dispatch below stays healer-agnostic.
+    copiers = dict(_COPIERS)
+    copiers["flaky_healer"] = functools.partial(
+        _copy_healer, relaxed_key_fn=relaxed_key_fn)
 
     reports: list[SourceReport] = []
     # uri=True so the ATTACH `file:…?mode=ro` filenames in _attach_ro are
@@ -334,7 +355,7 @@ def migrate(home: Path | None = None, *, dry_run: bool = False,
             _attach_ro(conn, path)
             try:
                 with conn:
-                    _COPIERS[name](conn, report)
+                    copiers[name](conn, report)
                     stamp = datetime.now(UTC).isoformat(timespec="seconds")
                     conn.execute(
                         "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",

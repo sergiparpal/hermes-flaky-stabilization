@@ -41,6 +41,7 @@ from . import config as config_mod
 from . import ingest as ingest_mod
 from .config import ENV_TOKEN, NAME, IncidentsConfig  # noqa: F401 — ENV_TOKEN re-exported
 from .prefetch import PrefetchCache
+from .reader import IncidentReader
 from .store import IncidentStore
 from .sync import SyncScheduler
 
@@ -162,11 +163,22 @@ class IncidentsService:
         return NAME
 
     @property
+    def reader(self) -> IncidentReader:
+        """The redacted, read-only incident view for external (model-facing)
+        callers — the orchestrator's dedup and incident-context lookups.
+
+        Always returns a reader (wrapping the possibly-``None`` live store), and
+        every value it yields is already PII-redacted, so the raw ``IncidentStore``
+        never leaves the incidents package. Reach for this, never ``_store``."""
+        return IncidentReader(self._store)
+
+    @property
     def store(self):
-        """The live IncidentStore, or None before initialization / when the
-        index is unavailable. Public seam for the orchestrator (dedup and
-        incident-context lookups) — external callers must not reach into
-        ``_store``."""
+        """The raw ``IncidentStore`` (or ``None``) — INTERNAL to this package.
+
+        Kept for the CLI/tests that construct their own store; model-facing code
+        must use :attr:`reader` instead (its results are redacted). Reading raw
+        incident rows here and emitting them to a model would leak PII."""
         return self._store
 
     # -- availability (NO network) ------------------------------------------

@@ -349,11 +349,9 @@ class Pipeline:
         if log_path and not str(log_path).startswith("http"):
             try:
                 raw = Path(log_path).read_text(encoding="utf-8", errors="replace")
-                from ..triage import enrichment as triage_enrichment
-                from ..triage import prefilter
+                from .. import triage
 
-                excerpt, _stats = prefilter.prefilter(raw)
-                query = triage_enrichment.top_signal_line(excerpt) or query
+                query = triage.signal_query(raw) or query
             except Exception as exc:
                 logger.warning("incident-context query derivation failed", exc_info=True)
                 ctx.note(
@@ -734,74 +732,41 @@ def build_pipeline(ctx, incidents_service) -> Pipeline:
     import functools
 
     from .. import config as unified_config
+    from .. import detective, history, triage
     from ..bugreport import handler as bugreport_handler
-    from ..detective import _handle_is_flaky
     from ..healer import handlers as healer_handlers
-    from ..history import _handle_test_failure_lookup
-    from ..history import ingest as history_ingest
-    from ..history import storage as history_storage
     from ..incidents import write as incidents_write
-    from ..pii import redaction
-    from ..triage import handlers as triage_handlers
-    from . import dedup as dedup_mod
-    from . import gate as gate_mod
+    from ..pii import gate as gate_mod
 
     cfg = unified_config.load_config()
 
-    def history_lookup(test_id: str) -> dict:
-        return json.loads(_handle_test_failure_lookup({"test_id": test_id}))
-
-    def is_flaky(test_id: str) -> dict:
-        return json.loads(_handle_is_flaky({"test_id": test_id}))
-
     def triage_stage(call: dict, incident_context=None) -> str:
-        from ..triage import _enable_enrichment, _resolve_home
-
-        return triage_handlers.triage_pipeline_failure(
-            call,
-            llm=getattr(ctx, "llm", None),
-            hermes_home=_resolve_home(),
-            enable_enrichment=_enable_enrichment(),
-            incident_context=incident_context,
+        return triage.run_triage(
+            call, llm=getattr(ctx, "llm", None), incident_context=incident_context
         )
 
     def incident_search(query: str) -> list:
+        # The redacted reader is the only incident surface the orchestrator
+        # touches — it returns already-scrubbed key/summary/status projections.
         incidents_service.ensure_initialized()
-        store = incidents_service.store
-        if store is None:
-            return []
-        rows = store.search(query, limit=_INCIDENT_HINT_LIMIT)
-        return [
-            {
-                key: value
-                for key, value in redaction.redact_incident(
-                    row, fields=("key", "summary", "status")
-                ).items()
-                if key in ("key", "summary", "status")
-            }
-            for row in rows
-        ]
+        return incidents_service.reader.search(query, _INCIDENT_HINT_LIMIT)
 
     def dedup_stage(summary: str) -> dict:
         incidents_service.ensure_initialized()
-        return dedup_mod.find_duplicate_incidents(incidents_service.store, summary)
-
-    def ingest_synthetic(**kwargs) -> int:
-        conn = history_storage.get_connection()
-        return history_ingest.ingest_synthetic_run(conn, **kwargs)
+        return incidents_service.reader.find_duplicates(summary)
 
     return Pipeline(
         stages=Stages(
             fetch_ci_logs=functools.partial(healer_handlers.fetch_ci_logs, ctx=ctx),
-            history_lookup=history_lookup,
-            is_flaky=is_flaky,
+            history_lookup=history.failure_lookup,
+            is_flaky=detective.flaky_verdict,
             triage=triage_stage,
             heal=functools.partial(healer_handlers.heal_flaky_test, ctx=ctx),
             bugreport=bugreport_handler.make_handler(ctx),
             dedup=dedup_stage,
             gate=gate_mod.assert_evidence_clean,
             tracker=incidents_write.handle_create_incident,
-            ingest_synthetic=ingest_synthetic,
+            ingest_synthetic=history.ingest_synthetic,
             incident_search=incident_search,
         ),
         config=cfg,
@@ -896,8 +861,6 @@ FIND_DUPLICATES_SCHEMA = {
 
 def make_find_duplicates_handler(incidents_service):
     def handler(args, **kwargs) -> str:
-        from . import dedup as dedup_mod
-
         try:
             args = args if isinstance(args, dict) else {}
             summary = args.get("summary")
@@ -908,9 +871,7 @@ def make_find_duplicates_handler(incidents_service):
                     "remediation": "Pass the bug title/summary text to match.",
                 })
             incidents_service.ensure_initialized()
-            result = dedup_mod.find_duplicate_incidents(
-                incidents_service.store, summary, args.get("limit", 5)
-            )
+            result = incidents_service.reader.find_duplicates(summary, args.get("limit", 5))
             return json.dumps({"success": True, **result}, ensure_ascii=False)
         except Exception as exc:
             logger.exception("find_duplicate_incidents crashed")

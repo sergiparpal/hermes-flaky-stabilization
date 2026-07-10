@@ -137,7 +137,7 @@ def build_ticket(args: dict[str, Any], jira_section: dict[str, Any]) -> dict[str
 
 def handle_create_incident(args: dict[str, Any], **kwargs: Any) -> str:
     """Tool handler. Always returns a JSON string; never echoes the request body."""
-    from ..orchestrator import gate
+    from ..pii import gate
 
     if not isinstance(args, dict):
         return _error("Invalid arguments: expected an object.",

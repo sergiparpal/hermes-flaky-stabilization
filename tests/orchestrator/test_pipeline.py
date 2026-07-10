@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 
 from hermes_flaky_stabilization.orchestrator import pipeline as pl
-from hermes_flaky_stabilization.orchestrator.gate import GateResult
+from hermes_flaky_stabilization.pii.gate import GateResult
 
 REPORT = {
     "title": "Checkout broken on Safari",

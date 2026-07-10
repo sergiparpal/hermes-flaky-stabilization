@@ -5,6 +5,11 @@ referenced evidence path. Safe ⇔ every scan is ``clean && complete`` (the
 scanner's own gate semantics). The gate lives in handlers/pipeline code, not
 in a hook — hooks are advisory; this is a hard refusal.
 
+Lives in the ``pii`` package (it is a PII concern over ``pii.scanner``), so both
+the orchestrator's bug branch and the incidents write handler depend on it
+here — neither reaches up into the orchestrator for it, which used to create an
+incidents → orchestrator import cycle.
+
 The result never carries raw PII: only the scanner's masked previews are
 summarised, and only as type:count aggregates plus file names.
 """
@@ -14,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..pii import scanner
+from . import scanner
 
 
 @dataclass

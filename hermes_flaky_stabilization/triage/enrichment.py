@@ -82,13 +82,14 @@ def top_signal_line(excerpt: str) -> str:
 
 
 def _history_lookup(query: str) -> dict[str, Any]:
-    """Run the direct in-package history lookup (isolated for test injection)."""
-    from ..history import queries, storage
+    """Run the history lookup through its public port (isolated for test injection).
 
-    conn = storage.get_connection()
-    return queries.test_failure_lookup(
-        conn, test_id=query, limit=_ENRICH_LIMIT, config=storage.get_config()
-    )
+    Depends on ``history.failure_history`` — the stage's stable public surface —
+    not on history's internal ``queries``/``storage`` modules.
+    """
+    from ..history import failure_history
+
+    return failure_history(query, limit=_ENRICH_LIMIT)
 
 
 def enrich(excerpt: str) -> dict[str, Any] | None:
