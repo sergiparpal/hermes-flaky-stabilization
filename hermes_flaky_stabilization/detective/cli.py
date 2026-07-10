@@ -26,47 +26,75 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+# The argument definitions live in these adders, not inline, because the unified
+# `flaky-stab` CLI mounts the same subcommands into its own flat subparser and
+# used to transcribe every flag a second time (--window and --min-fails existed
+# in four places). Each adder takes an already-created parser so the one-line
+# `help=` stays at the call site, where it can name its namespace.
+
+
+def add_detection_window_args(parser) -> None:
+    """The two detection tunables, shared by ``scan`` and ``install-cron``."""
+    parser.add_argument("--window", type=int, default=None,
+                        help="Detection window in days (default: from config)")
+    parser.add_argument("--min-fails", dest="min_fails", type=int, default=None,
+                        help="Minimum failures in the window to be non-stable "
+                             "(default: from config)")
+
+
+def add_scan_args(parser) -> None:
+    add_detection_window_args(parser)
+    parser.add_argument("--include-errors", dest="include_errors",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help="Count `error` status as a failure (default: from config)")
+    parser.add_argument("--format", choices=["human", "cron", "json"], default="human",
+                        help="Output format (default: human)")
+
+
+def add_list_args(parser) -> None:
+    parser.add_argument("--status", choices=["flaky", "consistently_failing", "all"],
+                        default="flaky", help="Which verdicts to list (default: flaky)")
+
+
+def add_install_cron_args(parser) -> None:
+    parser.add_argument("--schedule", default=None, help="Cron expression (default: from config)")
+    parser.add_argument("--deliver", default=None, help="Delivery channel (default: from config)")
+    add_detection_window_args(parser)
+    parser.add_argument("--no-create", dest="no_create", action="store_true",
+                        help="Only write the shim + config; print the command instead "
+                             "of creating the job")
+
+
 def setup_parser(subparser) -> None:
     """Define the detection subcommands (mounted by the unified ``flaky-stab`` CLI)."""
     subs = subparser.add_subparsers(dest="flaky_command", required=True)
 
-    p_scan = subs.add_parser("scan", help="Detect flaky tests, persist verdicts, and report")
-    p_scan.add_argument("--window", type=int, default=None,
-                        help="Detection window in days (default: from config)")
-    p_scan.add_argument("--min-fails", dest="min_fails", type=int, default=None,
-                        help="Minimum failures in the window to be non-stable (default: from config)")
-    p_scan.add_argument("--include-errors", dest="include_errors",
-                        action=argparse.BooleanOptionalAction, default=None,
-                        help="Count `error` status as a failure (default: from config)")
-    p_scan.add_argument("--format", choices=["human", "cron", "json"], default="human",
-                        help="Output format (default: human)")
+    add_scan_args(subs.add_parser(
+        "scan", help="Detect flaky tests, persist verdicts, and report"))
 
     subs.add_parser("status", help="Show resolved config, DB paths, and the last scan")
 
-    p_list = subs.add_parser("list", help="List stored verdicts")
-    p_list.add_argument("--status", choices=["flaky", "consistently_failing", "all"],
-                        default="flaky", help="Which verdicts to list (default: flaky)")
+    add_list_args(subs.add_parser("list", help="List stored verdicts"))
 
-    p_cron = subs.add_parser("install-cron", help="Install the nightly no-agent detection job")
-    p_cron.add_argument("--schedule", default=None, help="Cron expression (default: from config)")
-    p_cron.add_argument("--deliver", default=None, help="Delivery channel (default: from config)")
-    p_cron.add_argument("--window", type=int, default=None, help="Detection window in days")
-    p_cron.add_argument("--min-fails", dest="min_fails", type=int, default=None,
-                        help="Minimum failures in the window to be non-stable")
-    p_cron.add_argument("--no-create", dest="no_create", action="store_true",
-                        help="Only write the shim + config; print the command instead of creating the job")
+    add_install_cron_args(subs.add_parser(
+        "install-cron", help="Install the nightly no-agent detection job"))
 
 
-def handle(args) -> int:
-    """Dispatch to the selected subcommand. Returns a process exit code."""
-    handlers = {
+def command_handlers() -> dict[str, object]:
+    """Subcommand -> handler. The single dispatch table; the unified CLI uses a
+    subset of it rather than re-deriving the mapping from private attr names."""
+    return {
         "scan": _cmd_scan,
         "status": _cmd_status,
         "list": _cmd_list,
         "install-cron": _cmd_install_cron,
     }
+
+
+def handle(args) -> int:
+    """Dispatch to the selected subcommand. Returns a process exit code."""
     sub = getattr(args, "flaky_command", None)
-    fn = handlers.get(sub)
+    fn = command_handlers().get(sub)
     if fn is None:
         print("error: no subcommand given (try `hermes flaky-stab --help`)")
         return 2

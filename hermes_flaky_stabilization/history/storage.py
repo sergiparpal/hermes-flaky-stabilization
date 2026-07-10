@@ -18,6 +18,12 @@ from . import domain
 _connection: sqlite3.Connection | None = None
 _config: dict[str, Any] | None = None
 
+# The keystone public data contract (plan D2): `<hermes_home>/test-history/
+# history.db`. Named here, once — the unified CLI's `status` used to spell both
+# components out by hand.
+STORAGE_DIR_NAME = "test-history"
+DB_FILENAME = "history.db"
+
 # The two tunables mirror their single source of truth in ``domain`` (the query
 # layer reads the same defaults); ``db_path_override`` is storage-only so it has
 # no domain constant.
@@ -46,8 +52,18 @@ def get_hermes_home() -> Path:
     return paths.get_hermes_home()
 
 
+def default_db_path() -> Path:
+    """``<hermes_home>/test-history/history.db``, creating nothing.
+
+    :func:`get_db_path` applies the config override *and* mkdirs the directory;
+    callers that only need to NAME the DB (``flaky-stab status``) must not
+    inherit that side effect, and must not hardcode the two path components.
+    """
+    return get_hermes_home() / STORAGE_DIR_NAME / DB_FILENAME
+
+
 def get_storage_dir() -> Path:
-    storage_dir = get_hermes_home() / "test-history"
+    storage_dir = get_hermes_home() / STORAGE_DIR_NAME
     # mode=0o700 on creation closes the mkdir(0755)→chmod window; 0o700 is
     # umask-safe. The chmod below stays for an already-existing 0755 dir.
     storage_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -82,7 +98,7 @@ def get_db_path() -> Path:
         # database file" for a not-yet-existing directory.
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
-    return get_storage_dir() / "history.db"
+    return get_storage_dir() / DB_FILENAME
 
 
 # ---------------------------------------------------------------------------

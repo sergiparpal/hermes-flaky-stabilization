@@ -21,8 +21,11 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import quote
 
+# Re-exported (not re-implemented): the ``mode=ro`` percent-encoding rule has one
+# owner, in ``paths``. ``paths`` is this plugin's own module, so the "never import
+# a test-history Python module" boundary above is untouched.
+from ..paths import read_only_uri as read_only_uri
 from . import domain, timeutil
 
 logger = logging.getLogger(__name__)
@@ -91,19 +94,8 @@ _FALLBACK_CASES_SQL = (
 
 
 # ---------------------------------------------------------------------------
-# Read-only connection
+# Read-only connection  (read_only_uri is re-exported from ``paths``, above)
 # ---------------------------------------------------------------------------
-
-
-def read_only_uri(db_path) -> str:
-    """The ``mode=ro`` connection URI for ``db_path`` (read-only, never writable).
-
-    The path is percent-encoded (SQLite decodes percent-escapes in URI
-    filenames): a raw ``#``, ``?``, or ``%`` would otherwise terminate or alter
-    the URI's path part, silently dropping ``mode=ro`` and opening — or even
-    creating — a *different* file read-write.
-    """
-    return f"file:{quote(str(Path(db_path)), safe='/')}?mode=ro"
 
 
 def read_source_schema_version(conn: sqlite3.Connection) -> int | None:

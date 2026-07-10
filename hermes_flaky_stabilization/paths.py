@@ -143,3 +143,19 @@ def restrict_file(path: Path | str) -> None:
         os.chmod(path, 0o600)
     except OSError:
         pass
+
+
+def read_only_uri(db_path: Path | str) -> str:
+    """The ``mode=ro`` connection URI for *db_path* (read-only, never writable).
+
+    The path is percent-encoded (SQLite decodes percent-escapes in URI
+    filenames): a raw ``#``, ``?``, or ``%`` would otherwise terminate or alter
+    the URI's path part, silently dropping ``mode=ro`` and opening — or even
+    creating — a *different* file read-write.
+
+    Lives here rather than in a stage module because every read-only opener
+    needs it; ``cli.status_text`` used to hand-build the un-encoded form.
+    """
+    from urllib.parse import quote
+
+    return f"file:{quote(str(Path(db_path)), safe='/')}?mode=ro"

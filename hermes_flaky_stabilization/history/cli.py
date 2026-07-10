@@ -17,35 +17,58 @@ from .storage import get_config, get_connection, get_db_path
 # ---------------------------------------------------------------------------
 
 
+# The argument definitions live in these adders, not inline, because the unified
+# `flaky-stab` CLI mounts the same subcommands into its own flat subparser and
+# used to transcribe every flag a second time. Each adder takes an already-created
+# parser: the one-line `help=` stays at the call site, where it can name the
+# namespace it appears in ("the test-history FTS5 index" vs "the FTS5 index").
+
+
+def add_ingest_args(parser) -> None:
+    parser.add_argument("path", type=str, help="Path to an .xml file or a directory")
+
+
+def add_prune_args(parser) -> None:
+    parser.add_argument("--before", required=True, type=str, help="ISO-8601 date/time cutoff")
+
+
 def setup_parser(subparser) -> None:
     """Define ``test-history`` subcommands. Called by Hermes during registration."""
     subs = subparser.add_subparsers(dest="test_history_command", required=True)
 
-    p_ingest = subs.add_parser("ingest", help="Ingest a JUnit XML file or a directory of them (recursive)")
-    p_ingest.add_argument("path", type=str, help="Path to an .xml file or a directory")
+    add_ingest_args(subs.add_parser(
+        "ingest", help="Ingest a JUnit XML file or a directory of them (recursive)"))
 
     subs.add_parser("status", help="Show DB path, counts, and date range")
 
-    p_prune = subs.add_parser("prune", help="Delete runs older than --before (cascades to cases)")
-    p_prune.add_argument("--before", required=True, type=str, help="ISO-8601 date/time cutoff")
+    add_prune_args(subs.add_parser(
+        "prune", help="Delete runs older than --before (cascades to cases)"))
 
     subs.add_parser("rebuild-fts", help="Rebuild the FTS5 index from the base table")
 
     subs.add_parser("config", help="Show the resolved configuration")
 
 
-def handle(args) -> int:
-    """Dispatch to the selected subcommand. Returns a process exit code."""
-    handlers = {
+def command_handlers() -> dict[str, object]:
+    """Subcommand -> handler. The single dispatch table; the unified CLI uses a
+    subset of it rather than re-deriving the mapping from private attr names."""
+    return {
         "ingest": _cmd_ingest,
         "status": _cmd_status,
         "prune": _cmd_prune,
         "rebuild-fts": _cmd_rebuild_fts,
         "config": _cmd_config,
     }
+
+
+def handle(args) -> int:
+    """Dispatch to the selected subcommand. Returns a process exit code."""
     sub = getattr(args, "test_history_command", None)
-    fn = handlers.get(sub)
+    fn = command_handlers().get(sub)
     if fn is None:
+        # NOTE: stdout, not stderr — the four CLIs disagree on this and the cron
+        # shim keys on their output. Unifying it is a behavior change, not a
+        # refactor; left as-is deliberately.
         print("error: no subcommand given (try `hermes test-history --help`)")
         return 2
     return fn(args)

@@ -23,78 +23,46 @@ from pathlib import Path
 
 SUBCOMMAND_DEST = "flaky_stab_cmd"
 
-# Subcommands delegated to each stage CLI module: name -> (module attr, handler name)
-_HISTORY_COMMANDS = {
-    "ingest": "_cmd_ingest",
-    "prune": "_cmd_prune",
-    "rebuild-fts": "_cmd_rebuild_fts",
-    "config": "_cmd_config",
-}
-_DETECTIVE_COMMANDS = {
-    "scan": "_cmd_scan",
-    "list": "_cmd_list",
-    "install-cron": "_cmd_install_cron",
-}
+# Subcommands mounted from each stage CLI. The handler for each comes from that
+# module's own `command_handlers()` table — this module names only the SUBSET it
+# re-exposes (the stage `status` commands are shadowed by the unified one below).
+_HISTORY_COMMANDS = ("ingest", "prune", "rebuild-fts", "config")
+_DETECTIVE_COMMANDS = ("scan", "list", "install-cron")
 
 
 def setup_cli(parser) -> None:
-    import argparse
+    from .detective import cli as detective_cli
+    from .history import cli as history_cli
+    from .incidents import cli as incidents_cli
 
     subs = parser.add_subparsers(dest=SUBCOMMAND_DEST)
 
     subs.add_parser("status", help="Show data locations, schema version, and config summary")
 
-    # -- history-owned (argument definitions mirror history.cli.setup_parser) --
-    p_ingest = subs.add_parser(
-        "ingest", help="Ingest a JUnit XML file or a directory of them (recursive)"
-    )
-    p_ingest.add_argument("path", type=str, help="Path to an .xml file or a directory")
-
-    p_prune = subs.add_parser(
-        "prune", help="Delete test runs older than --before (cascades to cases)"
-    )
-    p_prune.add_argument("--before", required=True, type=str, help="ISO-8601 date/time cutoff")
-
+    # Arguments come from the owning stage's arg-adders; only the `help=` text is
+    # local, because it names this namespace ("the test-history FTS5 index").
+    # -- history-owned --
+    history_cli.add_ingest_args(subs.add_parser(
+        "ingest", help="Ingest a JUnit XML file or a directory of them (recursive)"))
+    history_cli.add_prune_args(subs.add_parser(
+        "prune", help="Delete test runs older than --before (cascades to cases)"))
     subs.add_parser("rebuild-fts", help="Rebuild the test-history FTS5 index")
-
     subs.add_parser("config", help="Show the resolved test-history configuration")
 
-    # -- detective-owned (argument definitions mirror detective.cli.setup_parser) --
-    p_scan = subs.add_parser("scan", help="Detect flaky tests, persist verdicts, and report")
-    p_scan.add_argument("--window", type=int, default=None,
-                        help="Detection window in days (default: from config)")
-    p_scan.add_argument("--min-fails", dest="min_fails", type=int, default=None,
-                        help="Minimum failures in the window to be non-stable "
-                             "(default: from config)")
-    p_scan.add_argument("--include-errors", dest="include_errors",
-                        action=argparse.BooleanOptionalAction, default=None,
-                        help="Count `error` status as a failure (default: from config)")
-    p_scan.add_argument("--format", choices=["human", "cron", "json"], default="human",
-                        help="Output format (default: human)")
-
-    p_list = subs.add_parser("list", help="List stored flaky verdicts")
-    p_list.add_argument("--status", choices=["flaky", "consistently_failing", "all"],
-                        default="flaky", help="Which verdicts to list (default: flaky)")
+    # -- detective-owned --
+    detective_cli.add_scan_args(subs.add_parser(
+        "scan", help="Detect flaky tests, persist verdicts, and report"))
+    detective_cli.add_list_args(subs.add_parser("list", help="List stored flaky verdicts"))
 
     p_cron = subs.add_parser("install-cron",
                              help="Install the nightly no-agent detection job")
-    p_cron.add_argument("--schedule", default=None,
-                        help="Cron expression (default: from config)")
-    p_cron.add_argument("--deliver", default=None,
-                        help="Delivery channel (default: from config)")
-    p_cron.add_argument("--window", type=int, default=None, help="Detection window in days")
-    p_cron.add_argument("--min-fails", dest="min_fails", type=int, default=None,
-                        help="Minimum failures in the window to be non-stable")
-    p_cron.add_argument("--no-create", dest="no_create", action="store_true",
-                        help="Only write the shim + config; print the command instead "
-                             "of creating the job")
+    detective_cli.add_install_cron_args(p_cron)
+    # Unified-only: the detective CLI has no Jira sync to install alongside.
     p_cron.add_argument("--with-jira-sync", dest="with_jira_sync", action="store_true",
                         help="Also install a second no-agent job that runs "
                              "`hermes flaky-stab jira sync` on the same schedule")
 
     # -- incidents-owned (argument definitions from incidents.cli) --
-    from .incidents import cli as incidents_cli
-
     p_jira = subs.add_parser("jira", help="Manage the local Jira incident index")
     incidents_cli.register_cli(p_jira)
 
@@ -117,11 +85,11 @@ def run_cli(args) -> int:
     if command in _HISTORY_COMMANDS:
         from .history import cli as history_cli
 
-        return getattr(history_cli, _HISTORY_COMMANDS[command])(args)
+        return history_cli.command_handlers()[command](args)
     if command in _DETECTIVE_COMMANDS:
         from .detective import cli as detective_cli
 
-        rc = getattr(detective_cli, _DETECTIVE_COMMANDS[command])(args)
+        rc = detective_cli.command_handlers()[command](args)
         if command == "install-cron" and rc == 0 and getattr(args, "with_jira_sync", False):
             rc = _install_jira_sync_job(args)
         return rc
@@ -246,60 +214,66 @@ _STATUS_TABLES = (
 )
 
 
-def status_text() -> str:
-    """Human-readable state summary (plan Phase 7): DB paths, schema versions,
-    per-table counts, config summary, credential presence — booleans only,
-    never token values."""
+def _state_db_lines() -> list[str]:
+    """Schema version, FTS availability, and per-table counts for state.db."""
+    from .storage import state
+
+    db_path = state.state_db_path()
+    if not db_path.exists():
+        return [f"state.db:   {db_path} (not created yet)"]
+    try:
+        with closing(state.connect(db_path)) as conn:
+            version = state.current_version(conn)
+            fts = state.fts_available(conn)
+            counts = {
+                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in _STATUS_TABLES
+            }
+    except sqlite3.Error as exc:
+        return [f"state.db:   {db_path} (unreadable: {exc})"]
+    return [
+        f"state.db:   {db_path} (schema v{version}, fts5={'yes' if fts else 'no'})",
+        "counts:     " + ", ".join(f"{table}={count}" for table, count in counts.items()),
+    ]
+
+
+def _history_db_lines() -> list[str]:
+    """Schema version and row counts for the keystone history.db (plan D2).
+
+    Opened through ``paths.read_only_uri`` (percent-encoded ``mode=ro``) and
+    named through ``history.storage.default_db_path`` — this function used to
+    hand-build both, and the hand-built URI silently dropped ``mode=ro`` for a
+    path containing ``#``, ``?`` or ``%``.
+    """
+    from . import paths
+    from .history import storage as history_storage
+
+    history_db = history_storage.default_db_path()
+    if not history_db.exists():
+        return [f"history.db: {history_db} (not created yet)"]
+    try:
+        with closing(sqlite3.connect(paths.read_only_uri(history_db), uri=True)) as conn:
+            runs = conn.execute("SELECT COUNT(*) FROM test_runs").fetchone()[0]
+            cases = conn.execute("SELECT COUNT(*) FROM test_cases").fetchone()[0]
+            history_schema_version = conn.execute(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version").fetchone()[0]
+    except sqlite3.Error as exc:
+        return [f"history.db: {history_db} (unreadable: {exc})"]
+    return [f"history.db: {history_db} (schema v{history_schema_version}, "
+            f"runs={runs}, cases={cases})"]
+
+
+def _config_lines() -> list[str]:
+    """Config location, the resolved summary, and credential PRESENCE booleans.
+
+    Never the token values themselves.
+    """
     import json as _json
     import os
 
-    from . import config, paths
-    from .storage import state
+    from . import config
 
-    lines = [f"hermes-flaky-stabilization @ {paths.get_data_dir()}"]
-
-    # -- state.db ---------------------------------------------------------
-    db_path = state.state_db_path()
-    if db_path.exists():
-        try:
-            with closing(state.connect(db_path)) as conn:
-                version = state.current_version(conn)
-                fts = state.fts_available(conn)
-                counts = {
-                    table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                    for table in _STATUS_TABLES
-                }
-            lines.append(
-                f"state.db:   {db_path} (schema v{version}, "
-                f"fts5={'yes' if fts else 'no'})"
-            )
-            lines.append("counts:     " + ", ".join(
-                f"{table}={count}" for table, count in counts.items()))
-        except sqlite3.Error as exc:
-            lines.append(f"state.db:   {db_path} (unreadable: {exc})")
-    else:
-        lines.append(f"state.db:   {db_path} (not created yet)")
-
-    # -- history.db (the keystone public contract, D2) -----------------------
-    history_db = paths.get_hermes_home() / "test-history" / "history.db"
-    if history_db.exists():
-        try:
-            with closing(sqlite3.connect(f"file:{history_db}?mode=ro", uri=True)) as conn:
-                runs = conn.execute("SELECT COUNT(*) FROM test_runs").fetchone()[0]
-                cases = conn.execute("SELECT COUNT(*) FROM test_cases").fetchone()[0]
-                hv = conn.execute(
-                    "SELECT COALESCE(MAX(version), 0) FROM schema_version").fetchone()[0]
-            lines.append(f"history.db: {history_db} (schema v{hv}, "
-                         f"runs={runs}, cases={cases})")
-        except sqlite3.Error as exc:
-            lines.append(f"history.db: {history_db} (unreadable: {exc})")
-    else:
-        lines.append(f"history.db: {history_db} (not created yet)")
-
-    # -- config + credentials (presence booleans only) ------------------------
     cfg_path = config.config_path()
-    lines.append(f"config:     {cfg_path} "
-                 f"({'present' if cfg_path.exists() else 'defaults'})")
     cfg = config.load_config()
     summary = {
         "detective": {k: cfg["detective"][k] for k in ("window_days", "min_fails",
@@ -309,8 +283,24 @@ def status_text() -> str:
                  "enable_write": cfg["jira"]["enable_write"]},
         "incidents": cfg["incidents"],
     }
-    lines.append("resolved config (summary):")
-    lines.append(_json.dumps(summary, indent=2, sort_keys=True))
-    lines.append(f"GITHUB_TOKEN set:   {bool(os.environ.get('GITHUB_TOKEN'))}")
-    lines.append(f"JIRA_API_TOKEN set: {bool(os.environ.get('JIRA_API_TOKEN'))}")
-    return "\n".join(lines)
+    return [
+        f"config:     {cfg_path} ({'present' if cfg_path.exists() else 'defaults'})",
+        "resolved config (summary):",
+        _json.dumps(summary, indent=2, sort_keys=True),
+        f"GITHUB_TOKEN set:   {bool(os.environ.get('GITHUB_TOKEN'))}",
+        f"JIRA_API_TOKEN set: {bool(os.environ.get('JIRA_API_TOKEN'))}",
+    ]
+
+
+def status_text() -> str:
+    """Human-readable state summary (plan Phase 7): DB paths, schema versions,
+    per-table counts, config summary, credential presence — booleans only,
+    never token values."""
+    from . import paths
+
+    return "\n".join([
+        f"hermes-flaky-stabilization @ {paths.get_data_dir()}",
+        *_state_db_lines(),
+        *_history_db_lines(),
+        *_config_lines(),
+    ])

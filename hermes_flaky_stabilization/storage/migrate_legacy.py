@@ -76,8 +76,14 @@ def _attach_ro(conn: sqlite3.Connection, path: Path) -> None:
     fallback would attach READ-WRITE, and detaching a WAL-mode legacy DB
     with a non-empty ``-wal`` would then checkpoint — i.e. mutate — the
     source file, breaking the trivial-rollback promise (D4).
+
+    The path is percent-encoded via ``paths.read_only_uri``: ``--healer-db``
+    takes an operator-supplied path, and a raw ``#``/``?``/``%`` in it would
+    terminate the URI's path part and silently drop ``mode=ro`` — attaching the
+    source READ-WRITE. (The no-op header write below would then abort the run,
+    but the URI should never have been malformed in the first place.)
     """
-    uri = f"file:{path}?mode=ro"
+    uri = paths.read_only_uri(path)
     try:
         conn.execute("ATTACH DATABASE ? AS legacy", (uri,))
     except sqlite3.OperationalError as exc:

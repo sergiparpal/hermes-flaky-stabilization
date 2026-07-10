@@ -234,6 +234,30 @@ def test_migrate_missing_sources_reported(profile_env):
                for r in reports.values())
 
 
+def test_attach_ro_encodes_paths_with_uri_metacharacters(profile_env, tmp_path):
+    """A legacy DB path containing '?' must still attach read-only.
+
+    `--healer-db` takes an operator-supplied path. _attach_ro used to build
+    `file:{path}?mode=ro` by hand: for `/x/db?a=1/healer.db` SQLite parses the
+    path as `/x/db` and finds NO `mode` parameter, so it would open a different
+    file READ-WRITE. The percent-encoded paths.read_only_uri prevents that.
+    """
+    weird_dir = tmp_path / "db?a=1"
+    weird_dir.mkdir()
+    healer_db = weird_dir / "healer.db"
+    _build_healer_db(healer_db, v1=False)
+    before = hashlib.sha256(healer_db.read_bytes()).hexdigest()
+
+    reports = {r.name: r for r in migrate_legacy.migrate(
+        profile_env, overrides={"flaky_healer": healer_db})}
+
+    healer = reports["flaky_healer"]
+    assert healer.found, f"source not found via the '?' path: {healer.skipped}"
+    assert healer.skipped is None, f"migration skipped: {healer.skipped}"
+    # The source must be byte-identical: attached read-only, never checkpointed.
+    assert hashlib.sha256(healer_db.read_bytes()).hexdigest() == before
+
+
 def test_migrate_never_clobbers_newer_unified_rows(legacy_home):
     home, _counts, _parts = legacy_home
     with closing(state.connect()) as conn, conn:

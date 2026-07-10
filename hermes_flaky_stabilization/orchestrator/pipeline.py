@@ -58,6 +58,34 @@ OUTCOME_NEEDS_ATTENTION = "needs_attention"
 
 _INCIDENT_HINT_LIMIT = 3
 
+
+def _as_dict(raw: Any) -> Any:
+    """Normalise a stage's return value.
+
+    Stage callables honour the tool contract (a JSON string) in production but
+    the injected test doubles return plain dicts; every call site used to
+    re-inline this ternary.
+    """
+    return json.loads(raw) if isinstance(raw, str) else raw
+
+
+def _stage_error(label: str, exc: Exception) -> dict[str, str]:
+    """The uniform stage-error envelope.
+
+    The exception *type* is reported, never its message: a stage failure must
+    not leak a token or a path out of a third-party client's error string.
+    """
+    return {"error": f"{label} failed ({type(exc).__name__})"}
+
+
+def _internal_error_envelope(exc: Exception) -> str:
+    """The tool-contract envelope for a crash inside a registered handler."""
+    return json.dumps({
+        "success": False,
+        "error": f"internal error ({type(exc).__name__})",
+        "remediation": "See the agent log for details.",
+    })
+
 STABILIZE_SCHEMA = {
     "name": "stabilize_test_failure",
     "description": (
@@ -141,6 +169,11 @@ class Pipeline:
     config: dict[str, Any] = field(default_factory=dict)
     record_run: Callable[[dict], None] | None = None
 
+    @property
+    def _pipeline_cfg(self) -> dict[str, Any]:
+        """The ``pipeline`` config section, always a dict."""
+        return self.config.get("pipeline") or {}
+
     # -- public entry -----------------------------------------------------
 
     def run(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -149,8 +182,7 @@ class Pipeline:
         results: dict[str, Any] = {key: {"skipped": "not reached"} for key in STAGE_KEYS}
         notes: list[str] = []
 
-        pipeline_cfg = self.config.get("pipeline") or {}
-        heal_categories = pipeline_cfg.get("heal_categories") or ["flaky", "timeout"]
+        heal_categories = self._pipeline_cfg.get("heal_categories") or ["flaky", "timeout"]
 
         log_path = self._evidence(args, results, notes)
         test_id = str(args.get("test_id") or "").strip()
@@ -201,10 +233,9 @@ class Pipeline:
         repo = str(args.get("repo") or "").strip()
         if build_id and repo and self.stages.fetch_ci_logs is not None:
             try:
-                raw = self.stages.fetch_ci_logs({"build_id": build_id, "repo": repo})
-                data = json.loads(raw) if isinstance(raw, str) else raw
+                data = _as_dict(self.stages.fetch_ci_logs({"build_id": build_id, "repo": repo}))
             except Exception as exc:
-                results["evidence"] = {"error": f"fetch_ci_logs failed ({type(exc).__name__})"}
+                results["evidence"] = _stage_error("fetch_ci_logs", exc)
                 return None
             if isinstance(data, dict) and data.get("filtered_log"):
                 try:
@@ -213,9 +244,7 @@ class Pipeline:
                     # not a run abort that loses every result and the ledger row.
                     path = self._spool_log(data["filtered_log"], build_id)
                 except Exception as exc:
-                    results["evidence"] = {
-                        "error": f"evidence spool failed ({type(exc).__name__})",
-                    }
+                    results["evidence"] = _stage_error("evidence spool", exc)
                     return None
                 results["evidence"] = {
                     "source": "fetch_ci_logs", "log": str(path),
@@ -233,16 +262,16 @@ class Pipeline:
     def _spool_log(self, text: str, build_id: str) -> Path:
         from .. import paths
 
+        # Owner-only: the spooled CI log can carry secrets and captured output,
+        # and get_data_dir()'s 0700 parent does not set this child's mode.
         spool = paths.get_data_dir() / "pipeline-evidence"
-        spool.mkdir(parents=True, exist_ok=True)
+        spool.mkdir(parents=True, mode=0o700, exist_ok=True)
         # build_id is untrusted ("123/456" would escape the spool dir or just
         # fail on a missing subdirectory); sanitise before it names a file.
         safe_id = _SAFE_BUILD_ID_RE.sub("-", build_id) or "unknown"
         path = spool / f"ci-log-{safe_id}.log"
         path.write_text(text, encoding="utf-8")
-        from ..paths import restrict_file
-
-        restrict_file(path)
+        paths.restrict_file(path)
         return path
 
     def _history(self, test_id: str, results) -> None:
@@ -254,14 +283,14 @@ class Pipeline:
             try:
                 results["history"] = self.stages.history_lookup(test_id)
             except Exception as exc:
-                results["history"] = {"error": f"history lookup failed ({type(exc).__name__})"}
+                results["history"] = _stage_error("history lookup", exc)
         else:
             results["history"] = {"skipped": "history stage unavailable"}
         if self.stages.is_flaky is not None:
             try:
                 results["detective"] = self.stages.is_flaky(test_id)
             except Exception as exc:
-                results["detective"] = {"error": f"is_flaky failed ({type(exc).__name__})"}
+                results["detective"] = _stage_error("is_flaky", exc)
         else:
             results["detective"] = {"skipped": "detective stage unavailable"}
 
@@ -319,10 +348,9 @@ class Pipeline:
         if args.get("project"):
             call["project"] = args["project"]
         try:
-            raw = self.stages.triage(call, incident_context=incident_context)
-            data = json.loads(raw) if isinstance(raw, str) else raw
+            data = _as_dict(self.stages.triage(call, incident_context=incident_context))
         except Exception as exc:
-            results["triage"] = {"error": f"triage failed ({type(exc).__name__})"}
+            results["triage"] = _stage_error("triage", exc)
             return None
         results["triage"] = data
         if not isinstance(data, dict) or not data.get("success"):
@@ -340,17 +368,15 @@ class Pipeline:
         if self.stages.heal is None:
             results["healer"] = {"skipped": "healer stage unavailable"}
             return OUTCOME_NEEDS_ATTENTION
-        pipeline_cfg = self.config.get("pipeline") or {}
-        mode = str(args.get("mode") or pipeline_cfg.get("default_heal_mode") or "suggest")
+        mode = str(args.get("mode") or self._pipeline_cfg.get("default_heal_mode") or "suggest")
         call = {"repo_dir": repo_dir, "test_id": test_id, "mode": mode}
         for optional in ("trace_path", "build_id", "repo"):
             if args.get(optional):
                 call[optional] = args[optional]
         try:
-            raw = self.stages.heal(call)
-            data = json.loads(raw) if isinstance(raw, str) else raw
+            data = _as_dict(self.stages.heal(call))
         except Exception as exc:
-            results["healer"] = {"error": f"heal failed ({type(exc).__name__})"}
+            results["healer"] = _stage_error("heal", exc)
             return OUTCOME_NEEDS_ATTENTION
         results["healer"] = data
         if not isinstance(data, dict):
@@ -406,7 +432,7 @@ class Pipeline:
             try:
                 results["dedup"] = self.stages.dedup(summary_query)
             except Exception as exc:
-                results["dedup"] = {"error": f"dedup failed ({type(exc).__name__})"}
+                results["dedup"] = _stage_error("dedup", exc)
         else:
             results["dedup"] = {"skipped": "no dedup stage or empty summary"}
 
@@ -417,8 +443,7 @@ class Pipeline:
         if log_path and not str(log_path).startswith("http"):
             evidence_paths.append(str(log_path))
 
-        pipeline_cfg = self.config.get("pipeline") or {}
-        if pipeline_cfg.get("require_pii_gate", True):
+        if self._pipeline_cfg.get("require_pii_gate", True):
             if self.stages.gate is None:
                 # Fail CLOSED, mirroring assert_evidence_clean's scan-error
                 # policy: a required gate that cannot run must block the
@@ -487,10 +512,9 @@ class Pipeline:
             return None
         raw_text = self._raw_evidence_text(args, log_path, test_id, results)
         try:
-            raw = self.stages.bugreport({"raw_text": raw_text, "format": "json"})
-            data = json.loads(raw) if isinstance(raw, str) else raw
+            data = _as_dict(self.stages.bugreport({"raw_text": raw_text, "format": "json"}))
         except Exception as exc:
-            results["bugreport"] = {"error": f"bug report failed ({type(exc).__name__})"}
+            results["bugreport"] = _stage_error("bug report", exc)
             return None
         if not isinstance(data, dict) or data.get("error"):
             results["bugreport"] = data if isinstance(data, dict) else {"error": "bad report"}
@@ -564,15 +588,14 @@ class Pipeline:
             notes.append("tracker write disabled — returning the ticket body to file manually")
             return OUTCOME_TICKET_READY
         try:
-            raw = self.stages.tracker({
+            data = _as_dict(self.stages.tracker({
                 "title": title,
                 "body": body,
                 "severity": report.get("severity", ""),
                 "evidence_paths": evidence_paths,
-            })
-            data = json.loads(raw) if isinstance(raw, str) else raw
+            }))
         except Exception as exc:
-            results["tracker"] = {"error": f"tracker write failed ({type(exc).__name__})"}
+            results["tracker"] = _stage_error("tracker write", exc)
             return OUTCOME_NEEDS_ATTENTION
         results["tracker"] = data
         if isinstance(data, dict) and data.get("created"):
@@ -746,11 +769,7 @@ def make_tool_handler(ctx, incidents_service):
                               ensure_ascii=False)
         except Exception as exc:
             logger.exception("stabilize_test_failure crashed")
-            return json.dumps({
-                "success": False,
-                "error": f"internal error ({type(exc).__name__})",
-                "remediation": "See the agent log for details.",
-            })
+            return _internal_error_envelope(exc)
     return handler
 
 
@@ -845,9 +864,5 @@ def make_find_duplicates_handler(incidents_service):
             return json.dumps({"success": True, **result}, ensure_ascii=False)
         except Exception as exc:
             logger.exception("find_duplicate_incidents crashed")
-            return json.dumps({
-                "success": False,
-                "error": f"internal error ({type(exc).__name__})",
-                "remediation": "See the agent log for details.",
-            })
+            return _internal_error_envelope(exc)
     return handler
