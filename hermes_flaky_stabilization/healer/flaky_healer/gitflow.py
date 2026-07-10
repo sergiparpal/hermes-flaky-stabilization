@@ -143,6 +143,22 @@ def cleanup_dispatches(
     return steps
 
 
+def _as_dict(result) -> dict | None:
+    """Coerce a dispatch result to a dict, or ``None`` when it isn't one.
+
+    A host may hand back an already-parsed dict or a JSON string; anything that
+    does not resolve to a dict (a non-JSON string, a JSON scalar/list, a
+    non-string non-dict) yields ``None``, and each caller decides what that means
+    for its own contract. Shared so the str→JSON→dict preamble has one owner.
+    """
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except json.JSONDecodeError:
+            return None
+    return result if isinstance(result, dict) else None
+
+
 def _result_failure(result) -> str | None:
     """``None`` when *result* positively signals success, else a failure reason.
 
@@ -152,16 +168,12 @@ def _result_failure(result) -> str | None:
     ``execute_locally`` produces) or a JSON string would read as success and
     the flow would commit on whatever branch the user has checked out.
     """
-    if isinstance(result, str):
-        try:
-            parsed = json.loads(result)
-        except json.JSONDecodeError:
+    parsed = _as_dict(result)
+    if parsed is None:
+        if isinstance(result, str):
             return f"unrecognizable dispatch result: {result[:200]!r}"
-        if not isinstance(parsed, dict):
-            return f"unrecognizable dispatch result: {result[:200]!r}"
-        result = parsed
-    if not isinstance(result, dict):
         return f"unrecognizable dispatch result of type {type(result).__name__}"
+    result = parsed
     if result.get("error"):
         return str(result["error"])
     for key in ("exit_code", "returncode", "exitCode", "returnCode"):
@@ -178,19 +190,15 @@ def _result_failure(result) -> str | None:
 
 def _result_text(result) -> str | None:
     """Best-effort textual output of a read-only git dispatch, or ``None``."""
-    if isinstance(result, str):
-        try:
-            parsed = json.loads(result)
-        except json.JSONDecodeError:
-            return result  # raw stdout from a plain-text host
-        if not isinstance(parsed, dict):
-            return result
-        result = parsed
-    if isinstance(result, dict):
-        for key in ("stdout", "output", "text", "content"):
-            value = result.get(key)
-            if isinstance(value, str):
-                return value
+    parsed = _as_dict(result)
+    if parsed is None:
+        # A raw string that wasn't a JSON object IS the plain-text host's stdout;
+        # anything else has no textual output to offer.
+        return result if isinstance(result, str) else None
+    for key in ("stdout", "output", "text", "content"):
+        value = parsed.get(key)
+        if isinstance(value, str):
+            return value
     return None
 
 

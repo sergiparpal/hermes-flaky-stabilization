@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 
-from .base import PatchOp, register_strategy
+from .base import CauseMatchStrategy, PatchOp, register_strategy
 
 _PAGE_VAR_RE = re.compile(r"\b(\w+)\.(?:locator|getBy\w+)\(")
 
@@ -45,18 +45,12 @@ def _statement_anchor(lines: list[str], idx: int) -> int | None:
     return None
 
 
-class AwaitState:
+class AwaitState(CauseMatchStrategy):
     name = "await_state"
-
-    def applies(self, diagnosis: dict, trace) -> bool:
-        diagnosis = diagnosis or {}
-        return (
-            diagnosis.get("cause") == "race_condition"
-            or diagnosis.get("recommended_strategy") == self.name
-        )
+    cause = "race_condition"
 
     def plan(self, test_source: str, diagnosis: dict, trace, test_file: str) -> list[PatchOp]:
-        selector = (trace.selector if trace else None) or (diagnosis or {}).get("selector")
+        selector = self._selector(trace, diagnosis)
         if not isinstance(selector, str) or not selector:
             return []
         lines = test_source.splitlines()

@@ -84,6 +84,10 @@ def _json_safe(fn):
     return wrapper
 
 
+# A GitHub Actions job/step with any of these conclusions is NOT a failure; the
+# CI-log fetch keeps only jobs and steps whose conclusion is outside this set.
+_NON_FAILURE_CONCLUSIONS = (None, "success", "skipped", "neutral")
+
 # zip entry reads can raise zlib.error/RuntimeError on corrupt/encrypted members,
 # which the BadZipFile guard alone does not cover; ZipLimitError guards bombs.
 _ZIP_READ_ERRORS = (
@@ -172,6 +176,28 @@ def _logs_zip_to_text(blob: bytes, failed_job_names: set[str] | None = None) -> 
     return "\n".join(parts)
 
 
+def _make_ci_adapter(transport):
+    """Build the GitHub Actions CI adapter shared by the two CI-log call sites.
+
+    Returns ``(adapter, has_credentials)``. ``has_credentials`` is False ONLY in
+    the "no GITHUB_TOKEN and no injected transport" case — the sole case the
+    adapter cannot be built to reach the API, so ``adapter`` is then ``None``.
+    The two callers diverge on that signal (``fetch_ci_logs`` returns an error
+    envelope, ``_pull_ci_log`` degrades to a warning), so the helper only
+    centralizes the identical token guard, the ``"injected-transport"`` token
+    fallback and the ``api_base`` wiring, keeping the two sites from drifting.
+    """
+    token = config.github_token()
+    if not token and transport is None:
+        return None, False
+    adapter = github_actions.GitHubActionsCI(
+        token=token or "injected-transport",
+        transport=transport,
+        api_base=config.github_api_base(),
+    )
+    return adapter, True
+
+
 @_json_safe
 def fetch_ci_logs(params, ctx=None, transport=None, **kwargs) -> str:
     p = _params(params)
@@ -180,18 +206,12 @@ def fetch_ci_logs(params, ctx=None, transport=None, **kwargs) -> str:
     if not build_id or not repo:
         return _err("both 'build_id' and 'repo' (owner/name) are required")
 
-    token = config.github_token()
-    if not token and transport is None:
+    adapter, has_credentials = _make_ci_adapter(transport)
+    if not has_credentials:
         return _err(
             "GITHUB_TOKEN is not set; fetch_ci_logs needs it to call the GitHub API",
             hint="export GITHUB_TOKEN with actions:read scope",
         )
-
-    adapter = github_actions.GitHubActionsCI(
-        token=token or "injected-transport",
-        transport=transport,
-        api_base=config.github_api_base(),
-    )
     try:
         run = adapter.get_run(repo, build_id)
         jobs = adapter.get_jobs(repo, build_id)
@@ -201,7 +221,7 @@ def fetch_ci_logs(params, ctx=None, transport=None, **kwargs) -> str:
 
     failed_jobs = []
     for job in jobs.get("jobs", []):
-        if job.get("conclusion") in (None, "success", "skipped", "neutral"):
+        if job.get("conclusion") in _NON_FAILURE_CONCLUSIONS:
             continue
         failed_jobs.append(
             {
@@ -211,7 +231,7 @@ def fetch_ci_logs(params, ctx=None, transport=None, **kwargs) -> str:
                 "failed_steps": [
                     s.get("name")
                     for s in job.get("steps", [])
-                    if s.get("conclusion") not in (None, "success", "skipped", "neutral")
+                    if s.get("conclusion") not in _NON_FAILURE_CONCLUSIONS
                 ],
             }
         )
@@ -287,14 +307,11 @@ def analyze_playwright_trace(params, ctx=None, **kwargs) -> str:
 def _pull_ci_log(build_id: str, repo: str, transport) -> tuple[str | None, list[str]]:
     """Best-effort filtered CI log for diagnosis context; never fatal."""
     warnings: list[str] = []
-    token = config.github_token()
-    if not token and transport is None:
+    adapter, has_credentials = _make_ci_adapter(transport)
+    if not has_credentials:
+        # Diagnosis context is optional: degrade to a warning here. fetch_ci_logs,
+        # where the log IS the request, returns an error envelope for the same case.
         return None, [f"build_id {build_id} given but GITHUB_TOKEN unset; skipped CI logs"]
-    adapter = github_actions.GitHubActionsCI(
-        token=token or "injected-transport",
-        transport=transport,
-        api_base=config.github_api_base(),
-    )
     try:
         blob = adapter.download_logs_zip(repo, build_id)
         text = _logs_zip_to_text(blob)
@@ -313,21 +330,12 @@ def _signature_for(trace_summary, diagnosis: dict | None) -> str:
     return signature_mod.signature_hash(parts)
 
 
-def _pr_flow(ctx, report: healer.HealReport, repo_dir: str) -> dict:
-    sig = report.recipe_signature or _signature_for(None, report.diagnosis)
-    branch = gitflow.branch_name(report.test_id, sig)
-    base = config.base_branch()
+def _pr_messages(report: healer.HealReport, sig: str, pre) -> tuple[str, str, str]:
+    """Assemble ``(commit_message, pr_title, pr_body)`` for a heal PR.
 
-    # Read-only preflight (via the same dispatch mechanism): refuses to start
-    # the write sequence on a dirty tree and records the original ref (restored
-    # on failure) plus the validated HEAD the fix branch is cut from.
-    pre = gitflow.run_preflight(ctx, repo_dir)
-
-    patch_dir = config.data_dir(ctx) / "patches"
-    patch_dir.mkdir(parents=True, exist_ok=True)
-    patch_path = patch_dir / f"{branch.rsplit('/', 1)[-1]}.patch"
-    patch_path.write_text(report.diff, encoding="utf-8")
-
+    Separated from :func:`_pr_flow`'s dispatch orchestration so the outbound
+    text — the only reviewer-facing product of the flow — lives in one place.
+    """
     burnin = report.burnin or {}
     commit_message = (
         f"fix(flaky): heal {report.test_id} via {report.strategy}\n\n"
@@ -351,6 +359,25 @@ def _pr_flow(ctx, report: healer.HealReport, repo_dir: str) -> dict:
         f"the fix branch is cut from it\n\n"
         f"```diff\n{report.diff}```\n"
     )
+    return commit_message, pr_title, pr_body
+
+
+def _pr_flow(ctx, report: healer.HealReport, repo_dir: str) -> dict:
+    sig = report.recipe_signature or _signature_for(None, report.diagnosis)
+    branch = gitflow.branch_name(report.test_id, sig)
+    base = config.base_branch()
+
+    # Read-only preflight (via the same dispatch mechanism): refuses to start
+    # the write sequence on a dirty tree and records the original ref (restored
+    # on failure) plus the validated HEAD the fix branch is cut from.
+    pre = gitflow.run_preflight(ctx, repo_dir)
+
+    patch_dir = config.data_dir(ctx) / "patches"
+    patch_dir.mkdir(parents=True, exist_ok=True)
+    patch_path = patch_dir / f"{branch.rsplit('/', 1)[-1]}.patch"
+    patch_path.write_text(report.diff, encoding="utf-8")
+
+    commit_message, pr_title, pr_body = _pr_messages(report, sig, pre)
     dispatches = gitflow.build_dispatches(
         repo_dir=repo_dir,
         branch=branch,
@@ -438,24 +465,9 @@ def heal_flaky_test(params, ctx=None, sandbox=None, store=None, transport=None, 
         payload["warnings"] = warnings
 
     if mode == "pr":
-        # A subprocess-validated heal ran the (possibly patched) test on the host
-        # with no container isolation, so it must not be auto-promoted to a PR.
-        weak_isolation = report.isolation == "subprocess" and not config.allow_subprocess_pr()
-        if report.error or not report.stable or not report.diff.strip() or weak_isolation:
+        reason = _pr_skip_reason(report)
+        if reason is not None:
             payload["pr"] = None
-            if report.error:
-                reason = report.error
-            elif not report.stable:
-                reason = "post-patch burn-in was not fully green"
-            elif not report.diff.strip():
-                reason = "no diff was produced"
-            else:
-                reason = (
-                    "validation ran in the weaker 'subprocess' sandbox (no container "
-                    "isolation), so any patched code executed directly on the host; refusing "
-                    "to auto-open a PR. Re-run on the Docker backend, or set "
-                    "FLAKY_HEALER_ALLOW_SUBPROCESS_PR=1 to override."
-                )
             payload["pr_skipped"] = "refusing to open a PR: " + reason
         else:
             try:
@@ -464,6 +476,31 @@ def heal_flaky_test(params, ctx=None, sandbox=None, store=None, transport=None, 
                 payload["pr"] = None
                 payload["pr_skipped"] = str(exc)
     return json.dumps(payload)
+
+
+def _pr_skip_reason(report: healer.HealReport) -> str | None:
+    """Why a stable-looking heal must NOT auto-open a PR — or ``None`` to proceed.
+
+    Precedence is preserved from the original inline cascade: an error wins over
+    an unstable burn-in, which wins over an empty diff, which wins over weak
+    sandbox isolation.
+    """
+    if report.error:
+        return report.error
+    if not report.stable:
+        return "post-patch burn-in was not fully green"
+    if not report.diff.strip():
+        return "no diff was produced"
+    # A subprocess-validated heal ran the (possibly patched) test on the host
+    # with no container isolation, so it must not be auto-promoted to a PR.
+    if report.isolation == "subprocess" and not config.allow_subprocess_pr():
+        return (
+            "validation ran in the weaker 'subprocess' sandbox (no container "
+            "isolation), so any patched code executed directly on the host; refusing "
+            "to auto-open a PR. Re-run on the Docker backend, or set "
+            "FLAKY_HEALER_ALLOW_SUBPROCESS_PR=1 to override."
+        )
+    return None
 
 
 @_json_safe

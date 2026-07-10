@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 
-from .base import PatchOp, register_strategy
+from .base import CauseMatchStrategy, PatchOp, register_strategy
 
 # A data-testid is attacker-controlled data lifted from the trace's DOM snapshot
 # and would be written *verbatim* into a .spec source line. Without this guard a
@@ -25,16 +25,23 @@ def _is_safe_testid(value: object) -> bool:
     return isinstance(value, str) and _SAFE_TESTID_RE.match(value) is not None
 
 
-class TestidSelector:
+class TestidSelector(CauseMatchStrategy):
     name = "testid_selector"
+    cause = "fragile_selector"
 
     def applies(self, diagnosis: dict, trace) -> bool:
-        diagnosis = diagnosis or {}
-        wants = (
-            diagnosis.get("cause") == "fragile_selector"
-            or diagnosis.get("recommended_strategy") == self.name
+        # Extra gate on top of the shared cause/recommendation match: only apply
+        # once the trace PROVES a data-testid on the failing target (that proof
+        # is ``trace.testid_on_target`` — see the module docstring), else the
+        # planner has nothing safe to rewrite. ``super().applies(...)`` is the
+        # ``wants`` OR term, so this preserves the exact original truth table:
+        # (cause=='fragile_selector' OR recommended==name) AND trace is not None
+        # AND bool(trace.testid_on_target).
+        return (
+            super().applies(diagnosis, trace)
+            and trace is not None
+            and bool(trace.testid_on_target)
         )
-        return wants and trace is not None and bool(trace.testid_on_target)
 
     def plan(self, test_source: str, diagnosis: dict, trace, test_file: str) -> list[PatchOp]:
         if trace is None or not trace.testid_on_target or not trace.selector:

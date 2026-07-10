@@ -41,6 +41,18 @@ STRATEGY_FOR_CAUSE = {
 
 CONFIDENCE_THRESHOLD = 0.7
 
+# Per-rule confidence for the heuristic (stage-1) diagnosis. Named so the ladder
+# of thresholds can be read and tuned in one place instead of as bare floats
+# scattered through the rule cascade. Ordered most- to least-certain.
+_CONF_FRAGILE_SELECTOR = 0.85    # trace proves a same-shaped data-testid target
+_CONF_ENVIRONMENT = 0.8          # network-level failure marker in the output
+_CONF_RACE_CONDITION = 0.8       # timed out with requests still in flight
+_CONF_INFRA = 0.75               # browser/runner infrastructure failure
+_CONF_TIMEOUT = 0.75             # element resolved but never reached its state
+_CONF_TIMEOUT_LOG_ONLY = 0.6     # timeout marker in a CI log, no trace to confirm
+_CONF_DATA = 0.5                 # assertion failed without timing out
+_CONF_UNKNOWN = 0.3              # no deterministic rule matched
+
 DIAGNOSIS_SCHEMA = {
     "type": "object",
     "properties": {
@@ -72,7 +84,7 @@ _LOG_TIMEOUT_RE = re.compile(r"Timeout \d+ms exceeded", re.IGNORECASE)
 _LOG_SELECTOR_RE = re.compile(r"waiting for locator\('([^']+)'\)")
 
 
-def _make(cause, confidence, evidence, failing_action=None, selector=None) -> dict:
+def _make_diagnosis(cause, confidence, evidence, failing_action=None, selector=None) -> dict:
     return {
         "cause": cause,
         "triage_label": TRIAGE_FOR_CAUSE[cause],
@@ -103,18 +115,18 @@ def heuristic_diagnosis(trace: TraceSummary | None, log_excerpt: str | None = No
 
     m = _ENVIRONMENT_RE.search(text)
     if m:
-        return _make(
+        return _make_diagnosis(
             "environment",
-            0.8,
+            _CONF_ENVIRONMENT,
             f"network-level failure marker '{m.group(1)}' in the failure output",
             action,
             selector,
         )
     m = _INFRA_RE.search(text)
     if m:
-        return _make(
+        return _make_diagnosis(
             "infra",
-            0.75,
+            _CONF_INFRA,
             f"browser/runner infrastructure failure: '{m.group(1)}'",
             action,
             selector,
@@ -122,9 +134,9 @@ def heuristic_diagnosis(trace: TraceSummary | None, log_excerpt: str | None = No
 
     if trace is not None and trace.timed_out:
         if selector and not trace.selector_resolved and trace.testid_on_target:
-            return _make(
+            return _make_diagnosis(
                 "fragile_selector",
-                0.85,
+                _CONF_FRAGILE_SELECTOR,
                 f"{action} timed out waiting for {selector!r} which never attached, but the "
                 f"DOM snapshot shows a same-shaped element carrying "
                 f"data-testid={trace.testid_on_target!r}",
@@ -133,17 +145,17 @@ def heuristic_diagnosis(trace: TraceSummary | None, log_excerpt: str | None = No
             )
         if trace.pending_requests:
             urls = ", ".join(r.url for r in trace.pending_requests[:3])
-            return _make(
+            return _make_diagnosis(
                 "race_condition",
-                0.8,
+                _CONF_RACE_CONDITION,
                 f"{action} timed out while network requests were still unsettled ({urls}); "
                 "the assertion ran before the data it depends on arrived",
                 action,
                 selector,
             )
-        return _make(
+        return _make_diagnosis(
             "timeout",
-            0.75,
+            _CONF_TIMEOUT,
             f"{action} on {selector!r} timed out after {trace.timeout_ms}ms; the element "
             "resolved but did not reach the expected state in time and no network requests "
             "were pending",
@@ -152,9 +164,9 @@ def heuristic_diagnosis(trace: TraceSummary | None, log_excerpt: str | None = No
         )
 
     if trace is None and log_excerpt and _LOG_TIMEOUT_RE.search(log_excerpt):
-        return _make(
+        return _make_diagnosis(
             "timeout",
-            0.6,
+            _CONF_TIMEOUT_LOG_ONLY,
             "timeout marker found in CI log (no trace available for deeper analysis)",
             action,
             selector,
@@ -162,18 +174,18 @@ def heuristic_diagnosis(trace: TraceSummary | None, log_excerpt: str | None = No
 
     if trace is not None and trace.error_name and "expect" in (action or ""):
         if not trace.timed_out:
-            return _make(
+            return _make_diagnosis(
                 "data",
-                0.5,
+                _CONF_DATA,
                 f"assertion {action} failed without timing out — received value likely "
                 "differs from expectation (possible test-data drift)",
                 action,
                 selector,
             )
 
-    return _make(
+    return _make_diagnosis(
         "unknown",
-        0.3,
+        _CONF_UNKNOWN,
         "no deterministic rule matched the failure evidence",
         action,
         selector,
@@ -214,7 +226,7 @@ def _sanitize_llm_diagnosis(raw: dict, fallback: dict) -> dict:
         confidence = float(raw.get("confidence", 0.5))
     except (TypeError, ValueError):
         confidence = 0.5
-    out = _make(
+    out = _make_diagnosis(
         cause,
         min(1.0, max(0.0, confidence)),
         str(raw.get("evidence") or "model-provided diagnosis"),

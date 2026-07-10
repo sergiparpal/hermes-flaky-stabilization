@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from .base import PatchOp, register_strategy
+from .base import CauseMatchStrategy, PatchOp, register_strategy
 
 FACTOR = 3
 CAP_MS = 60_000
@@ -26,18 +26,12 @@ def _bumped(value: int) -> int | None:
     return new if new > value else None
 
 
-class BumpTimeout:
+class BumpTimeout(CauseMatchStrategy):
     name = "bump_timeout"
-
-    def applies(self, diagnosis: dict, trace) -> bool:
-        diagnosis = diagnosis or {}
-        return (
-            diagnosis.get("cause") == "timeout"
-            or diagnosis.get("recommended_strategy") == self.name
-        )
+    cause = "timeout"
 
     def plan(self, test_source: str, diagnosis: dict, trace, test_file: str) -> list[PatchOp]:
-        selector = (trace.selector if trace else None) or (diagnosis or {}).get("selector")
+        selector = self._selector(trace, diagnosis)
         if not isinstance(selector, str):
             selector = None
 

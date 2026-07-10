@@ -150,6 +150,32 @@ def _resolve_error_name(error: dict, result: dict, message: str) -> str:
     return name or "Error"
 
 
+def _iter_ndjson(budget, zf, entries):
+    """Yield each decoded JSON object from the NDJSON ``entries``, in sorted order.
+
+    Blank lines, lines that fail to parse, and payloads that don't decode to a
+    ``dict`` are skipped — the exact scaffolding the trace- and network-entry
+    scan loops each carried verbatim. Reads go through ``budget.iter_lines`` so
+    the shared ``ZipBudget`` (a zip-bomb decompressed-byte guard, see
+    flaky_healer.zipsafe) is accounted identically for both scans; routing both
+    through one generator is what keeps that guard from drifting between them.
+    The caller passes the SAME ``budget`` across successive calls, so the byte
+    budget accumulates across every entry exactly as the single ``budget``
+    threaded through both inline loops did.
+    """
+    for entry in sorted(entries):
+        for raw_line in budget.iter_lines(zf, entry):
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                ev = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(ev, dict):
+                yield ev
+
+
 def parse_trace(path: str | Path) -> TraceSummary:
     path = Path(path)
     try:
@@ -173,29 +199,11 @@ def parse_trace(path: str | Path) -> TraceSummary:
             if not trace_entries:
                 raise ValueError(f"no .trace entries inside {path.name}; not a Playwright trace")
 
-            for entry in sorted(trace_entries):
-                for raw_line in budget.iter_lines(zf, entry):
-                    raw_line = raw_line.strip()
-                    if not raw_line:
-                        continue
-                    try:
-                        ev = json.loads(raw_line)
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(ev, dict):
-                        _ingest_trace_event(ev, summary, calls, order)
+            for ev in _iter_ndjson(budget, zf, trace_entries):
+                _ingest_trace_event(ev, summary, calls, order)
 
-            for entry in sorted(network_entries):
-                for raw_line in budget.iter_lines(zf, entry):
-                    raw_line = raw_line.strip()
-                    if not raw_line:
-                        continue
-                    try:
-                        ev = json.loads(raw_line)
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(ev, dict):
-                        _ingest_network_event(ev, summary)
+            for ev in _iter_ndjson(budget, zf, network_entries):
+                _ingest_network_event(ev, summary)
         except ZipLimitError as exc:
             raise ValueError(f"trace.zip rejected: {exc}") from exc
 
@@ -207,83 +215,111 @@ def parse_trace(path: str | Path) -> TraceSummary:
     return summary
 
 
-def _ingest_trace_event(ev: dict, summary: TraceSummary, calls: dict, order: list) -> None:
-    etype = ev.get("type")
-    if etype == "context-options":
-        version = ev.get("version")
-        if isinstance(version, int):
-            summary.trace_version = max(summary.trace_version or 0, version)
-    elif etype == "before":
-        if ev.get("class") in _NON_ACTION_CLASSES:
-            return
-        call_id = ev.get("callId")
-        if not call_id:  # unidentifiable action — cannot correlate its after/log events
-            return
-        if call_id in calls:  # duplicate before for the same id: keep the first
-            return
-        params = ev.get("params")
-        if not isinstance(params, dict):
-            params = {}
-        selector = params.get("selector")
-        timeout = params.get("timeout")
-        action = TraceAction(
-            call_id=call_id,
-            api_name=_api_name(ev.get("method") or "", ev.get("title")),
-            klass=ev.get("class") or "",
-            selector=selector if isinstance(selector, str) else None,
-            timeout_ms=timeout if isinstance(timeout, int | float) else None,
-            start_ms=ev.get("startTime"),
-            params=params,
+def _ingest_context_options(ev: dict, summary: TraceSummary, calls: dict, order: list) -> None:
+    version = ev.get("version")
+    if isinstance(version, int):
+        summary.trace_version = max(summary.trace_version or 0, version)
+
+
+def _ingest_before(ev: dict, summary: TraceSummary, calls: dict, order: list) -> None:
+    if ev.get("class") in _NON_ACTION_CLASSES:
+        return
+    call_id = ev.get("callId")
+    if not call_id:  # unidentifiable action — cannot correlate its after/log events
+        return
+    if call_id in calls:  # duplicate before for the same id: keep the first
+        return
+    params = ev.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    selector = params.get("selector")
+    timeout = params.get("timeout")
+    action = TraceAction(
+        call_id=call_id,
+        api_name=_api_name(ev.get("method") or "", ev.get("title")),
+        klass=ev.get("class") or "",
+        selector=selector if isinstance(selector, str) else None,
+        timeout_ms=timeout if isinstance(timeout, int | float) else None,
+        start_ms=ev.get("startTime"),
+        params=params,
+    )
+    calls[call_id] = action
+    order.append(call_id)
+
+
+def _ingest_after(ev: dict, summary: TraceSummary, calls: dict, order: list) -> None:
+    action = calls.get(ev.get("callId") or "")
+    if action is None:
+        return
+    action.end_ms = ev.get("endTime")
+    error = ev.get("error")
+    if not isinstance(error, dict):
+        error = {}
+    if isinstance(error.get("error"), dict):  # older traces nest it once more
+        error = error["error"]
+    result = ev.get("result")
+    if not isinstance(result, dict):
+        result = {}
+    if error:
+        message = str(error.get("message") or "")
+        action.error_message = _strip_ansi(message)
+        action.error_name = _resolve_error_name(error, result, message)
+        action.timed_out = bool(
+            result.get("timedOut")
+            or ("timeout" in message.lower() and "exceeded" in message.lower())
         )
-        calls[call_id] = action
-        order.append(call_id)
-    elif etype == "after":
-        action = calls.get(ev.get("callId") or "")
-        if action is None:
-            return
-        action.end_ms = ev.get("endTime")
-        error = ev.get("error")
-        if not isinstance(error, dict):
-            error = {}
-        if isinstance(error.get("error"), dict):  # older traces nest it once more
-            error = error["error"]
-        result = ev.get("result")
-        if not isinstance(result, dict):
-            result = {}
-        if error:
-            message = str(error.get("message") or "")
-            action.error_message = _strip_ansi(message)
-            action.error_name = _resolve_error_name(error, result, message)
-            action.timed_out = bool(
-                result.get("timedOut")
-                or ("timeout" in message.lower() and "exceeded" in message.lower())
-            )
-        log = result.get("log")
-        if isinstance(log, list):
-            for line in log:
-                action.call_log.append(_strip_ansi(str(line)).strip())
-    elif etype == "log":
-        action = calls.get(ev.get("callId") or "")
-        if action is not None:
-            action.call_log.append(_strip_ansi(str(ev.get("message") or "")).strip())
-    elif etype == "frame-snapshot":
-        snapshot = ev.get("snapshot")
-        if not isinstance(snapshot, dict):
-            return
-        for _tag, attrs in _walk_html(snapshot.get("html")):
-            testid = attrs.get("data-testid")
-            if testid and testid not in summary.dom_testids:
-                summary.dom_testids[testid] = dict(attrs)
-            el_id = attrs.get("id")
-            if el_id and el_id not in summary.dom_ids:
-                # Only the element's data-testid is read downstream
-                # (_match_testid_for_selector); storing that alone avoids copying
-                # every id-bearing element's full attribute dict on a large DOM.
-                summary.dom_ids[el_id] = {"data-testid": testid}
-    elif etype == "error":
-        message = _strip_ansi(str(ev.get("message") or ""))
-        if message and not summary.test_error_message:
-            summary.test_error_message = message
+    log = result.get("log")
+    if isinstance(log, list):
+        for line in log:
+            action.call_log.append(_strip_ansi(str(line)).strip())
+
+
+def _ingest_log(ev: dict, summary: TraceSummary, calls: dict, order: list) -> None:
+    action = calls.get(ev.get("callId") or "")
+    if action is not None:
+        action.call_log.append(_strip_ansi(str(ev.get("message") or "")).strip())
+
+
+def _ingest_frame_snapshot(ev: dict, summary: TraceSummary, calls: dict, order: list) -> None:
+    snapshot = ev.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return
+    for _tag, attrs in _walk_html(snapshot.get("html")):
+        testid = attrs.get("data-testid")
+        if testid and testid not in summary.dom_testids:
+            summary.dom_testids[testid] = dict(attrs)
+        el_id = attrs.get("id")
+        if el_id and el_id not in summary.dom_ids:
+            # Only the element's data-testid is read downstream
+            # (_match_testid_for_selector); storing that alone avoids copying
+            # every id-bearing element's full attribute dict on a large DOM.
+            summary.dom_ids[el_id] = {"data-testid": testid}
+
+
+def _ingest_error(ev: dict, summary: TraceSummary, calls: dict, order: list) -> None:
+    message = _strip_ansi(str(ev.get("message") or ""))
+    if message and not summary.test_error_message:
+        summary.test_error_message = message
+
+
+# Dispatch table replacing what was one long if/elif chain over ``ev["type"]``.
+# A table keeps each event type's handling in a single, independently testable
+# place and makes an unrecognized type a no-op (the old chain's fall-through),
+# so adding/removing an event type can't accidentally reorder the others.
+_TRACE_EVENT_HANDLERS = {
+    "context-options": _ingest_context_options,
+    "before": _ingest_before,
+    "after": _ingest_after,
+    "log": _ingest_log,
+    "frame-snapshot": _ingest_frame_snapshot,
+    "error": _ingest_error,
+}
+
+
+def _ingest_trace_event(ev: dict, summary: TraceSummary, calls: dict, order: list) -> None:
+    handler = _TRACE_EVENT_HANDLERS.get(ev.get("type"))
+    if handler is not None:
+        handler(ev, summary, calls, order)
 
 
 def _ingest_network_event(ev: dict, summary: TraceSummary) -> None:
