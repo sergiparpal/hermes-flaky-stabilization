@@ -9,6 +9,10 @@ plugin with one private state store.
 > Supersedes: `hermes-test-history`, `hermes-flaky-detective`,
 > `hermes-ci-triage`, `hermes-flaky-healer`, `hermes-bug-report-improver`,
 > `hermes-masking-validator`, `hermes-jira-incidents`. See `MIGRATION.md`.
+>
+> The replaced plugins are no longer published. New installations must use
+> `hermes-flaky-stabilization`; this plugin's migration command is for
+> preserving data from existing legacy installations.
 
 ## Install & enable
 
@@ -65,6 +69,10 @@ Every run lands in the `pipeline_runs` ledger inside `state.db`.
   (+FTS), links, meta, pipeline runs. Owner-only (`0700` dir / `0600` file),
   WAL, versioned migration ladder.
 
+Both databases refuse a schema version newer than this installed plugin
+supports. Upgrade the plugin before opening a newer database; do not point an
+older build at it.
+
 ## Configuration
 
 One JSON file: `<hermes_home>/flaky-stabilization/config.json`. All keys
@@ -83,6 +91,11 @@ legacy `test-history/config.json` > built-in default. Legacy env vars keep
 working as overrides: `FLAKY_HEALER_*`, `HERMES_CI_TRIAGE_*`,
 `JIRA_BASE_URL`/`JIRA_EMAIL`, `HERMES_JIRA_STRICT_REDACTION`. Secrets live
 **only** in env: `GITHUB_TOKEN`, `JIRA_API_TOKEN`.
+
+The PII gate is intentionally fail-closed: evidence must be both `clean` and
+`complete`. A scan that reaches a file, traversal, byte, finding, or time
+limit—or skips unreadable, binary, symlink-escaping, or unsupported image
+content—is not complete and cannot authorize an external ticket write.
 
 ## Security model
 
@@ -109,9 +122,16 @@ working as overrides: `FLAKY_HEALER_*`, `HERMES_CI_TRIAGE_*`,
    `validate_no_pii` (`clean && complete`) in the same call, and every
    outbound field is redacted (`[redacted-*]` tokens). Incident data is
    redacted on *every* model-facing path; the local index keeps full fidelity
-   at rest, owner-only.
-5. **Untrusted-content framing** — CI logs, test artifacts, and incident text
-   are always fenced as untrusted data in prompts and tool output.
+   at rest, owner-only. The read-only scanner opens regular files only,
+   refuses symlink escapes, and bounds traversal, text, and OCR work.
+5. **Untrusted-content framing and output minimization** — CI logs, test
+   artifacts, and incident text are always fenced as untrusted data in prompts
+   and tool output. Trace summaries and pipeline results scrub secrets and
+   PII; URLs are reduced to their origin and local evidence references to a
+   safe filename.
+6. **Bounded remote clients** — Jira and CI clients enforce HTTPS where
+   credentials are involved, cap responses, and avoid returning upstream error
+   bodies that could echo sensitive incident or log content.
 
 ## Triage taxonomy
 
@@ -139,8 +159,11 @@ new flaky tests — and optionally a second job that runs
 `hermes flaky-stab jira sync --quiet` (silent when nothing changed; a broken
 sync exits non-zero so the job alerts). `hermes flaky-stab jira sync --full`
 re-ingests from scratch and, when the run completes untruncated, removes
-locally indexed incidents that no longer exist in Jira. The gateway daemon
-must be running for jobs to fire.
+locally indexed incidents that no longer exist in Jira. If `max_pages` cuts a
+full sync short, its checkpoint is retained: re-run the same `sync --full`
+command to resume safely; deletion happens only after the complete sweep. A
+failed or timed-out automatic cron creation prints the manual command and
+exits non-zero. The gateway daemon must be running for jobs to fire.
 
 ## Development
 
@@ -150,8 +173,17 @@ HERMES_REPO=~/hermes-agent bash scripts/run_tests.sh   # + real-loader integrati
 ruff check .
 ```
 
-Requires Python ≥ 3.11, < 3.14. Runtime is standard library only; OCR extras
-for the PII scanner are optional (`requirements-ocr.txt`).
+Requires Python ≥ 3.11, < 3.14. The core runtime is standard library only.
+To scan image evidence, install the optional package extra in the Hermes
+environment and make the system `tesseract` executable available on `PATH`:
+
+```bash
+python -m pip install ".[ocr]"
+```
+
+Without both the Python extra and `tesseract`, image files are reported as
+`ocr_unavailable`; that makes a PII-gated write incomplete rather than
+silently passing the image.
 
 ## License
 

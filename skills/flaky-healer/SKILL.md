@@ -36,8 +36,10 @@ selector misses, race conditions) rather than a genuine regression.
 - `bump_timeout` — raise the failing action/assertion timeout (≤3×, cap 60 s).
 - `testid_selector` — replace a fragile selector with `getByTestId(...)`, only
   when the trace DOM snapshot proves the target carries a `data-testid`.
-- `await_state` — insert `await page.waitForLoadState('networkidle')` before
-  the failing action when the trace shows unsettled network traffic.
+- `await_state` — for a target implicated by unsettled network traffic, raise
+  an explicitly short assertion timeout to 5 seconds or wait for that target
+  locator to become visible. It deliberately avoids a global `networkidle`
+  wait, which is often unrelated to the failing element.
 
 ## Notes
 
@@ -48,3 +50,7 @@ selector misses, race conditions) rather than a genuine regression.
   host with no container isolation; re-run on the Docker backend, or set
   `FLAKY_HEALER_ALLOW_SUBPROCESS_PR=1` to override.
 - A learned recipe is never applied without a fresh full burn-in.
+- Trace summaries are deliberately bounded and redacted: secrets and PII are
+  masked, and network URLs are reduced to their origin. Use the local trace
+  artifact for raw forensic inspection rather than expecting those values in
+  tool output.

@@ -4,7 +4,8 @@
 `hermes-flaky-detective`, `hermes-ci-triage`, `hermes-flaky-healer`,
 `hermes-bug-report-improver`, `hermes-masking-validator`, and
 `hermes-jira-incidents`. All 13 legacy tools keep their names, schemas, and
-JSON return shapes.
+JSON return shapes. The seven replaced plugins are no longer published; this
+guide is for moving data and configuration from an existing installation.
 
 ## Steps
 

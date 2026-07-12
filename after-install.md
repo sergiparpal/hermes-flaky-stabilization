@@ -16,7 +16,14 @@
      unlocks the Jira incident sync and, only if you also set
      `jira.enable_write: true`, the `jira_create_incident` write-back.
 
-3. **Feed it data:**
+3. **Optional image-evidence OCR.** To scan screenshots or other image
+   evidence, install the package's `ocr` extra in the environment that runs
+   Hermes (`python -m pip install "hermes-flaky-stabilization[ocr]"`) and
+   install the system `tesseract` executable. Without both, an image is
+   reported as `ocr_unavailable`; PII-gated tracker writes refuse incomplete
+   evidence rather than treating the image as clean.
+
+4. **Feed it data:**
 
    ```bash
    hermes test-history ingest path/to/junit-reports/
@@ -24,6 +31,6 @@
    hermes flaky-stab install-cron    # …or nightly, at zero LLM cost
    ```
 
-4. **Use it:** ask the agent to `stabilize` a failing CI run, or call
+5. **Use it:** ask the agent to `stabilize` a failing CI run, or call
    `/stabilize <ci-log-path>` directly. `hermes flaky-stab status` shows
    what the plugin knows.
