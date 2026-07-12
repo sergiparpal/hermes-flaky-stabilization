@@ -109,15 +109,15 @@ class TestAwaitState:
         ops = strategy.plan(source, diag, race_trace, "tests/flaky-race.spec.ts")
         assert len(ops) == 1
         op = ops[0]
-        assert op.op == "insert_before"
-        assert op.new == "  await page.waitForLoadState('networkidle');"
+        assert op.op == "replace"
+        assert op.new == "timeout: 5000"
         assert "expect(page.locator('#item-count'))" in op.anchor
 
     def test_idempotent_when_already_patched(self, race_trace):
         strategy = get_strategy("await_state")
         source = (
-            "  await page.waitForLoadState('networkidle');\n"
-            "  await expect(page.locator('#item-count')).toHaveText('3 items');\n"
+            "  await expect(page.locator('#item-count')).toHaveText('3 items', "
+            "{ timeout: 5000 });\n"
         )
         assert strategy.plan(source, {"cause": "race_condition"}, race_trace, "t.spec.ts") == []
 
@@ -134,9 +134,9 @@ class TestApplyAndDiff:
         )
         changes = apply_ops(repo, ops)
         diff = unified_diff(changes)
-        assert "+  await page.waitForLoadState('networkidle');" in diff
+        assert "timeout: 5000" in diff
         assert "a/tests/flaky-race.spec.ts" in diff and "b/tests/flaky-race.spec.ts" in diff
-        assert "waitForLoadState" in spec.read_text()
+        assert "timeout: 5000" in spec.read_text()
 
     def test_missing_anchor_raises(self, tmp_path):
         repo = tmp_path / "repo"

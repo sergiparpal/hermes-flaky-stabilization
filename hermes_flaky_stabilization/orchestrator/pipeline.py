@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -44,6 +46,7 @@ logger = logging.getLogger(__name__)
 # build_id is untrusted input that ends up in a spool *filename*; anything
 # outside this class (path separators above all) is replaced with "-".
 _SAFE_BUILD_ID_RE = re.compile(r"[^A-Za-z0-9._-]")
+_MAX_BUILD_ID_CHARS = 80
 
 STAGE_KEYS = (
     "evidence", "history", "detective", "triage",
@@ -80,6 +83,22 @@ def _stage_error(label: str, exc: Exception) -> dict[str, str]:
     not leak a token or a path out of a third-party client's error string.
     """
     return {"error": f"{label} failed ({type(exc).__name__})"}
+
+
+def _safe_payload(value: Any) -> Any:
+    """Recursively scrub strings before stage results reach output/the ledger."""
+    from ..pii import redaction
+    from ..pii.scanner import mask_pii
+
+    if isinstance(value, str):
+        return mask_pii(redaction.redact_text(value))
+    if isinstance(value, dict):
+        return {str(key): _safe_payload(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_safe_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [_safe_payload(item) for item in value]
+    return value
 
 
 def _internal_error_envelope(exc: Exception) -> str:
@@ -251,6 +270,7 @@ class Pipeline:
                      reason="no category and no flaky verdict")
             ctx.note("nothing to act on: supply a log and/or a known test_id")
 
+        ctx.results = _safe_payload(ctx.results)
         envelope = {
             "success": True,
             "outcome": outcome,
@@ -258,6 +278,7 @@ class Pipeline:
             "notes": ctx.notes,
         }
         self._ledger(ctx, category, branch, outcome, time.monotonic() - started)
+        self._cleanup_spooled_evidence(ctx, log_path)
         return envelope
 
     # -- stage steps --------------------------------------------------------
@@ -265,7 +286,8 @@ class Pipeline:
     def _evidence(self, ctx: RunContext) -> str | None:
         log = ctx.arg("log_url_or_path")
         if log:
-            ctx.results["evidence"] = {"source": "given_log", "log": log}
+            ctx.results["evidence"] = {
+                "source": "given_log", "log": self._safe_evidence_ref(log)}
             return log
         build_id = ctx.arg("build_id")
         repo = ctx.arg("repo")
@@ -285,7 +307,7 @@ class Pipeline:
                     ctx.fail("evidence", "evidence spool", exc)
                     return None
                 ctx.results["evidence"] = {
-                    "source": "fetch_ci_logs", "log": str(path),
+                    "source": "fetch_ci_logs", "log": self._safe_evidence_ref(path),
                     "bytes_filtered": data.get("bytes_filtered"),
                 }
                 return str(path)
@@ -304,13 +326,48 @@ class Pipeline:
         # and get_data_dir()'s 0700 parent does not set this child's mode.
         spool = paths.get_data_dir() / "pipeline-evidence"
         spool.mkdir(parents=True, mode=0o700, exist_ok=True)
+        # Best-effort crash residue cleanup. Normal runs remove their own spool
+        # at the end; this bounds files left by a killed process.
+        cutoff = time.time() - 24 * 60 * 60
+        for stale in spool.glob("ci-log-*.log"):
+            try:
+                if stale.is_file() and stale.stat().st_mtime < cutoff:
+                    stale.unlink()
+            except OSError:
+                pass
         # build_id is untrusted ("123/456" would escape the spool dir or just
         # fail on a missing subdirectory); sanitise before it names a file.
-        safe_id = _SAFE_BUILD_ID_RE.sub("-", build_id) or "unknown"
-        path = spool / f"ci-log-{safe_id}.log"
-        path.write_text(text, encoding="utf-8")
+        safe_id = (_SAFE_BUILD_ID_RE.sub("-", str(build_id))[:_MAX_BUILD_ID_CHARS]
+                   or "unknown")
+        fd, raw_path = tempfile.mkstemp(
+            prefix=f"ci-log-{safe_id}-", suffix=".log", dir=spool)
+        path = Path(raw_path)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(str(text))
         paths.restrict_file(path)
         return path
+
+    @staticmethod
+    def _cleanup_spooled_evidence(ctx: RunContext, log_path: str | None) -> None:
+        evidence = ctx.results.get("evidence")
+        if not (log_path and isinstance(evidence, dict)
+                and evidence.get("source") == "fetch_ci_logs"):
+            return
+        try:
+            Path(log_path).unlink(missing_ok=True)
+        except OSError:
+            logger.warning("could not remove temporary pipeline evidence", exc_info=True)
+
+    @staticmethod
+    def _safe_evidence_ref(value: Any) -> str:
+        """Non-sensitive evidence identifier for results and generated text."""
+        from ..pii.scanner import mask_pii
+        from ..triage import logfetch, safehttp
+
+        raw = str(value)
+        if logfetch.is_remote(raw):
+            return mask_pii(safehttp.safe_url(raw))
+        return mask_pii(Path(raw).name or "local log")
 
     def _history(self, test_id: str, ctx: RunContext) -> None:
         if not test_id:
@@ -348,9 +405,10 @@ class Pipeline:
         query = test_id
         if log_path and not str(log_path).startswith("http"):
             try:
-                raw = Path(log_path).read_text(encoding="utf-8", errors="replace")
                 from .. import triage
+                from ..triage import logfetch
 
+                raw = logfetch.fetch(str(log_path))
                 query = triage.signal_query(raw) or query
             except Exception as exc:
                 logger.warning("incident-context query derivation failed", exc_info=True)
@@ -441,17 +499,20 @@ class Pipeline:
         classname, name = None, test_id
         if "::" in test_id:
             classname, name = test_id.rsplit("::", 1)
-        cases = [{
+        case = {
             "classname": classname,
             "name": name,
             "file_path": report.get("test_id") or test_id,
             "status": "passed",
-        }] * max(1, repeats)
+        }
         try:
-            run_id = self.stages.ingest_synthetic(cases=cases)
+            run_ids = [
+                self.stages.ingest_synthetic(cases=[case])
+                for _ in range(max(1, repeats))
+            ]
             ctx.note(
-                f"burn-in outcome fed back into test history (run_id={run_id}, "
-                f"{len(cases)} green case row(s))"
+                f"burn-in outcome fed back into test history "
+                f"({len(run_ids)} synthetic green run(s))"
             )
         except Exception as exc:
             ctx.note(f"burn-in feedback failed ({type(exc).__name__})")
@@ -592,7 +653,7 @@ class Pipeline:
                     f"{history.get('last_failure_at')}"
                 )
         if log_path:
-            parts.append(f"CI log: {log_path}")
+            parts.append(f"CI log: {Pipeline._safe_evidence_ref(log_path)}")
         return "\n".join(parts) or "CI pipeline failure (no further evidence collected)"
 
     @staticmethod

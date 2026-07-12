@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from typing import Any, NamedTuple
 
@@ -140,6 +141,7 @@ class IncidentsService:
         self._client: Any | None = None  # config.build_client(...) -> JiraClient | None
         self._session_id: str = ""
         self._initialized = False
+        self._lifecycle_lock = threading.RLock()
         # Mirror of config.prefetch_timeout, kept as an attribute so tests (and
         # any runtime tuning) can override the prefetch bound directly.
         self._prefetch_timeout: float = self._config.prefetch_timeout
@@ -200,7 +202,7 @@ class IncidentsService:
         try:
             if self.is_available():
                 return True
-            self.ensure_initialized()
+            self.ensure_initialized(agent_context="read_only")
             return bool(self._store and self._store.count() > 0)
         except Exception:
             return False
@@ -218,8 +220,14 @@ class IncidentsService:
         one). When the config/home did change, the old scheduler is joined with
         a short timeout before the old store is closed.
         """
+        with self._lifecycle_lock:
+            self._initialize_locked(session_id, **kwargs)
+
+    def _initialize_locked(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id or ""
         hermes_home = kwargs.get("hermes_home") or config_mod.resolve_hermes_home()
+        old_state = (self._config, self._hermes_home, self._prefetch_timeout,
+                     self._sync_min_interval)
         reuse = self._reload_config(hermes_home)
         agent_context = kwargs.get("agent_context", "primary")
 
@@ -235,6 +243,13 @@ class IncidentsService:
         # tearing down the store it writes to.
         if self._sync is not None:
             self._sync.join(SYNC_JOIN_TIMEOUT)
+            if self._sync.is_running():
+                (self._config, self._hermes_home, self._prefetch_timeout,
+                 self._sync_min_interval) = old_state
+                logger.warning(
+                    "%s: configuration change deferred because the prior sync "
+                    "did not stop within %.1fs", NAME, SYNC_JOIN_TIMEOUT)
+                return
 
         # db_path is computed *after* _reload_config set the new config/home, and
         # _reopen_store closes the old store before opening the new one.
@@ -315,9 +330,12 @@ class IncidentsService:
         if self._client and self._store and self._is_writable_context(agent_context):
             self._sync.trigger()
 
-    def ensure_initialized(self, session_id: str = "") -> None:
-        if not self._initialized:
-            self.initialize(session_id, hermes_home=self._hermes_home)
+    def ensure_initialized(self, session_id: str = "", **kwargs) -> None:
+        with self._lifecycle_lock:
+            if not self._initialized:
+                options = dict(kwargs)
+                options.setdefault("hermes_home", self._hermes_home)
+                self._initialize_locked(session_id, **options)
 
     def _effective_db_path(self) -> str:
         """Consolidated storage (plan D4): ``state.db`` under the unified data
@@ -346,19 +364,25 @@ class IncidentsService:
             return None
 
     def shutdown(self) -> None:
-        try:
-            if self._sync is not None:
-                self._sync.join(SYNC_JOIN_TIMEOUT)
-            self._prefetch.shutdown()
-            close = getattr(self._store, "close", None)
-            if callable(close):
-                close()
-        except Exception as e:
-            logger.warning("%s: shutdown error: %s", NAME, e)
-        finally:
-            self._store = None
-            self._client = None
-            self._initialized = False
+        with self._lifecycle_lock:
+            try:
+                if self._sync is not None:
+                    self._sync.join(SYNC_JOIN_TIMEOUT)
+                    if self._sync.is_running():
+                        logger.warning(
+                            "%s: shutdown deferred because sync is still running", NAME)
+                        return
+                self._prefetch.shutdown()
+                close = getattr(self._store, "close", None)
+                if callable(close):
+                    close()
+            except Exception as e:
+                logger.warning("%s: shutdown error: %s", NAME, e)
+            finally:
+                if not (self._sync and self._sync.is_running()):
+                    self._store = None
+                    self._client = None
+                    self._initialized = False
 
     # -- background ingest ---------------------------------------------------
 
@@ -406,6 +430,11 @@ class IncidentsService:
         except Exception as e:
             logger.warning("%s: sync trigger failed to spawn: %s", NAME, e)
 
+    def trigger_sync_for_context(self, agent_context=None) -> None:
+        """Trigger only from the foreground writer context."""
+        if self._is_writable_context(agent_context):
+            self.trigger_sync()
+
     def sync_turn(self, user_content: str, assistant_content: str, *,
                   session_id: str = "", messages: list[dict[str, Any]] | None = None) -> None:
         """Legacy-shaped alias for :meth:`trigger_sync` (kept for the ported suite)."""
@@ -415,7 +444,9 @@ class IncidentsService:
         """``on_session_start`` hook body: (re)load config and kick a background
         sync when credentials resolve; silent no-op otherwise. Never raises."""
         try:
-            self.initialize(session_id, hermes_home=self._hermes_home)
+            options = dict(kwargs)
+            options.setdefault("hermes_home", self._hermes_home)
+            self.initialize(session_id, **options)
         except Exception as e:
             logger.warning("%s: session-start initialize failed: %s", NAME, e)
 
@@ -471,7 +502,10 @@ class IncidentsService:
         try:
             if not user_message or not self._context_injection_enabled():
                 return None
-            self.ensure_initialized()
+            self.ensure_initialized(
+                session_id=kwargs.get("session_id", ""),
+                agent_context=kwargs.get("agent_context"),
+            )
             text = self.prefetch(str(user_message))
             return {"context": text} if text else None
         except Exception:
@@ -585,10 +619,12 @@ def register(ctx) -> IncidentsService:
     def make_handler(tool_name: str):
         def handler(args, **kwargs):
             try:
-                service.ensure_initialized(kwargs.get("session_id") or "")
+                agent_context = kwargs.get("agent_context")
+                service.ensure_initialized(
+                    kwargs.get("session_id") or "", agent_context=agent_context)
                 # Reads piggyback a debounced background refresh (plan D1) —
                 # never blocking, never on the response path.
-                service.trigger_sync()
+                service.trigger_sync_for_context(agent_context)
                 return service.handle_tool_call(tool_name, args, **kwargs)
             except Exception:
                 logger.exception("%s: %s failed", NAME, tool_name)

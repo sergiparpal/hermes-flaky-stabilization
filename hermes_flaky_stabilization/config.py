@@ -31,8 +31,10 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -150,7 +152,8 @@ def _coerce(section: str, key: str, value: Any, default: Any) -> Any:
         return value if isinstance(value, int) and not isinstance(value, bool) else default
     if isinstance(default, float):
         is_num = isinstance(value, (int, float)) and not isinstance(value, bool)
-        return float(value) if is_num else default
+        numeric = float(value) if is_num else default
+        return numeric if math.isfinite(numeric) else default
     if isinstance(default, str):
         return value if isinstance(value, str) else default
     if isinstance(default, list):
@@ -228,3 +231,37 @@ def write_config(cfg: dict[str, Any], data_dir: Path | None = None) -> Path:
             pass
         raise
     return path
+
+
+@contextmanager
+def _config_lock(data_dir: Path | None = None):
+    """Cross-process advisory lock for read-modify-write config updates."""
+    lock_path = config_path(data_dir).with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        try:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass
+        yield
+
+
+def update_section(section: str, updates: dict[str, Any],
+                   data_dir: Path | None = None) -> dict[str, Any]:
+    """Atomically merge one section without losing concurrent section writes."""
+    with _config_lock(data_dir):
+        path = config_path(data_dir)
+        whole: dict[str, Any] = {}
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                whole = loaded
+        except (OSError, ValueError, TypeError):
+            pass
+        current = whole.get(section)
+        merged = {**(current if isinstance(current, dict) else {}), **updates}
+        whole[section] = merged
+        write_config(whole, data_dir)
+        return merged

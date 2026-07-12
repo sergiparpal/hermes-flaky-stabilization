@@ -359,7 +359,8 @@ class TestStrictEgressCanary:
         monkeypatch.setenv("HERMES_JIRA_STRICT_REDACTION", "1")
         with caplog.at_level(logging.WARNING, logger="jira_incidents"):
             ret = provider._egress_guard("contact a@b.com now", "unit-test")
-        assert ret == "contact a@b.com now"  # never mutates
+        assert ret != "contact a@b.com now"
+        assert "a@b.com" not in ret
         assert any("residual PII" in r.getMessage() for r in caplog.records)
 
     def test_canary_silent_when_disabled(self, provider, monkeypatch, caplog):

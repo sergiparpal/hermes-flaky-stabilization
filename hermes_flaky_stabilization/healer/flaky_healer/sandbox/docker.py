@@ -23,6 +23,7 @@ from .base import (
     execute_phase,
     tail,
 )
+from .subproc import _bounded_wait
 
 # docker-CLI exit codes that mean the CONTAINER NEVER RAN the test command:
 # 125 = the docker daemon/CLI itself errored, 126 = the command cannot be
@@ -123,35 +124,36 @@ class DockerSandbox:
         cmd = self.build_command(work_dir, test_id, name)
         start = time.monotonic()
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            output, timed_out = _bounded_wait(proc, timeout_s)
+            text = output.decode("utf-8", "replace")
+            if timed_out:
+                try:
+                    subprocess.run(
+                        [self.docker_bin, "kill", name], capture_output=True, timeout=30
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                return RunResult(
+                    exit_code=-1,
+                    duration_s=time.monotonic() - start,
+                    timed_out=True,
+                    stdout_tail=tail(text),
+                )
             if proc.returncode in _DOCKER_INFRA_EXIT_CODES:
                 raise SandboxError(
                     "docker sandbox infrastructure failure (docker exited "
                     f"{proc.returncode}; the test never ran): "
-                    f"{tail(proc.stderr or proc.stdout, 500)}"
+                    f"{tail(text, 500)}"
                 )
             return RunResult(
                 exit_code=proc.returncode,
                 duration_s=time.monotonic() - start,
-                stdout_tail=tail(proc.stdout + proc.stderr),
+                stdout_tail=tail(text),
             )
-        except subprocess.TimeoutExpired as exc:
-            try:  # best-effort container kill; --rm reaps it, never mask the timeout
-                subprocess.run(
-                    [self.docker_bin, "kill", name], capture_output=True, timeout=30
-                )
-            except (OSError, subprocess.SubprocessError):
-                pass
-            return RunResult(
-                exit_code=-1,
-                duration_s=time.monotonic() - start,
-                timed_out=True,
-                stdout_tail=tail(
-                    (exc.stdout or b"").decode("utf-8", "replace")
-                    if isinstance(exc.stdout, bytes)
-                    else (exc.stdout or "")
-                ),
-            )
+        except OSError as exc:
+            raise SandboxError(f"cannot launch docker sandbox: {exc}") from exc
 
     def run_test(self, repo_dir, test_id: str, repeats: int = 1, timeout_s: int = 180,
                  prepare=None):

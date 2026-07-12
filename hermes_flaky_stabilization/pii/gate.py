@@ -76,23 +76,26 @@ def assert_evidence_clean(paths: list[str] | None,
         max_files = _configured_max_files()
     for raw in paths or []:
         path = str(raw)
-        result.checked_paths.append(path)
+        safe_path = scanner.mask_pii(path)
+        result.checked_paths.append(safe_path)
         try:
             scan_result = scanner.scan(path, None, max_files)
         except Exception as exc:  # fail closed — an unscannable path is unsafe
             result.ok = False
-            result.errors.append(f"{path}: scan failed ({type(exc).__name__})")
+            result.errors.append(
+                f"{safe_path}: scan failed ({type(exc).__name__})")
             continue
         if not scan_result.get("success"):
             result.ok = False
-            result.errors.append(f"{path}: {scan_result.get('error', 'scan error')}")
+            safe_error = scanner.mask_pii(str(scan_result.get("error", "scan error")))
+            result.errors.append(f"{safe_path}: {safe_error}")
             continue
         if not scan_result.get("clean"):
             result.ok = False
-            result.dirty_paths.append(path)
+            result.dirty_paths.append(safe_path)
             for kind, count in (scan_result.get("summary") or {}).items():
                 result.findings_summary[kind] = result.findings_summary.get(kind, 0) + count
         if not scan_result.get("complete"):
             result.ok = False
-            result.incomplete_paths.append(path)
+            result.incomplete_paths.append(safe_path)
     return result

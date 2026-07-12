@@ -87,7 +87,7 @@ def test_failure_lookup_matched_tests_flags_multi_test_fts(db):
     db.commit()
     # 'login' is not an exact test name -> FTS fallback matches both tests.
     r = queries.test_failure_lookup(db, "login")
-    assert r["matched_tests"] == 2 and r["total_runs"] == 2 and r["failure_count"] == 2
+    assert r["matched_tests"] == 2 and r["total_runs"] == 1 and r["failure_count"] == 1
     # An exact id resolves to exactly one test.
     assert queries.test_failure_lookup(db, "test_login_alpha")["matched_tests"] == 1
 

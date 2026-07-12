@@ -93,7 +93,7 @@ def compute_verdicts(rows, now, window_days, min_fails, include_errors) -> list[
         # the name column) would miss it. None is preserved (jest omits classname).
         classname = classname.strip() if isinstance(classname, str) else classname
         name = name.strip() if isinstance(name, str) else name
-        key = domain.make_test_key(classname, name)
+        key = domain.make_test_key(classname, name, file_path)
         agg = acc.get(key)
         if agg is None:
             agg = {

@@ -14,7 +14,7 @@ import logging
 import os
 from typing import Any
 
-from ..pii import redaction
+from ..pii import redaction, scanner
 from .config import NAME
 
 logger = logging.getLogger(__name__)
@@ -33,19 +33,20 @@ def guard(text: str, where: str) -> str:
 
     When strict mode is enabled, re-scan already-redacted output and log a
     warning if anything still looks like PII *or* like un-neutralised injection
-    residue (a control char / forged role marker) — both signs a redactor or the
-    neutraliser missed a case. Never raises and never mutates the payload —
-    redaction already ran; this only surfaces gaps so they can be fixed.
+    residue. Residual detector matches are masked before emission; strict mode
+    additionally logs the miss so the primary redactor can be improved.
     """
     try:
-        if text and strict_enabled() and (
-                redaction.contains_pii(text)
+        original = text
+        text = scanner.mask_pii(text) if text else text
+        if original and strict_enabled() and (
+                text != original or redaction.contains_pii(text)
                 or redaction.neutralization_needed(text)):
             logger.warning(
                 "%s: possible residual PII or injection marker on egress "
                 "path '%s'", NAME, where)
     except Exception:
-        pass
+        return text
     return text
 
 

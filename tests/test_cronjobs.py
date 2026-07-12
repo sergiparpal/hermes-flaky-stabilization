@@ -134,7 +134,7 @@ def test_create_job_nonzero_falls_back_to_printing_with_the_job_description(
 ):
     monkeypatch.setattr("subprocess.run",
                         lambda *a, **k: _fake_completed(1, stderr="gateway not configured"))
-    assert cronjobs.create_job(JIRA_JOB, "0 9 * * *", "local") == 0
+    assert cronjobs.create_job(JIRA_JOB, "0 9 * * *", "local") == 1
     out = capsys.readouterr().out
     assert "gateway not configured" in out
     assert "could not create the jira-sync job automatically" in out

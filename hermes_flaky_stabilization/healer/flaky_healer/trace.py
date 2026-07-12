@@ -15,6 +15,10 @@ import re
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
+
+from hermes_flaky_stabilization.common import secretscrub
+from hermes_flaky_stabilization.pii.scanner import mask_pii
 
 from .shapes import shape
 from .zipsafe import ZipBudget, ZipLimitError, guard_entry_count
@@ -25,6 +29,28 @@ _ERROR_NAME_RE = re.compile(r"\b([A-Z][A-Za-z]*Error)\b")
 
 # test-runner bookkeeping classes that are not browser actions
 _NON_ACTION_CLASSES = {"Test", "Tracing", "LocalUtils"}
+MAX_ACTIONS = 10_000
+MAX_REQUESTS = 10_000
+MAX_DOM_KEYS = 20_000
+MAX_CALL_LOG_LINES = 200
+MAX_TRACE_TEXT = 4_000
+
+
+def _safe_text(value) -> str:
+    text = _strip_ansi(str(value or ""))[:MAX_TRACE_TEXT]
+    return mask_pii(secretscrub.scrub_text(text))
+
+
+def _safe_url(value) -> str:
+    """Keep only scheme and authority; trace URLs may contain tokens/PII."""
+    try:
+        parsed = urlsplit(str(value or ""))
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return "[redacted-url]"
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        return mask_pii(f"{parsed.scheme}://{parsed.hostname}{port}")
+    except (TypeError, ValueError):
+        return "[redacted-url]"
 
 
 @dataclass
@@ -82,14 +108,14 @@ class TraceSummary:
             "framework": self.framework,
             "trace_version": self.trace_version,
             "failing_action": self.failing_action,
-            "selector": self.selector,
+            "selector": _safe_text(self.selector),
             "timeout_ms": self.timeout_ms,
             "error_name": self.error_name,
             "error_message": (self.error_message or "")[:500],
             "timed_out": self.timed_out,
             "selector_resolved": self.selector_resolved,
-            "testid_on_target": self.testid_on_target,
-            "dom_testids": sorted(self.dom_testids),
+            "testid_on_target": _safe_text(self.testid_on_target),
+            "dom_testids": [_safe_text(v) for v in sorted(self.dom_testids)],
             "pending_requests": [
                 {"url": r.url, "method": r.method, "status": r.status}
                 for r in self.pending_requests
@@ -229,6 +255,8 @@ def _ingest_before(ev: dict, summary: TraceSummary, calls: dict, order: list) ->
         return
     if call_id in calls:  # duplicate before for the same id: keep the first
         return
+    if len(calls) >= MAX_ACTIONS:
+        return
     params = ev.get("params")
     if not isinstance(params, dict):
         params = {}
@@ -241,7 +269,7 @@ def _ingest_before(ev: dict, summary: TraceSummary, calls: dict, order: list) ->
         selector=selector if isinstance(selector, str) else None,
         timeout_ms=timeout if isinstance(timeout, int | float) else None,
         start_ms=ev.get("startTime"),
-        params=params,
+        params={},
     )
     calls[call_id] = action
     order.append(call_id)
@@ -262,7 +290,7 @@ def _ingest_after(ev: dict, summary: TraceSummary, calls: dict, order: list) -> 
         result = {}
     if error:
         message = str(error.get("message") or "")
-        action.error_message = _strip_ansi(message)
+        action.error_message = _safe_text(message)
         action.error_name = _resolve_error_name(error, result, message)
         action.timed_out = bool(
             result.get("timedOut")
@@ -270,14 +298,16 @@ def _ingest_after(ev: dict, summary: TraceSummary, calls: dict, order: list) -> 
         )
     log = result.get("log")
     if isinstance(log, list):
-        for line in log:
-            action.call_log.append(_strip_ansi(str(line)).strip())
+        for line in log[:MAX_CALL_LOG_LINES]:
+            if len(action.call_log) >= MAX_CALL_LOG_LINES:
+                break
+            action.call_log.append(_safe_text(line).strip())
 
 
 def _ingest_log(ev: dict, summary: TraceSummary, calls: dict, order: list) -> None:
     action = calls.get(ev.get("callId") or "")
-    if action is not None:
-        action.call_log.append(_strip_ansi(str(ev.get("message") or "")).strip())
+    if action is not None and len(action.call_log) < MAX_CALL_LOG_LINES:
+        action.call_log.append(_safe_text(ev.get("message")).strip())
 
 
 def _ingest_frame_snapshot(ev: dict, summary: TraceSummary, calls: dict, order: list) -> None:
@@ -286,10 +316,12 @@ def _ingest_frame_snapshot(ev: dict, summary: TraceSummary, calls: dict, order: 
         return
     for _tag, attrs in _walk_html(snapshot.get("html")):
         testid = attrs.get("data-testid")
-        if testid and testid not in summary.dom_testids:
+        if (testid and testid not in summary.dom_testids
+                and len(summary.dom_testids) < MAX_DOM_KEYS):
             summary.dom_testids[testid] = dict(attrs)
         el_id = attrs.get("id")
-        if el_id and el_id not in summary.dom_ids:
+        if (el_id and el_id not in summary.dom_ids
+                and len(summary.dom_ids) < MAX_DOM_KEYS):
             # Only the element's data-testid is read downstream
             # (_match_testid_for_selector); storing that alone avoids copying
             # every id-bearing element's full attribute dict on a large DOM.
@@ -297,7 +329,7 @@ def _ingest_frame_snapshot(ev: dict, summary: TraceSummary, calls: dict, order: 
 
 
 def _ingest_error(ev: dict, summary: TraceSummary, calls: dict, order: list) -> None:
-    message = _strip_ansi(str(ev.get("message") or ""))
+    message = _safe_text(ev.get("message"))
     if message and not summary.test_error_message:
         summary.test_error_message = message
 
@@ -325,6 +357,8 @@ def _ingest_trace_event(ev: dict, summary: TraceSummary, calls: dict, order: lis
 def _ingest_network_event(ev: dict, summary: TraceSummary) -> None:
     if ev.get("type") != "resource-snapshot":
         return
+    if len(summary.requests) >= MAX_REQUESTS:
+        return
     snap = ev.get("snapshot")
     if not isinstance(snap, dict):
         return
@@ -335,8 +369,8 @@ def _ingest_network_event(ev: dict, summary: TraceSummary) -> None:
     pending = (isinstance(duration, int | float) and duration < 0) or not status
     summary.requests.append(
         NetworkRequest(
-            url=request.get("url") or "",
-            method=request.get("method") or "GET",
+            url=_safe_url(request.get("url")),
+            method=_safe_text(request.get("method") or "GET")[:16],
             status=status if status else None,
             duration_ms=duration,
             pending=pending,

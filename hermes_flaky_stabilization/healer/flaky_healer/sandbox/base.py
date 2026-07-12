@@ -102,14 +102,14 @@ def _hardlink_or_copy(src: str, dst: str) -> None:
 def copy_project(src: Path | str, dst: Path | str) -> Path:
     """Copy a Playwright project (incl. node_modules, excl. artifacts/VCS).
 
-    Byte-copies by default; hardlinks files when ``FLAKY_HEALER_HARDLINK_COPY``
-    is set (see ``config.hardlink_copy`` for the safety rationale).
+    Always byte-copies files. A hardlinked sandbox can mutate the source project
+    when a tool writes in place, so hardlinks are not a valid isolation mode.
     """
     src, dst = Path(src), Path(dst)
     if not src.is_dir():
         raise SandboxError(f"project directory does not exist: {src}")
-    copy_function = _hardlink_or_copy if config.hardlink_copy() else shutil.copy2
-    shutil.copytree(src, dst, symlinks=True, ignore=_copy_ignore, copy_function=copy_function)
+    shutil.copytree(src, dst, symlinks=True, ignore=_copy_ignore,
+                    copy_function=shutil.copy2)
     return dst
 
 

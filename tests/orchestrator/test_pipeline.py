@@ -208,9 +208,10 @@ def test_stable_heal_feeds_burnin_back_into_history(tmp_path):
     p, _ = _pipeline(calls, category="flaky", heal_stable=True)
     out = p.run({"log_url_or_path": _log(tmp_path), "test_id": "shop.cart::kw_checkout",
                  "repo_dir": "."})
-    synth = next(c for c in calls if c[0] == "ingest_synthetic")
-    cases = synth[1]["cases"]
-    assert len(cases) == 3 and all(c["status"] == "passed" for c in cases)
+    synths = [c for c in calls if c[0] == "ingest_synthetic"]
+    assert len(synths) == 3
+    cases = synths[0][1]["cases"]
+    assert len(cases) == 1 and cases[0]["status"] == "passed"
     assert cases[0]["classname"] == "shop.cart" and cases[0]["name"] == "kw_checkout"
     assert any("fed back into test history" in n for n in out["notes"])
 
@@ -343,11 +344,10 @@ def test_burnin_feedback_reads_the_real_heal_envelope(tmp_path):
     p, _ = _pipeline(calls, category="flaky", heal_stable=True, heal_runs=7)
     out = p.run({"log_url_or_path": _log(tmp_path), "test_id": "t", "repo_dir": "."})
     assert out["outcome"] == "healed"
-    synth = next(c for c in calls if c[0] == "ingest_synthetic")
-    cases = synth[1]["cases"]
-    assert len(cases) == 7                      # not 1: the real burn-in count
-    assert all(c["status"] == "passed" for c in cases)
-    assert any("7 green case row(s)" in n for n in out["notes"])
+    synths = [c for c in calls if c[0] == "ingest_synthetic"]
+    assert len(synths) == 7
+    assert all(c[1]["cases"][0]["status"] == "passed" for c in synths)
+    assert any("7 synthetic green run(s)" in n for n in out["notes"])
 
 
 # --- outbound ticket: title redaction + the egress canary (D7/D6.4b) ------------------
@@ -497,8 +497,9 @@ def test_build_id_with_path_separator_is_sanitized(tmp_path):
     evidence = out["stage_results"]["evidence"]
     assert evidence["source"] == "fetch_ci_logs"
     spooled = Path(evidence["log"])
-    assert spooled.name == "ci-log-123-456.log"
-    assert spooled.exists()
+    assert spooled.name.startswith("ci-log-123-456-")
+    assert spooled.suffix == ".log"
+    assert spooled.parent == Path(".")
     assert ledger  # the run completed and was recorded
 
 
@@ -633,7 +634,7 @@ def test_synthetic_run_visible_via_test_failure_lookup(profile_env):
          "file_path": "src/c.py", "status": "passed"}] * 5)
 
     after = json.loads(_handle_test_failure_lookup({"test_id": "kw_checkout"}))
-    assert after["total_runs"] == 6              # 1 failed + 5 synthetic green
+    assert after["total_runs"] == 2              # two distinct test runs
     assert after["failure_count"] == before["failure_count"]
     storage.reset_for_tests()
 

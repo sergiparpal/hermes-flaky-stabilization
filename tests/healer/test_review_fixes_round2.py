@@ -80,7 +80,7 @@ class TestApplyOpsBreaksHardlinks:
         original = src / "tests" / "t.spec.ts"
         original.write_text(self.ORIGINAL)
         work = copy_project(src, tmp_path / "work")
-        assert original.stat().st_nlink == 2, "sanity: the copy hardlinked the spec"
+        assert original.stat().st_nlink == 1
         apply_ops(work, [self.OP])
         assert original.read_text() == self.ORIGINAL
         assert "timeout: 6000" in (work / "tests" / "t.spec.ts").read_text()
@@ -119,7 +119,9 @@ class TestAwaitStatePrettierWrapped:
         assert ops[0].anchor == "  await expect(", (
             "the insert must anchor at the statement start, not mid-expression"
         )
-        assert ops[0].new == "  await page.waitForLoadState('networkidle');"
+        assert ops[0].new == (
+            '  await page.locator("#btn").waitFor({ state: \'visible\' });'
+        )
 
     def test_patched_source_stays_syntactic(self, tmp_path):
         (tmp_path / "t.spec.ts").write_text(self.PRETTIER_SOURCE)
@@ -127,7 +129,8 @@ class TestAwaitStatePrettierWrapped:
         ops = strategy.plan(self.PRETTIER_SOURCE, self.DIAG, None, "t.spec.ts")
         changes = apply_ops(tmp_path, ops)
         lines = changes["t.spec.ts"][1].splitlines()
-        idx = lines.index("  await page.waitForLoadState('networkidle');")
+        idx = lines.index(
+            '  await page.locator("#btn").waitFor({ state: \'visible\' });')
         assert lines[idx + 1] == "  await expect(", (
             "the wait must precede the whole statement, never split it"
         )
@@ -149,7 +152,7 @@ class TestAwaitStatePrettierWrapped:
 
     def test_idempotent_after_reanchored_patch(self):
         source = (
-            "  await page.waitForLoadState('networkidle');\n"
+            '  await page.locator("#btn").waitFor({ state: \'visible\' });\n'
             "  await expect(\n"
             "    page.locator('#btn')\n"
             "  ).toBeVisible();\n"
@@ -180,26 +183,32 @@ class TestBumpTimeoutMultilineSetTimeout:
 
 class TestDockerInfraExitCodes:
     @staticmethod
-    def _fake_run(returncode):
-        def fake_run(cmd, **kwargs):
-            return subprocess.CompletedProcess(
-                cmd, returncode, stdout="", stderr="docker: Error response from daemon"
-            )
+    def _fake_popen(returncode):
+        class FakeProcess:
+            def __init__(self):
+                self.returncode = returncode
+                self.stdout = io.BytesIO(b"docker: Error response from daemon")
 
-        return fake_run
+            def poll(self):
+                return self.returncode
+
+            def communicate(self, timeout=None):
+                return self.stdout.getvalue(), None
+
+        return lambda *args, **kwargs: FakeProcess()
 
     @pytest.mark.parametrize("code", [125, 126, 127])
     def test_docker_cli_infra_exit_codes_raise(self, monkeypatch, tmp_path, code):
         from flaky_healer.sandbox import docker as docker_mod
 
-        monkeypatch.setattr(docker_mod.subprocess, "run", self._fake_run(code))
+        monkeypatch.setattr(docker_mod.subprocess, "Popen", self._fake_popen(code))
         with pytest.raises(SandboxError, match="infrastructure"):
             DockerSandbox(image="img")._run_once(tmp_path, "t.spec.ts", timeout_s=5)
 
     def test_ordinary_test_failure_still_returns_run_result(self, monkeypatch, tmp_path):
         from flaky_healer.sandbox import docker as docker_mod
 
-        monkeypatch.setattr(docker_mod.subprocess, "run", self._fake_run(1))
+        monkeypatch.setattr(docker_mod.subprocess, "Popen", self._fake_popen(1))
         result = DockerSandbox(image="img")._run_once(tmp_path, "t.spec.ts", timeout_s=5)
         assert result.exit_code == 1 and not result.passed
 

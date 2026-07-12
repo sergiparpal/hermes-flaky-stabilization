@@ -219,23 +219,15 @@ class PatternStore:
         """
         ts = _iso_now(now)
         sample = (excerpt or "")[:_SAMPLE_CHARS]
-        existing = self.conn.execute(
-            "SELECT occurrences FROM triage_patterns WHERE project=? AND signature=?",
-            (project, signature),
-        ).fetchone()
-        if existing is None:
-            self.conn.execute(
-                "INSERT INTO triage_patterns "
-                "(project, signature, category, occurrences, first_seen, last_seen, sample) "
-                "VALUES (?, ?, ?, 1, ?, ?, ?)",
-                (project, signature, category, ts, ts, sample),
-            )
-        else:
-            self.conn.execute(
-                "UPDATE triage_patterns SET occurrences=occurrences+1, last_seen=?, "
-                "category=?, sample=? WHERE project=? AND signature=?",
-                (ts, category, sample, project, signature),
-            )
+        self.conn.execute(
+            "INSERT INTO triage_patterns "
+            "(project, signature, category, occurrences, first_seen, last_seen, sample) "
+            "VALUES (?, ?, ?, 1, ?, ?, ?) "
+            "ON CONFLICT(project, signature) DO UPDATE SET "
+            "occurrences=triage_patterns.occurrences+1, last_seen=excluded.last_seen, "
+            "category=excluded.category, sample=excluded.sample",
+            (project, signature, category, ts, ts, sample),
+        )
         self._fts_delete(project, signature)
         self._fts_insert(project, signature, sample)
         self.conn.commit()

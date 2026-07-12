@@ -148,14 +148,14 @@ def register(ctx, *, incidents_service) -> None:
 
     def on_pre_llm_call(user_message: str = "", **kwargs):
         try:
-            return incidents_service.llm_context(user_message)
+            return incidents_service.llm_context(user_message, **kwargs)
         except Exception:  # defensive: the service already guards internally
             logger.debug("incident context injection failed", exc_info=True)
             return None
 
     def on_session_start(session_id: str = "", **kwargs):
         try:
-            incidents_service.on_session_start(session_id)
+            incidents_service.on_session_start(session_id, **kwargs)
         except Exception:
             logger.debug("session-start sync trigger failed", exc_info=True)
         return None

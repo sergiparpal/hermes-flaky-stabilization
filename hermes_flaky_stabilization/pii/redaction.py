@@ -133,10 +133,10 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # US SSN. Space- and dash-separated (env dumps and prose use either); the
     # separator class is [ \t\-] so the match cannot span a newline.
     (_compile(r"\b\d{3}[ \t\-]\d{2}[ \t\-]\d{4}\b"), SSN_TOKEN),
-    # Credit-card-like 13–16 digit groups (with optional spaces/dashes).
+    # Credit-card-like 13–19 digit groups (with optional spaces/dashes).
     # Anchored to start and end on a digit so a trailing separator (and the
     # following word) is not swallowed into the match.
-    (_compile(r"\b\d(?:[ \-]?\d){12,15}\b"), CARD_TOKEN),
+    (_compile(r"\b\d(?:[ \-]?\d){12,18}\b"), CARD_TOKEN),
 
     # --- IPv4 addresses --------------------------------------------------
     (_compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b"), IP_TOKEN),

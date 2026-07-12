@@ -138,16 +138,16 @@ def validate_cron_schedule(schedule: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def make_test_key(classname, name) -> str:
+def make_test_key(classname, name, file_path=None) -> str:
     """Canonical identity for a test: ``"{classname}::{name}"``.
 
-    When ``classname`` is NULL/empty (some emitters, e.g. jest, omit it) the key
-    is ``"::{name}"`` so the test is still uniquely addressable by name. ``name``
-    is required by the test-history schema, so it is never empty.
+    When ``classname`` is absent, ``file_path`` becomes the namespace. This
+    prevents same-named Jest tests in different files from collapsing together.
     """
     cls = (classname or "").strip()
     nm = (name or "").strip()
-    return f"{cls}::{nm}"
+    namespace = cls or (file_path or "").strip()
+    return f"{namespace}::{nm}"
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ a sibling parser producing the same ``ParsedRun`` — without touching the write
 """
 
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -96,9 +97,10 @@ def _to_float(value: str | None) -> float | None:
     if value is None:
         return None
     try:
-        return float(value)
+        result = float(value)
     except (ValueError, TypeError):
         return None
+    return result if math.isfinite(result) else None
 
 
 def _normalize_iso(value: str | None) -> str | None:
@@ -268,8 +270,11 @@ def _resolve_suite_name(root, suites, path: Path) -> str:
     )
 
 
-def _resolve_run_timestamp(suites, path: Path) -> str | None:
-    """First parseable suite ``@timestamp``, falling back to the file's mtime."""
+def _resolve_run_timestamp(root, suites, path: Path) -> str | None:
+    """Root timestamp, then first suite timestamp, then the file mtime."""
+    root_timestamp = _normalize_iso(root.get("timestamp"))
+    if root_timestamp:
+        return root_timestamp
     for suite in suites:
         ts = _normalize_iso(suite.get("timestamp"))
         if ts:
@@ -311,7 +316,7 @@ def parse_junit_xml(path: Path) -> ParsedRun:
         raise ValueError(f"not a JUnit XML document (root=<{root.tag}>, no testcases)")
 
     suite_name = _resolve_suite_name(root, suites, path)
-    run_timestamp = _resolve_run_timestamp(suites, path)
+    run_timestamp = _resolve_run_timestamp(root, suites, path)
     total, failures, errors, skipped = _aggregate_counts(root, top_suites, cases)
 
     return ParsedRun(

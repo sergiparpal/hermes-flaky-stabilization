@@ -16,27 +16,38 @@ from __future__ import annotations
 
 import functools
 import os
+import selectors
 import shutil
 import signal
 import subprocess
 import time
 from pathlib import Path
 
-try:  # POSIX-only; imported at module level so the forked child (see
-    import resource  # _rlimits) only does a sys.modules lookup — importing
-except ImportError:  # between fork and exec in a multi-threaded parent
-    resource = None  # (map_runs uses a thread pool) is a deadlock hazard.
+try:
+    import resource
+except ImportError:  # pragma: no cover - non-POSIX
+    resource = None
 
 from .. import config
 from .base import PLAYWRIGHT_ARGS, RunResult, SandboxError, execute_phase, tail
 
-_NPROC_TARGET = 4096
+_OUTPUT_TAIL_BYTES = 64 * 1024
 
 # Post-kill drain budget: after SIGKILLing the session we still communicate()
 # to collect output, but a test-spawned daemon that setsid'd away while
 # inheriting the stdout pipe would keep the pipe open forever — never block
 # the heal on it for more than this.
 _KILL_COMMUNICATE_TIMEOUT_S = 10
+
+
+def _rlimits() -> None:  # pragma: no cover - retained for embedders; not used by Popen
+    """Apply basic limits when an embedding host invokes this in a safe child."""
+    if resource is None:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ValueError, OSError):
+        pass
 
 
 @functools.lru_cache(maxsize=1)
@@ -72,22 +83,57 @@ def _netns_prefix() -> tuple[str, ...]:
     )
 
 
-def _rlimits() -> None:  # pragma: no cover - runs in the child process
-    # Runs between fork and exec: no imports here (module-level `resource`
-    # above is only a globals lookup) and nothing beyond the rlimit calls.
-    if resource is None:
-        return
+def _bounded_wait(proc: subprocess.Popen, timeout_s: int) -> tuple[bytes, bool]:
+    """Drain output without unbounded buffering; return tail and timeout flag."""
+    assert proc.stdout is not None
     try:
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    except (ValueError, OSError):
-        pass
+        fd = proc.stdout.fileno()
+    except (AttributeError, OSError):
+        try:
+            out, _ = proc.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired as exc:
+            out = exc.stdout or b""
+            if isinstance(out, str):
+                out = out.encode("utf-8", "replace")
+            return out[-_OUTPUT_TAIL_BYTES:], True
+        if isinstance(out, str):
+            out = out.encode("utf-8", "replace")
+        return out[-_OUTPUT_TAIL_BYTES:], False
+    os.set_blocking(fd, False)
+    selector = selectors.DefaultSelector()
+    selector.register(fd, selectors.EVENT_READ)
+    output = bytearray()
+    deadline = time.monotonic() + timeout_s
+    timed_out = False
     try:
-        soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
-        cap = _NPROC_TARGET if hard in (resource.RLIM_INFINITY, -1) else min(hard, _NPROC_TARGET)
-        if soft == resource.RLIM_INFINITY or soft > cap:
-            resource.setrlimit(resource.RLIMIT_NPROC, (cap, hard))
-    except (ValueError, OSError):
-        pass
+        while proc.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            for _key, _mask in selector.select(min(0.2, remaining)):
+                try:
+                    chunk = os.read(fd, 8192)
+                except BlockingIOError:
+                    continue
+                output.extend(chunk)
+                if len(output) > _OUTPUT_TAIL_BYTES:
+                    del output[:-_OUTPUT_TAIL_BYTES]
+        # Drain bytes already in the pipe, but never wait for an escaped child
+        # that inherited stdout after the runner itself exited.
+        while selector.select(0):
+            try:
+                chunk = os.read(fd, 8192)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > _OUTPUT_TAIL_BYTES:
+                del output[:-_OUTPUT_TAIL_BYTES]
+    finally:
+        selector.close()
+    return bytes(output), timed_out
 
 
 class SubprocessSandbox:
@@ -121,8 +167,6 @@ class SubprocessSandbox:
                 env=self.build_env(home),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                preexec_fn=_rlimits,
                 start_new_session=True,
             )
         except (FileNotFoundError, OSError) as exc:
@@ -133,40 +177,33 @@ class SubprocessSandbox:
                 f"subprocess sandbox infrastructure failure: cannot launch 'npx' "
                 f"(is Node.js installed and on PATH?): {exc}"
             ) from exc
-        try:
-            out, _ = proc.communicate(timeout=timeout_s)
+        out, timed_out = _bounded_wait(proc, timeout_s)
+        if not timed_out:
             return RunResult(
                 exit_code=proc.returncode,
                 duration_s=time.monotonic() - start,
-                stdout_tail=tail(out or ""),
+                stdout_tail=tail(out.decode("utf-8", "replace")),
             )
-        except subprocess.TimeoutExpired:
-            # kill the whole session: npx, the web server and browser children
+        # kill the whole session: npx, the web server and browser children
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.kill()
+        try:
+            proc.wait(timeout=_KILL_COMMUNICATE_TIMEOUT_S)
+        except (AttributeError, subprocess.TimeoutExpired):
+            pass
+        if proc.stdout is not None:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                proc.kill()
-            try:
-                out, _ = proc.communicate(timeout=_KILL_COMMUNICATE_TIMEOUT_S)
-            except subprocess.TimeoutExpired as exc:
-                # A daemon escaped the killed session but inherited our stdout
-                # pipe: draining would block forever. Close the pipes and return
-                # the timed-out result with whatever output was collected.
-                out = exc.stdout or ""
-                if isinstance(out, bytes):
-                    out = out.decode("utf-8", "replace")
-                for stream in (proc.stdout, proc.stderr, proc.stdin):
-                    if stream is not None:
-                        try:
-                            stream.close()
-                        except OSError:
-                            pass
-            return RunResult(
-                exit_code=-1,
-                duration_s=time.monotonic() - start,
-                timed_out=True,
-                stdout_tail=tail(out or ""),
-            )
+                proc.stdout.close()
+            except OSError:
+                pass
+        return RunResult(
+            exit_code=-1,
+            duration_s=time.monotonic() - start,
+            timed_out=True,
+            stdout_tail=tail(out.decode("utf-8", "replace")),
+        )
 
     def run_test(self, repo_dir, test_id: str, repeats: int = 1, timeout_s: int = 180,
                  prepare=None):

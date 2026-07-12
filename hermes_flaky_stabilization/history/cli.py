@@ -155,7 +155,11 @@ def _cmd_prune(args) -> int:
 
 def _cmd_rebuild_fts(args) -> int:
     conn = get_connection()
-    conn.execute("INSERT INTO test_cases_fts(test_cases_fts) VALUES('rebuild')")
+    try:
+        conn.execute("INSERT INTO test_cases_fts(test_cases_fts) VALUES('rebuild')")
+    except Exception as exc:  # SQLite build may not include FTS5
+        print(f"error: FTS5 index unavailable ({type(exc).__name__})", file=sys.stderr)
+        return 1
     conn.commit()
     print("FTS5 index rebuilt")
     return 0

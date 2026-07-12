@@ -28,6 +28,8 @@ from __future__ import annotations
 import os
 import socket
 import ssl
+import stat
+import time
 import urllib.error
 import urllib.request
 from collections import deque
@@ -169,7 +171,7 @@ def _timeout_error(url: str, timeout: float) -> LogFetchError:
     )
 
 
-def _read_capped(resp) -> tuple[bytes, bool]:
+def _read_capped(resp, *, deadline: float | None = None) -> tuple[bytes, bool]:
     """Read a response body, keeping the LAST :data:`MAX_LOG_BYTES` bytes.
 
     Tail-biased on purpose: the failure signal clusters at the end of a CI
@@ -181,6 +183,8 @@ def _read_capped(resp) -> tuple[bytes, bool]:
     total = 0
     truncated = False
     while True:
+        if deadline is not None and time.monotonic() > deadline:
+            raise TimeoutError("log transfer exceeded its deadline")
         chunk = resp.read(_READ_CHUNK)
         if not chunk:
             break
@@ -255,20 +259,30 @@ def read_local(path: str) -> str:
             "Point log_url_or_path at a log file, not a directory, device, "
             "or pipe.",
         )
+    fd: int | None = None
     try:
-        size = p.stat().st_size
+        fd = os.open(
+            real, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0))
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("not a regular file")
+        size = info.st_size
     except OSError as exc:
+        if fd is not None:
+            os.close(fd)
         raise LogFetchError(
             f"Could not stat log file: {_safe_path(path)} ({type(exc).__name__})",
             _PERMS_HINT,
         )
     if size > MAX_LOG_BYTES:
+        os.close(fd)
         raise LogFetchError(
             f"Log file too large: {size} bytes (cap {MAX_LOG_BYTES}).",
             "Pre-trim the log, or point at the specific failing job's log.",
         )
     try:
-        with p.open("rb") as fh:
+        with os.fdopen(fd, "rb") as fh:
             data = fh.read(MAX_LOG_BYTES)
     except OSError as exc:
         raise LogFetchError(
@@ -322,8 +336,9 @@ def _fetch_remote(url: str, *, timeout: float = DEFAULT_TIMEOUT) -> tuple[str, b
     context = ssl.create_default_context()
     opener = safehttp.build_opener(context)
     try:
+        deadline = time.monotonic() + timeout
         with opener.open(request, timeout=timeout) as resp:
-            data, truncated = _read_capped(resp)
+            data, truncated = _read_capped(resp, deadline=deadline)
         return data.decode("utf-8", errors="replace"), truncated
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
@@ -348,7 +363,8 @@ def _fetch_remote(url: str, *, timeout: float = DEFAULT_TIMEOUT) -> tuple[str, b
         if isinstance(reason, (TimeoutError, socket.timeout)):
             raise _timeout_error(url, timeout)
         raise LogFetchError(
-            f"Network error fetching {safehttp.safe_url(url)}: {reason}",
+            f"Network error fetching {safehttp.safe_url(url)} "
+            f"({type(reason).__name__}).",
             "Check connectivity and that the host is reachable.",
         )
 

@@ -129,7 +129,7 @@ def test_create_failure_falls_back_to_printing(profile_env, capsys, monkeypatch)
         return SimpleNamespace(returncode=1, stdout="", stderr="gateway not configured")
 
     monkeypatch.setattr("subprocess.run", fake_run)
-    assert _run(["install-cron", "--deliver", "local"]) == 0
+    assert _run(["install-cron", "--deliver", "local"]) == 1
     out = capsys.readouterr().out
     assert "gateway not configured" in out
     assert "hermes cron create" in out

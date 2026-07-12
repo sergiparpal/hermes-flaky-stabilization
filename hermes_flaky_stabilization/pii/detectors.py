@@ -173,7 +173,7 @@ def _validated_finder(
     name: str,
     pattern: re.Pattern[str],
     is_valid: Callable[[re.Match[str]], bool],
-) -> Callable[[str], list[Match]]:
+) -> Callable[..., list[Match]]:
     """Build a detector from a regex plus a validator run on each regex match.
 
     Precision over recall: every detector that *can* check its hits against a
@@ -201,12 +201,14 @@ def _validated_finder(
     digit run must be phone-shaped", so retrying inside a rejected run would
     re-admit every sub-window and read ``100 200 300 400`` as a phone number.
     """
-    def find(text: str) -> list[Match]:
+    def find(text: str, limit: int | None = None) -> list[Match]:
         out: list[Match] = []
         pos = 0
         while (m := pattern.search(text, pos)) is not None:
             if is_valid(m):
                 out.append(Match(name, m.start(), m.end(), m.group(0)))
+                if limit is not None and len(out) >= limit:
+                    break
                 # max(): a zero-width match would otherwise never advance.
                 pos = max(m.end(), m.start() + 1)
             else:
@@ -235,7 +237,7 @@ find_us_itin = _validated_finder("us_itin", _SSN_LIKE_RE, lambda m: _itin_ok(*m.
 # phone and passport carry no checksum, so neither fits the pattern+validator
 # mould above; both need bespoke gating and correspondingly closer scrutiny.
 
-def find_phone(text: str) -> list[Match]:
+def find_phone(text: str, limit: int | None = None) -> list[Match]:
     # Ordinary logs are dense in phone-shaped-but-not-phone tokens (a
     # `YYYY-MM-DD HH:MM:SS` stamp carries a 10-digit run with separators), so the
     # rejection path runs far more often than the accept path and the cheapest
@@ -271,10 +273,12 @@ def find_phone(text: str) -> list[Match]:
         # phone numbers — they are placeholders or padding.
         if ok and len(set(digits)) > 1:
             out.append(Match("phone", m.start(), m.end(), raw))
+            if limit is not None and len(out) >= limit:
+                break
     return out
 
 
-def find_passport(text: str) -> list[Match]:
+def find_passport(text: str, limit: int | None = None) -> list[Match]:
     """Context-gated: report passport-shaped tokens that follow a
     ``passport``-family keyword within a short window. Passport numbers carry
     no universal checksum, so requiring context keeps false positives low.
@@ -301,6 +305,8 @@ def find_passport(text: str) -> list[Match]:
                 continue
             seen.add((start, end))
             out.append(Match("passport", start, end, text[start:end]))
+            if limit is not None and len(out) >= limit:
+                return out
     return out
 
 
@@ -384,7 +390,7 @@ class Detector:
     """
 
     name: str
-    find: Callable[[str], list[Match]]
+    find: Callable[..., list[Match]]
     priority: int  # lower wins when two detectors claim overlapping spans
     mask: Callable[[str], str]
 
@@ -552,7 +558,8 @@ def _dedupe(matches: list[Match]) -> list[Match]:
     return _claim_non_overlapping(_drop_contained(matches))
 
 
-def run_detectors(text: str, types: list[str] | None = None) -> list[Finding]:
+def run_detectors(text: str, types: list[str] | None = None,
+                  limit: int | None = None) -> list[Finding]:
     """Run the selected detectors over *text* and return masked ``Finding``s.
 
     *types* restricts the run to a subset of detector names; unknown names are
@@ -567,8 +574,9 @@ def run_detectors(text: str, types: list[str] | None = None) -> list[Finding]:
         selected = [name for name in DETECTOR_NAMES if name in wanted]
     matches: list[Match] = []
     for name in selected:
-        matches.extend(DETECTORS[name].find(text))
-    return [
+        matches.extend(DETECTORS[name].find(text, limit))
+    findings = [
         Finding(m.type, m.start, m.end, mask(m.type, m.raw))
         for m in _dedupe(matches)
     ]
+    return findings[:limit] if limit is not None else findings

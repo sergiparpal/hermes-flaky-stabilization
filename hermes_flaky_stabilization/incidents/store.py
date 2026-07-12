@@ -153,6 +153,8 @@ class IncidentStore:
                 logger.warning(
                     "incidents FTS5 mirror unavailable (%s); search falls back "
                     "to LIKE scans", e)
+            if self.fts_available:
+                self._repair_fts_mirror()
             self._conn.commit()
 
     def _create_fts(self) -> None:
@@ -165,6 +167,22 @@ class IncidentStore:
                 tokenize = 'unicode61'
             )
             """
+        )
+
+    def _repair_fts_mirror(self) -> None:
+        """Backfill or rebuild an incomplete/duplicated FTS mirror."""
+        base_count = int(self._conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0])
+        fts_count = int(self._conn.execute("SELECT COUNT(*) FROM incidents_fts").fetchone()[0])
+        missing = self._conn.execute(
+            "SELECT 1 FROM incidents i WHERE NOT EXISTS ("
+            "SELECT 1 FROM incidents_fts f WHERE f.key=i.key) LIMIT 1"
+        ).fetchone()
+        if fts_count == base_count and missing is None:
+            return
+        self._conn.execute("DELETE FROM incidents_fts")
+        self._conn.execute(
+            "INSERT INTO incidents_fts(key, summary, status, root_cause, body) "
+            "SELECT key, summary, status, root_cause, body FROM incidents"
         )
 
     # -- writes --------------------------------------------------------------
@@ -244,12 +262,12 @@ class IncidentStore:
         row = self._prepare_row(incident)
         key = row["key"]
         with self._lock:
-            self._conn.execute(self._UPSERT_SQL, row)
-            if self.fts_available:
-                # Refresh the FTS mirror row (rowid-targeted, not a full scan).
-                self._conn.execute(self._FTS_DELETE_SQL, self._fts_delete_params(key))
-                self._conn.execute(self._FTS_INSERT_SQL, row)
-            self._conn.commit()
+            with self._conn:
+                self._conn.execute(self._UPSERT_SQL, row)
+                if self.fts_available:
+                    # Refresh the FTS mirror row (rowid-targeted, not a full scan).
+                    self._conn.execute(self._FTS_DELETE_SQL, self._fts_delete_params(key))
+                    self._conn.execute(self._FTS_INSERT_SQL, row)
             self._count_cache = None
         return key
 
@@ -264,27 +282,32 @@ class IncidentStore:
         per page keeps the bulk load to a single fsync. Per-row mapping errors
         are skipped.
         """
-        rows = []
+        # Jira should not repeat a key within one page, but a proxy/server bug must
+        # not create duplicate standalone-FTS rows. Last occurrence wins, matching
+        # the base table's ON CONFLICT behavior.
+        prepared: dict[str, dict[str, Any]] = {}
         for inc in incidents:
             try:
-                rows.append(self._prepare_row(inc))
+                row = self._prepare_row(inc)
+                prepared[row["key"]] = row
             except Exception:
                 continue
+        rows = list(prepared.values())
         if not rows:
             return 0
         with self._lock:
             changed = self._changed_rows(rows)
             if changed:
-                self._conn.executemany(self._UPSERT_SQL, changed)
-                if self.fts_available:
-                    # Refresh the FTS mirror only for the rows that changed,
-                    # locating each mirror row by indexed MATCH + rowid rather
-                    # than a full virtual-table scan per key.
-                    self._conn.executemany(
-                        self._FTS_DELETE_SQL,
-                        [self._fts_delete_params(r["key"]) for r in changed])
-                    self._conn.executemany(self._FTS_INSERT_SQL, changed)
-                self._conn.commit()
+                with self._conn:
+                    self._conn.executemany(self._UPSERT_SQL, changed)
+                    if self.fts_available:
+                        # Refresh the FTS mirror only for the rows that changed,
+                        # locating each mirror row by indexed MATCH + rowid rather
+                        # than a full virtual-table scan per key.
+                        self._conn.executemany(
+                            self._FTS_DELETE_SQL,
+                            [self._fts_delete_params(r["key"]) for r in changed])
+                        self._conn.executemany(self._FTS_INSERT_SQL, changed)
                 self._count_cache = None
         return len(changed)
 

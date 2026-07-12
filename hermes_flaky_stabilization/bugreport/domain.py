@@ -41,6 +41,16 @@ class ImprovedBugReport:
         if len(title) > schema.MAX_TITLE_CHARS:
             title = title[: schema.MAX_TITLE_CHARS - 1].rstrip() + "…"
         self.title = title
+        for field_name in (
+            "summary", "expected_behavior", "actual_behavior", "severity_rationale"
+        ):
+            value = getattr(self, field_name)
+            setattr(self, field_name, value[:schema.MAX_FIELD_CHARS])
+        for field_name in ("reproduction_steps", "missing_evidence"):
+            values = getattr(self, field_name)[:schema.MAX_LIST_ITEMS]
+            setattr(self, field_name, [
+                value[:schema.MAX_LIST_ITEM_CHARS] for value in values
+            ])
 
     @classmethod
     def from_parsed(cls, data: Any) -> ImprovedBugReport:

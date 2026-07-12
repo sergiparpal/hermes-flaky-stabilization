@@ -132,7 +132,7 @@ class TestCopyProject:
         assert (dst / "a.txt").read_text() == "payload"
         assert (dst / "a.txt").stat().st_ino != f.stat().st_ino
 
-    def test_hardlinks_when_enabled(self, tmp_path, monkeypatch):
+    def test_hardlink_setting_cannot_alias_source(self, tmp_path, monkeypatch):
         monkeypatch.setenv("FLAKY_HEALER_HARDLINK_COPY", "1")
         src = tmp_path / "src"
         (src / "node_modules" / "dep").mkdir(parents=True)
@@ -141,8 +141,7 @@ class TestCopyProject:
         dst = copy_project(src, tmp_path / "dst")
         linked = dst / "node_modules" / "dep" / "index.js"
         assert linked.read_text() == "payload"
-        # same filesystem (tmp) → hardlinked to the source inode, not byte-copied
-        assert linked.stat().st_ino == f.stat().st_ino
+        assert linked.stat().st_ino != f.stat().st_ino
 
 
 class TestRunConcurrencyConfig:

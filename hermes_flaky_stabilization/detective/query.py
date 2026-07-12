@@ -124,6 +124,11 @@ def _warn_on_schema_mismatch(version: int | None) -> None:
             "test-history database has no schema_version row (expected %s); "
             "reading anyway, results may be unreliable.", expected,
         )
+    elif version > expected:
+        raise TestHistoryUnavailable(
+            f"test-history schema_version is {version}, newer than supported "
+            f"version {expected}; upgrade hermes-flaky-stabilization before scanning."
+        )
     elif version != expected:
         logger.warning(
             "test-history schema_version is %s but this plugin was built for %s; "

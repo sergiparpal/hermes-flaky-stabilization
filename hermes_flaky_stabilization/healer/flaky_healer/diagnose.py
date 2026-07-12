@@ -234,7 +234,7 @@ def _sanitize_llm_diagnosis(raw: dict, fallback: dict) -> dict:
         _coerce_str_or_none(raw.get("selector"), fallback.get("selector")),
     )
     strategy = raw.get("recommended_strategy")
-    if strategy in STRATEGY_FOR_CAUSE.values():
+    if strategy == STRATEGY_FOR_CAUSE.get(cause):
         out["recommended_strategy"] = strategy
     triage = raw.get("triage_label")
     if triage in set(TRIAGE_FOR_CAUSE.values()):

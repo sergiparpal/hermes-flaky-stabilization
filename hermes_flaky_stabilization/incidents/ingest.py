@@ -15,6 +15,10 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
+class SyncProtocolError(RuntimeError):
+    """Jira returned a successful response whose shape is unsafe to ingest."""
+
 # Custom-field ids/names commonly used for root-cause / RCA across Jira setups.
 _RCA_FIELD_HINTS = ("root_cause", "root cause", "rca", "cause", "post-mortem", "postmortem")
 
@@ -160,7 +164,11 @@ def map_issue(issue: dict[str, Any], root_cause_field: str | None = None) -> dic
     if not isinstance(issue, dict):
         raise ValueError("issue must be a dict")
     key = issue.get("key") or ""
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError("issue is missing a non-empty string key")
     fields = issue.get("fields") or {}
+    if not isinstance(fields, dict):
+        raise ValueError(f"issue {key!r} has a non-object fields value")
 
     status_field = fields.get("status")
     if isinstance(status_field, dict):
@@ -175,7 +183,7 @@ def map_issue(issue: dict[str, Any], root_cause_field: str | None = None) -> dic
         root_cause = body
 
     return {
-        "key": key,
+        "key": key.strip(),
         "summary": field_to_text(fields.get("summary")),
         "status": status,
         "root_cause": root_cause,
@@ -364,9 +372,12 @@ def _clear_tokens_if_query_changed(store: Any, jql: str) -> None:
             logger.warning(
                 "jira.jql changed since the last sync; clearing persisted "
                 "resume tokens and restarting pagination from the first page")
-        store.set_meta(_META_BACKFILL_TOKEN, "")
-        store.set_meta(_META_SYNC_TOKEN, "")
-        store.set_meta(_META_SYNC_NEWEST, "")
+        # A query change invalidates more than Jira's opaque page tokens. The old
+        # watermark describes the old result set; retaining it would make a newly
+        # broadened query skip every older issue it just began matching.
+        for key in (_META_WATERMARK, _META_BACKFILL_DONE, _META_BACKFILL_TOKEN,
+                    _META_SYNC_TOKEN, _META_SYNC_NEWEST):
+            store.set_meta(key, "")
     store.set_meta(_META_JQL, jql)
 
 
@@ -441,16 +452,27 @@ def _sweep_pages(
                 resumed_from_persisted_token = False
                 continue
             raise
-        issues = resp.get("issues", []) if isinstance(resp, dict) else []
+        if not isinstance(resp, dict):
+            raise SyncProtocolError(
+                f"Jira search returned {type(resp).__name__}, expected an object"
+            )
+        if "issues" not in resp or not isinstance(resp["issues"], list):
+            raise SyncProtocolError("Jira search response is missing an array-valued 'issues'")
+        issues = resp["issues"]
         if not issues:
             sweep.exhausted = True
             break
         mapped: list[dict[str, Any]] = []
-        for issue in issues:
+        for index, issue in enumerate(issues):
             try:
                 mapped.append(map_issue(issue, root_cause_field))
             except Exception as e:
-                logger.debug("skipping unmappable issue: %s", e)
+                # Skipping one row is unsafe: incremental sync could advance past
+                # it, while a full sync could delete its existing local copy as
+                # "unseen". Reject the page before any of it is written.
+                raise SyncProtocolError(
+                    f"Jira issue at page offset {index} could not be mapped: {type(e).__name__}"
+                ) from e
         # upsert_many returns the count of rows that were actually new or
         # changed (unchanged re-fetches are skipped), so "ingested" reflects
         # real index change — not the boundary issues every incremental sync
@@ -463,7 +485,10 @@ def _sweep_pages(
         if page_newest and (sweep.newest is None or page_newest > sweep.newest):
             sweep.newest = page_newest
 
-        sweep.next_token = resp.get("nextPageToken") if isinstance(resp, dict) else None
+        token = resp.get("nextPageToken")
+        if token is not None and not isinstance(token, str):
+            raise SyncProtocolError("Jira nextPageToken must be a string when present")
+        sweep.next_token = token or None
         if not sweep.next_token:
             sweep.exhausted = True
             break

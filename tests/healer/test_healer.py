@@ -162,7 +162,7 @@ class TestHealEndToEnd:
         )
         assert report.error is None, report.to_dict()
         assert report.strategy == "await_state"
-        assert "waitForLoadState('networkidle')" in report.diff
+        assert "timeout: 5000" in report.diff
         assert report.stable is True, (
             "post-patch burn-in must be N/N green: " + json.dumps(report.burnin)
         )

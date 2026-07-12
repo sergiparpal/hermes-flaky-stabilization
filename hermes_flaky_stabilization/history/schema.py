@@ -109,7 +109,25 @@ def apply_schema(conn: sqlite3.Connection) -> None:
     grows past version 1, add ``ALTER``/data-migration steps here gated on
     ``current_version(conn)``.
     """
-    conn.executescript(SCHEMA_SQL)
+    installed = current_version(conn)
+    if installed > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"history schema version {installed} is newer than supported "
+            f"version {SCHEMA_VERSION}")
+    try:
+        conn.executescript(SCHEMA_SQL)
+    except sqlite3.OperationalError as exc:
+        if "fts5" not in str(exc).lower():
+            raise
+        # Core tables precede the virtual table in SCHEMA_SQL and remain usable
+        # on SQLite builds without FTS5. Record the baseline version explicitly;
+        # query code falls back to escaped LIKE searches.
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS schema_version ("
+            "version INTEGER PRIMARY KEY, "
+            "applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);"
+            "INSERT OR IGNORE INTO schema_version(version) VALUES (1);"
+        )
     conn.commit()
 
 

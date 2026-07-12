@@ -6,6 +6,7 @@ the structured, **masked** result contract. Read-only: it opens files only for
 reading and never writes anything.
 """
 import os
+import stat
 import time
 from collections import Counter
 from collections.abc import Callable
@@ -23,6 +24,7 @@ MAX_BYTES_PER_FILE = 2_000_000     # per-file read cap
 DEFAULT_MAX_FILES = 2000           # default file cap when caller omits max_files
 MAX_MAX_FILES = 10_000             # ceiling the caller may *not* raise
 MAX_FINDINGS = 1000                # cap on findings returned
+MAX_SKIPPED = 1000                 # cap on skipped path metadata returned
 MAX_SCAN_SECONDS = 300             # wall-clock ceiling on the per-file loop
 _NULL_SCAN_BYTES = 8192            # bytes inspected for the null-byte heuristic
 
@@ -39,6 +41,7 @@ _MAX_ERROR_FIELD = 120             # chars of a (masked) value an error may quot
 # exhaust memory or wedge the scan. Both breaches surface as reason=ocr_failed.
 OCR_TIMEOUT_SECONDS = 30
 MAX_IMAGE_PIXELS = 40_000_000
+MAX_IMAGE_FRAMES = 100
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif", ".webp"}
 
@@ -82,11 +85,26 @@ def _ocr_image(path: str) -> str:
     from PIL import Image
 
     with _open_nofollow(path) as fh, Image.open(fh) as img:
-        width, height = img.size
-        if width * height > MAX_IMAGE_PIXELS:
-            raise ValueError(f"image exceeds the {MAX_IMAGE_PIXELS}-pixel cap")
-        img.load()  # force the decode while the fd is open
-        return pytesseract.image_to_string(img, timeout=OCR_TIMEOUT_SECONDS)
+        frames = int(getattr(img, "n_frames", 1))
+        if frames > MAX_IMAGE_FRAMES:
+            raise ValueError(f"image exceeds the {MAX_IMAGE_FRAMES}-frame cap")
+        deadline = time.monotonic() + OCR_TIMEOUT_SECONDS
+        total_pixels = 0
+        text: list[str] = []
+        for index in range(frames):
+            img.seek(index)
+            width, height = img.size
+            total_pixels += width * height
+            if total_pixels > MAX_IMAGE_PIXELS:
+                raise ValueError(
+                    f"image exceeds the {MAX_IMAGE_PIXELS}-pixel aggregate cap")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("image OCR timed out")
+            img.load()
+            text.append(pytesseract.image_to_string(
+                img, timeout=max(1, int(remaining))))
+        return "\n".join(text)
 
 
 # ── file classification / IO ─────────────────────────────────────────────────
@@ -104,8 +122,13 @@ def _open_nofollow(path: str) -> BinaryIO:
     the OCR reader and the byte reader so the raw-fd cleanup — closing the fd
     that ``fdopen`` did not adopt — has one correct implementation.
     """
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+    )
     try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file")
         return os.fdopen(fd, "rb")
     except BaseException:
         os.close(fd)  # fdopen didn't adopt the fd; close the raw one
@@ -156,7 +179,8 @@ def _resolve_within(path: str, real_root: str) -> str | None:
     return None
 
 
-def _collect_files(real_target: str, max_files: int) -> tuple[list[str], list[tuple[str, str]], bool]:
+def _collect_files(real_target: str, max_files: int, deadline: float) -> tuple[
+        list[str], list[tuple[str, str]], bool, bool]:
     """Return (files, skipped_dirs, truncated). Deterministic order for CI parity.
 
     ``skipped_dirs`` carries ``(path, reason)`` for every directory whose contents
@@ -171,28 +195,34 @@ def _collect_files(real_target: str, max_files: int) -> tuple[list[str], list[tu
       unreadable directory entirely.
     """
     if os.path.isfile(real_target):
-        return [real_target], [], False
+        return [real_target], [], False, False
 
     collected: list[str] = []
     skipped_dirs: list[tuple[str, str]] = []
 
     def on_error(exc: OSError) -> None:
-        skipped_dirs.append((getattr(exc, "filename", "") or real_target, "unreadable_directory"))
+        if len(skipped_dirs) < MAX_SKIPPED:
+            skipped_dirs.append(
+                (getattr(exc, "filename", "") or real_target,
+                 "unreadable_directory"))
 
     for dirpath, dirnames, filenames in os.walk(real_target, followlinks=False, onerror=on_error):
+        if time.monotonic() > deadline:
+            return collected, skipped_dirs, True, True
         descend: list[str] = []
         for dn in sorted(dirnames):
             full = os.path.join(dirpath, dn)
             if os.path.islink(full) and _resolve_within(full, real_target) is None:
-                skipped_dirs.append((full, "symlink_escape"))
+                if len(skipped_dirs) < MAX_SKIPPED:
+                    skipped_dirs.append((full, "symlink_escape"))
             else:
                 descend.append(dn)
         dirnames[:] = descend  # in-place: os.walk reads this back to choose its descent
         for fn in sorted(filenames):
             if len(collected) >= max_files:
-                return collected, skipped_dirs, True
+                return collected, skipped_dirs, True, False
             collected.append(os.path.join(dirpath, fn))
-    return collected, skipped_dirs, False
+    return collected, skipped_dirs, False, False
 
 
 def _mask_pii(text: str) -> str:
@@ -305,7 +335,14 @@ def _findings_for_file(
     budget: int,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Detect PII in *text*, returning at most *budget* rows plus a capped flag."""
-    found = detectors.run_detectors(text, types)
+    try:
+        found = detectors.run_detectors(text, types, limit=budget + 1)
+    except TypeError as exc:
+        # Preserve compatibility with injected/custom detector runners that
+        # implement the historical two-argument protocol.
+        if "limit" not in str(exc):
+            raise
+        found = detectors.run_detectors(text, types)
     capped = len(found) > budget
     found = found[:budget]
     if not found:
@@ -528,7 +565,9 @@ def scan(
     is_file_target = os.path.isfile(real_target)
     effective_max = max_files if max_files is not None else DEFAULT_MAX_FILES
 
-    files, skipped_dirs, files_truncated = _collect_files(real_target, effective_max)
+    deadline = time.monotonic() + MAX_SCAN_SECONDS
+    files, skipped_dirs, files_truncated, walk_timed_out = _collect_files(
+        real_target, effective_max, deadline)
 
     scanned = 0
     findings: list[dict[str, Any]] = []
@@ -544,8 +583,7 @@ def scan(
     ocr_ready = cache(_ocr_available)
     bytes_truncated = False
     findings_capped = False
-    timed_out = False
-    deadline = time.monotonic() + MAX_SCAN_SECONDS
+    timed_out = walk_timed_out
 
     for index, full_path in enumerate(files):
         # Nothing else bounds the loop's wall clock: `max_files` x

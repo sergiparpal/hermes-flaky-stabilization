@@ -30,7 +30,12 @@ def is_degenerate(parts: dict) -> bool:
     store refuses to persist recipes under them.
     """
     parts = parts or {}
-    return not any(parts.get(k) for k in _FAILURE_KEYS)
+    meaningful = "".join(str(parts.get(k) or "") for k in _FAILURE_KEYS)
+    # Shape normalisation can turn an otherwise empty/noisy input into only
+    # placeholders such as <n>/<h>. Those collide just like truly empty parts.
+    for placeholder in ("<n>", "<h>", "<uuid>", "<id>"):
+        meaningful = meaningful.replace(placeholder, "")
+    return not any(ch.isalnum() for ch in meaningful)
 
 
 def signature_parts(

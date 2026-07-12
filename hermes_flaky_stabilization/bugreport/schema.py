@@ -33,6 +33,9 @@ SEVERITY_LEVELS = tuple(SEVERITY_RUBRIC)
 MAX_RAW_TEXT_BYTES = 16 * 1024  # 16 KB cap on raw_text.
 MAX_CONTEXT_BYTES = 4 * 1024  # 4 KB cap on the optional context string.
 MAX_TITLE_CHARS = 80  # Title length cap; enforced by the handler when coercing.
+MAX_FIELD_CHARS = 4_000
+MAX_LIST_ITEMS = 50
+MAX_LIST_ITEM_CHARS = 1_000
 
 # --- Input schema (what the agent passes to the tool) --------------------------
 # Wrapped as a full tool schema: name/description/parameters.
@@ -77,22 +80,26 @@ BUG_REPORT_OUTPUT_SCHEMA = {
             "type": "string",
             "description": f"Concise bug title, at most {MAX_TITLE_CHARS} characters.",
         },
-        "summary": {"type": "string", "description": "One or two sentences."},
+        "summary": {"type": "string", "maxLength": MAX_FIELD_CHARS,
+                    "description": "One or two sentences."},
         "reproduction_steps": {
             "type": "array",
-            "items": {"type": "string"},
+            "items": {"type": "string", "maxLength": MAX_LIST_ITEM_CHARS},
+            "maxItems": MAX_LIST_ITEMS,
             "description": "Ordered steps to reproduce. Empty array if none given.",
         },
-        "expected_behavior": {"type": "string"},
-        "actual_behavior": {"type": "string"},
+        "expected_behavior": {"type": "string", "maxLength": MAX_FIELD_CHARS},
+        "actual_behavior": {"type": "string", "maxLength": MAX_FIELD_CHARS},
         "severity": {"type": "string", "enum": list(SEVERITY_LEVELS)},
         "severity_rationale": {
             "type": "string",
+            "maxLength": MAX_FIELD_CHARS,
             "description": "One or two sentences explaining the severity choice.",
         },
         "missing_evidence": {
             "type": "array",
-            "items": {"type": "string"},
+            "items": {"type": "string", "maxLength": MAX_LIST_ITEM_CHARS},
+            "maxItems": MAX_LIST_ITEMS,
             "description": "Evidence absent from the input that would help triage.",
         },
     },

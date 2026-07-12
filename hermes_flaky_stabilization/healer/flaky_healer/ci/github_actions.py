@@ -9,7 +9,7 @@ from urllib.parse import quote, urlparse
 from .base import MAX_RESPONSE_BYTES, CIError, Transport, UrllibTransport
 
 API_VERSION = "2022-11-28"
-USER_AGENT = "hermes-flaky-healer/0.1.0"
+USER_AGENT = "hermes-flaky-healer/0.1.1"
 
 # Hard cap for the run-logs zip. The default UrllibTransport already enforces
 # this while streaming; the check in download_logs_zip keeps the guarantee for

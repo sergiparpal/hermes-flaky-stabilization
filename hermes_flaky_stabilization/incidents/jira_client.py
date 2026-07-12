@@ -38,6 +38,7 @@ from ..common import nethttp
 Transport = Callable[[str, str, dict[str, str], bytes | None, float], tuple[int, bytes]]
 
 DEFAULT_TIMEOUT = 10.0
+MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 DEFAULT_SEARCH_FIELDS = ["summary", "status", "reporter", "assignee", "created", "updated", "description"]
 
 # Explicit, verifying TLS context (cert chain + hostname). urllib already uses
@@ -60,13 +61,24 @@ def _urllib_transport(method: str, url: str, headers: dict[str, str],
     # UNREDIRECTED — urllib must never replay it to a redirect target (a proxy
     # bounce or http→https upgrade would otherwise leak it in cleartext).
     req = nethttp.build_request(method, url, headers, body)
+
+    def read_capped(resp) -> bytes:
+        data = resp.read(MAX_RESPONSE_BYTES + 1)
+        if len(data) > MAX_RESPONSE_BYTES:
+            raise JiraError(
+                f"Jira response exceeded the {MAX_RESPONSE_BYTES}-byte safety cap"
+            )
+        return data
+
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:
-            return resp.getcode(), resp.read()
+            return resp.getcode(), read_capped(resp)
     except urllib.error.HTTPError as e:
         # HTTPError is also a response — surface status + body for context.
         try:
-            payload = e.read()
+            payload = e.read(MAX_RESPONSE_BYTES + 1)
+            if len(payload) > MAX_RESPONSE_BYTES:
+                payload = b""
         except Exception:
             payload = b""
         return e.code, payload
@@ -93,13 +105,21 @@ class JiraClient:
         # Refuse to send credentials over a cleartext / non-HTTPS scheme. Basic
         # auth carries base64(email:token); on http:// that token is trivially
         # sniffable. https:// also pins us to a verifying TLS context above.
-        scheme = urllib.parse.urlsplit(self.base_url).scheme.lower()
+        parsed_base = urllib.parse.urlsplit(self.base_url)
+        scheme = parsed_base.scheme.lower()
         if scheme != "https":
             raise ValueError(
                 "jira_base_url must use https:// — refusing to send Jira "
                 f"credentials over an insecure scheme ({scheme or 'none'!r})"
             )
+        if (not parsed_base.hostname or parsed_base.username is not None
+                or parsed_base.password is not None or parsed_base.query or parsed_base.fragment):
+            raise ValueError(
+                "jira_base_url must be an https origin/path without credentials, query, or fragment"
+            )
         self.auth_mode = (auth_mode or "api_token").lower()
+        if self.auth_mode not in {"api_token", "oauth"}:
+            raise ValueError("auth_mode must be 'api_token' or 'oauth'")
         self.email = email
         self._token = token
         self.timeout = float(timeout) if timeout else DEFAULT_TIMEOUT
@@ -182,7 +202,7 @@ class JiraClient:
         if expand:
             params["expand"] = expand
         return self._request(
-            "GET", f"/rest/api/{self.api_version}/issue/{urllib.parse.quote(key)}",
+            "GET", f"/rest/api/{self.api_version}/issue/{urllib.parse.quote(key, safe='')}",
             params=params or None,
         )
 

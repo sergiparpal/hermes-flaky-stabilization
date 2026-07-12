@@ -75,7 +75,7 @@ TOKEN_VALUE_RE = re.compile("|".join(f"(?:{p})" for p in _TOKEN_SOURCES), re.DOT
 # and host stay readable. The password class excludes '/' and '@' so the match
 # cannot run past the authority, and is length-bounded.
 URL_CRED_RE = re.compile(
-    r"(?P<pre>\b[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@]*:)(?P<pw>[^\s:/@]{1,256})(?P<at>@)"
+    r"(?P<pre>\b[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@]*:)(?P<pw>[^\s/@]{1,256})(?P<at>@)"
 )
 
 # --------------------------------------------------------------------------
@@ -93,7 +93,7 @@ KV_RE = re.compile(
     r"(?:"
     r"(?P<q>[\"'])(?P<qval>(?:bearer\s+)?[^\"'\r\n]{1,4096})(?P=q)"
     r"|"
-    r"(?P<val>(?:bearer\s+)?[^\s\"',;]{4,})"
+    r"(?P<val>(?:bearer\s+)?[^\s\"',;]{1,4096})"
     r")",
     re.IGNORECASE,
 )

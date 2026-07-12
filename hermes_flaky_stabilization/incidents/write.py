@@ -18,11 +18,17 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
+from urllib.parse import quote
 
 from ..pii import redaction
 from . import config as config_mod
 
 logger = logging.getLogger(__name__)
+
+_MAX_TITLE_CHARS = 255
+_MAX_BODY_CHARS = 100_000
+_MAX_LABELS = 50
+_MAX_LABEL_CHARS = 255
 
 TOOL_NAME = "jira_create_incident"
 
@@ -96,8 +102,13 @@ def create_incident(client, ticket: dict[str, Any]) -> dict[str, Any]:
     if ticket.get("labels"):
         fields["labels"] = list(ticket["labels"])
     response = client.create_issue(fields)
+    if not isinstance(response, dict):
+        raise ValueError("Jira create response was not an object")
     key = response.get("key", "")
-    url = f"{client.base_url}/browse/{key}" if key else ""
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError("Jira create response did not contain an issue key")
+    key = key.strip()
+    url = f"{client.base_url}/browse/{quote(key, safe='')}"
     return {"created": True, "key": key, "url": url}
 
 
@@ -117,13 +128,17 @@ def _egress_clean(text: str) -> str:
 
 def build_ticket(args: dict[str, Any], jira_section: dict[str, Any]) -> dict[str, Any]:
     """Assemble the outbound ticket with every text field redacted (D6.4b)."""
-    title = _egress_clean(str(args.get("title") or "").strip())
+    title = _egress_clean(str(args.get("title") or "").strip())[:_MAX_TITLE_CHARS]
     body = _egress_clean(str(args.get("body") or "").strip())
     severity = str(args.get("severity") or "").strip()
     if severity:
         body = f"{body}\n\nSeverity: {_egress_clean(severity)}"
+    body = body[:_MAX_BODY_CHARS]
+    raw_labels = args.get("labels") or []
+    if not isinstance(raw_labels, (list, tuple)):
+        raise ValueError("labels must be an array of strings")
     labels = [
-        _egress_clean(str(label)) for label in (args.get("labels") or [])
+        _egress_clean(str(label)).strip()[:_MAX_LABEL_CHARS] for label in raw_labels[:_MAX_LABELS]
         if str(label).strip()
     ]
     return {
@@ -150,6 +165,33 @@ def handle_create_incident(args: dict[str, Any], **kwargs: Any) -> str:
     if not isinstance(body, str) or not body.strip():
         return _error("Missing required argument 'body'.",
                       "Pass the issue description as 'body'.")
+    if len(title) > _MAX_TITLE_CHARS:
+        return _error(f"'title' exceeds {_MAX_TITLE_CHARS} characters.",
+                      "Shorten the issue summary and retry.")
+    if len(body) > _MAX_BODY_CHARS:
+        return _error(f"'body' exceeds {_MAX_BODY_CHARS} characters.",
+                      "Trim the issue description and retry.")
+    labels = args.get("labels")
+    if labels is not None and (
+        not isinstance(labels, list)
+        or len(labels) > _MAX_LABELS
+        or any(not isinstance(label, str) or len(label) > _MAX_LABEL_CHARS for label in labels)
+    ):
+        return _error(
+            "Invalid 'labels': expected a bounded array of strings.",
+            f"Pass at most {_MAX_LABELS} labels of at most {_MAX_LABEL_CHARS} characters each.",
+        )
+    evidence_paths = args.get("evidence_paths")
+    if evidence_paths is not None and (
+        not isinstance(evidence_paths, list)
+        or len(evidence_paths) > 100
+        or any(not isinstance(path, str) or len(path) > 4096
+               for path in evidence_paths)
+    ):
+        return _error(
+            "Invalid 'evidence_paths': expected a bounded array of path strings.",
+            "Pass at most 100 local paths of at most 4096 characters each.",
+        )
 
     home = config_mod.resolve_hermes_home()
     cfg = config_mod.load_unified_config(home)

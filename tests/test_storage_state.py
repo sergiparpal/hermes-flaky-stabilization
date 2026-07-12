@@ -179,13 +179,13 @@ def test_appendix_a_legacy_column_sets(profile_env):
         ]
 
 
-def test_future_version_short_circuits(profile_env):
-    """A DB stamped at a future version is left alone (no downgrade attempts)."""
+def test_future_version_is_refused(profile_env):
+    """A future DB is refused rather than opened under old assumptions."""
     with closing(state.connect()) as conn:
         conn.execute("INSERT OR IGNORE INTO schema_version(version) VALUES (99)")
         conn.commit()
-    with closing(state.connect()) as conn:
-        assert state.current_version(conn) == 99
+    with pytest.raises(RuntimeError, match="newer than supported"):
+        state.connect()
 
 
 @pytest.mark.parametrize("explicit", [True, False])

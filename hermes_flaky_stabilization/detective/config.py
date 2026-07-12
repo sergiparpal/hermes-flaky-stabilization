@@ -127,19 +127,7 @@ def write_config(updates: dict) -> dict:
     """
     from .. import config as unified_config
 
-    path = config_path()
-    whole: dict = {}
-    if path.exists():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                whole = loaded
-        except Exception:
-            whole = {}
-    section = whole.get(_SECTION)
-    merged = {**(section if isinstance(section, dict) else {}), **updates}
-    whole[_SECTION] = merged
-    unified_config.write_config(whole)
+    merged = unified_config.update_section(_SECTION, updates)
     return _coerce_config({**DEFAULT_CONFIG, **merged})
 
 

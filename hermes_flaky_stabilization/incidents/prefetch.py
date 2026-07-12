@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,10 @@ class PrefetchCache:
         self._workers = workers
         self._name = name
         self._cache: dict[str, str] = {}
+        self._inflight: dict[str, Future[str]] = {}
+        self._generation = 0
+        self._closed = False
+        self._max_pending = max(workers, workers * 2)
         self._lock = threading.Lock()
         self._pool: ThreadPoolExecutor | None = None
         self._pool_lock = threading.Lock()
@@ -60,7 +64,9 @@ class PrefetchCache:
             if key in self._cache:
                 return self._cache[key]
         try:
-            fut = self._get_pool().submit(self._build_and_cache, key, query)
+            fut = self._submit(key, query)
+            if fut is None:
+                return ""
             return fut.result(timeout=timeout) or ""
         except FuturesTimeout:
             return ""  # degrade; the result still warms the cache when it lands
@@ -74,12 +80,13 @@ class PrefetchCache:
             return
         key = self._key(query)
         try:
-            self._get_pool().submit(self._build_and_cache, key, query)
+            self._submit(key, query)
         except Exception as e:
             logger.debug("%s: queue failed: %s", self._name, e)
 
     def clear(self) -> None:
         with self._lock:
+            self._generation += 1
             self._cache.clear()
 
     def contains(self, query: str) -> bool:
@@ -88,6 +95,11 @@ class PrefetchCache:
             return self._key(query) in self._cache
 
     def shutdown(self) -> None:
+        with self._lock:
+            self._closed = True
+            self._generation += 1
+            self._cache.clear()
+            self._inflight.clear()
         pool = self._pool
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
@@ -95,16 +107,41 @@ class PrefetchCache:
 
     # -- internals -----------------------------------------------------------
 
-    def _build_and_cache(self, key: str, query: str) -> str:
+    def _submit(self, key: str, query: str) -> Future[str] | None:
+        pool = self._get_pool()
+        with self._lock:
+            if self._closed:
+                return None
+            existing = self._inflight.get(key)
+            if existing is not None:
+                return existing
+            if len(self._inflight) >= self._max_pending:
+                return None
+            generation = self._generation
+            future = pool.submit(self._build_and_cache, key, query, generation)
+            self._inflight[key] = future
+        # A completed Future invokes callbacks synchronously. Register outside
+        # the cache lock so a very fast builder cannot deadlock in _forget().
+        future.add_done_callback(lambda done: self._forget(key, done))
+        return future
+
+    def _build_and_cache(self, key: str, query: str, generation: int) -> str:
         value = self._builder(query)
         if value:
-            # Don't cache empty results: the index may simply be warming up, and
-            # a cached "" would shadow real matches once ingest populates them.
-            self._put(key, value)
+            # Don't cache empty results: the index may simply be warming up,
+            # and a cached "" would shadow matches once ingest populates it.
+            self._put(key, value, generation)
         return value
 
-    def _put(self, key: str, value: str) -> None:
+    def _forget(self, key: str, future: Future[str]) -> None:
         with self._lock:
+            if self._inflight.get(key) is future:
+                self._inflight.pop(key, None)
+
+    def _put(self, key: str, value: str, generation: int) -> None:
+        with self._lock:
+            if self._closed or generation != self._generation:
+                return
             if key not in self._cache and len(self._cache) >= self._max_size:
                 # Evict the oldest entry (FIFO — dicts preserve insertion order).
                 self._cache.pop(next(iter(self._cache)), None)
@@ -115,6 +152,8 @@ class PrefetchCache:
         if pool is not None:
             return pool
         with self._pool_lock:
+            if self._closed:
+                raise RuntimeError("prefetch cache is shut down")
             if self._pool is None:
                 self._pool = ThreadPoolExecutor(
                     max_workers=self._workers, thread_name_prefix=self._name)

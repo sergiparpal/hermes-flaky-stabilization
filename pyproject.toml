@@ -1,15 +1,21 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "hermes-flaky-stabilization"
-version = "0.1.0"
+version = "0.1.1"
 description = "Unified Hermes Agent plugin: failure history, flaky detection, CI triage, sandboxed healing with PR flow, bug-report structuring, PII gating, and a local Jira incident index."
 requires-python = ">=3.11,<3.14"
-license = { text = "GPL-3.0-only" }
+license = "GPL-3.0-only"
 authors = [{ name = "sergiparpal" }]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4", "pytest-cov>=4", "ruff>=0.5"]
-# OCR extras for the PII scanner are runtime-probed, never imported at module
-# load: see requirements-ocr.txt.
+ocr = ["Pillow>=11.3", "pytesseract>=0.3.13"]
+
+[tool.setuptools.packages.find]
+include = ["hermes_flaky_stabilization*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

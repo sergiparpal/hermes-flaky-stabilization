@@ -126,7 +126,11 @@ def current_version(conn: sqlite3.Connection) -> int:
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     version = current_version(conn)
-    if version >= SCHEMA_VERSION:
+    if version > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"state schema version {version} is newer than supported "
+            f"version {SCHEMA_VERSION}")
+    if version == SCHEMA_VERSION:
         return
     with conn:
         conn.execute(

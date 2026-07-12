@@ -262,16 +262,13 @@ def test_reads_source_schema_version(tmp_path):
     assert _read(db).source_schema_version == 1
 
 
-def test_schema_mismatch_warns_but_still_reads(tmp_path, caplog):
+def test_future_schema_is_refused(tmp_path, caplog):
     db = build_test_history_db(tmp_path / "h.db", [
         {"source_file": "a.xml", "run_timestamp": "2026-05-20T09:00:00",
          "cases": [{"name": "t", "status": "failed"}]},
     ], schema_version=999)
-    with caplog.at_level("WARNING"):
-        result = _read(db)
-    assert result.source_schema_version == 999
-    assert any("schema_version" in rec.message for rec in caplog.records)
-    assert {r[1] for r in result.rows} == {"t"}   # data still returned
+    with pytest.raises(query.TestHistoryUnavailable, match="newer than supported"):
+        _read(db)
 
 
 # ---------------------------------------------------------------------------

@@ -1,19 +1,14 @@
-"""Strategy: wait for network state before the failing action.
-
-Inserts ``await page.waitForLoadState('networkidle')`` right before the
-failing assertion/action. Level-triggered (returns immediately when the
-network is already idle), so it is safe even when the pending response has
-landed by the time the line executes — unlike waitForResponse, which only
-observes future responses.
-"""
+"""Strategy: wait for the failing target to become visible before acting."""
 
 from __future__ import annotations
 
+import json
 import re
 
 from .base import CauseMatchStrategy, PatchOp, register_strategy
 
 _PAGE_VAR_RE = re.compile(r"\b(\w+)\.(?:locator|getBy\w+)\(")
+_EXPECT_TIMEOUT_RE = re.compile(r"timeout:[ \t]*([\d_]+)")
 
 # A line we may safely insert a statement before: it must itself start a
 # statement. Anything else (a Prettier-wrapped continuation like
@@ -66,15 +61,32 @@ class AwaitState(CauseMatchStrategy):
                     break
         if target_idx is None:
             return []
+        # Playwright assertions are already condition-aware and retry until
+        # their timeout. Extending an explicitly tiny assertion budget is more
+        # precise than waiting for the discouraged global `networkidle` state.
+        timeout_match = _EXPECT_TIMEOUT_RE.search(lines[target_idx])
+        if timeout_match and "expect(" in lines[target_idx]:
+            current = int(timeout_match.group(1).replace("_", ""))
+            enlarged = 5_000
+            if enlarged > current:
+                return [PatchOp(
+                    file=test_file,
+                    op="replace",
+                    anchor=lines[target_idx],
+                    old=timeout_match.group(0),
+                    new=f"timeout: {enlarged}",
+                )]
+            return []
         # The selector line may sit mid-expression; only ever insert before a
         # plausible statement start, else decline rather than corrupt the test.
         anchor_idx = _statement_anchor(lines, target_idx)
         if anchor_idx is None:
             return []
         anchor_line = lines[anchor_idx]
-        if anchor_idx > 0 and "waitForLoadState" in lines[anchor_idx - 1]:
+        if anchor_idx > 0 and ".waitFor({ state: 'visible' })" in lines[anchor_idx - 1]:
             return []  # already patched — keep the op idempotent
-        if any("waitForLoadState" in lines[i] for i in range(anchor_idx, target_idx + 1)):
+        if any(".waitFor({ state: 'visible' })" in lines[i]
+               for i in range(anchor_idx, target_idx + 1)):
             return []
         m = _PAGE_VAR_RE.search(lines[target_idx])
         page_var = m.group(1) if m else "page"
@@ -84,7 +96,8 @@ class AwaitState(CauseMatchStrategy):
                 file=test_file,
                 op="insert_before",
                 anchor=anchor_line,
-                new=f"{indent}await {page_var}.waitForLoadState('networkidle');",
+                new=(f"{indent}await {page_var}.locator({json.dumps(selector)})"
+                     ".waitFor({ state: 'visible' });"),
             )
         ]
 

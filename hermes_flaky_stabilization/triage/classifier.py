@@ -17,6 +17,7 @@ shape of :class:`agent.plugin_llm.PluginLlmStructuredResult`.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from . import taxonomy
@@ -177,6 +178,8 @@ def _normalise_result(parsed: Any) -> dict[str, Any] | None:
     try:
         confidence = float(parsed.get("confidence", _UNKNOWN_CONFIDENCE))
     except (TypeError, ValueError):
+        confidence = _UNKNOWN_CONFIDENCE
+    if not math.isfinite(confidence):
         confidence = _UNKNOWN_CONFIDENCE
     confidence = max(0.0, min(1.0, confidence))
     summary = parsed.get("summary")

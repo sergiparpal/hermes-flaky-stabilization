@@ -113,7 +113,7 @@ def print_manual_command(printable: str) -> None:
 
 
 def create_job(job: CronJob, schedule: str, deliver: str) -> int:
-    """The one sanctioned subprocess: create *job* once. Always returns 0.
+    """The one sanctioned subprocess: create *job* once.
 
     A missing hermes CLI or an unconfigured gateway is not an error — it prints
     the exact command to run by hand. (A cron-run session cannot create cron
@@ -124,7 +124,19 @@ def create_job(job: CronJob, schedule: str, deliver: str) -> int:
                 "--script", job.shim_name, "--deliver", deliver,
                 "--name", job.job_name]
     try:
-        result = subprocess.run(cron_cmd, capture_output=True, text=True)
+        try:
+            result = subprocess.run(
+                cron_cmd, capture_output=True, text=True, timeout=30)
+        except TypeError as exc:
+            # Compatibility with minimal test/embedding shims that implement
+            # the older subprocess.run surface without a timeout keyword.
+            if "timeout" not in str(exc):
+                raise
+            result = subprocess.run(cron_cmd, capture_output=True, text=True)
+    except subprocess.TimeoutExpired:
+        print("timed out creating the cron job. To create it manually, run:")
+        print_manual_command(printable)
+        return 1
     except (FileNotFoundError, OSError) as exc:
         print(f"could not run the hermes CLI ({exc}). To create the job, run:")
         print_manual_command(printable)
@@ -143,4 +155,4 @@ def create_job(job: CronJob, schedule: str, deliver: str) -> int:
         print(detail)
     print(f"could not create the {job.description} automatically. To create it, run:")
     print_manual_command(printable)
-    return 0
+    return 1

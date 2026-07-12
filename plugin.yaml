@@ -1,5 +1,5 @@
 name: hermes-flaky-stabilization
-version: 0.1.0
+version: 0.1.1
 description: "Unified flaky-test stabilization pipeline: failure history, flaky detection,
   CI triage, sandboxed healing with PR flow, bug-report structuring, PII gating, and a local
   Jira incident index — one plugin, one state store."

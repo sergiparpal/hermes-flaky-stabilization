@@ -57,6 +57,11 @@ _FTS_FROM_WHERE = (
     "JOIN test_runs tr ON tr.id = tc.run_id "
     "WHERE test_cases_fts MATCH ?"
 )
+_LIKE_FROM_WHERE = (
+    "FROM test_cases tc JOIN test_runs tr ON tr.id = tc.run_id WHERE "
+    "(tc.name LIKE ? ESCAPE '\\' OR tc.classname LIKE ? ESCAPE '\\' OR "
+    "tc.failure_message LIKE ? ESCAPE '\\' OR tc.stack_trace LIKE ? ESCAPE '\\')"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +167,9 @@ def _lookup_counts(conn, from_where: str, params: tuple) -> tuple[int, int, int]
     would collapse NULL classnames.
     """
     row = conn.execute(
-        "SELECT COUNT(*) AS total_runs, "
-        "SUM(CASE WHEN tc.status IN " + domain.FAIL_STATUSES_SQL + " THEN 1 ELSE 0 END) "
+        "SELECT COUNT(DISTINCT tc.run_id) AS total_runs, "
+        "COUNT(DISTINCT CASE WHEN tc.status IN " + domain.FAIL_STATUSES_SQL
+        + " THEN tc.run_id END) "
         "AS failure_count " + from_where,
         params,
     ).fetchone()
@@ -223,8 +229,14 @@ def test_failure_lookup(conn, test_id: str, limit: int = domain.DEFAULT_LIMIT,
         try:
             total_runs, failure_count, matched_tests = _lookup_counts(conn, from_where, params)
         except sqlite3.OperationalError:
-            # e.g. "fts5: syntax error" from an injection-y / malformed query.
-            total_runs = failure_count = matched_tests = 0
+            # FTS5 can be absent, corrupt, or reject metacharacters. Preserve a
+            # useful best-effort lookup with an escaped literal LIKE fallback.
+            escaped = (fts_query.replace("\\", "\\\\")
+                       .replace("%", "\\%").replace("_", "\\_"))
+            like = f"%{escaped}%"
+            from_where, params = _LIKE_FROM_WHERE, (like, like, like, like)
+            total_runs, failure_count, matched_tests = _lookup_counts(
+                conn, from_where, params)
     # limit >= MIN_LIMIT (1), so whenever failure_count > 0 this fetches at
     # least the most recent failing row (which also supplies last_failure_at).
     failed = _lookup_failures(conn, from_where, params, limit) if failure_count else []

@@ -24,6 +24,7 @@ makes every read site type-safe.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -92,6 +93,9 @@ def _as_float(value: Any, default: float, *, lo: float | None = None,
     except (TypeError, ValueError):
         logger.warning("%s: invalid %s=%r; using default %r", NAME, label, value, default)
         return default
+    if not math.isfinite(f):
+        logger.warning("%s: invalid %s=%r; using default %r", NAME, label, value, default)
+        return default
     if lo is not None and f < lo:
         f = lo
     if hi is not None and f > hi:
@@ -117,6 +121,14 @@ def _as_str_tuple(value: Any) -> tuple[str, ...] | None:
         return None
     items = [p for p in items if p]
     return tuple(items) or None
+
+
+def _auth_mode(value: Any) -> str:
+    mode = (_as_str(value, "api_token") or "api_token").lower()
+    if mode not in {"api_token", "oauth"}:
+        logger.warning("%s: unsupported auth_mode=%r; using api_token", NAME, value)
+        return "api_token"
+    return mode
 
 
 @dataclass(frozen=True)
@@ -161,7 +173,7 @@ class IncidentsConfig:
         return cls(
             jira_base_url=_as_str(d.get("jira_base_url")),
             jira_email=_as_str(d.get("jira_email")),
-            auth_mode=_as_str(d.get("auth_mode"), "api_token") or "api_token",
+            auth_mode=_auth_mode(d.get("auth_mode")),
             timeout=_as_float(d.get("timeout"), jira_mod.DEFAULT_TIMEOUT,
                               lo=1.0, hi=300.0, label="timeout"),
             jql=_as_str(d.get("jql")) or DEFAULT_JQL,

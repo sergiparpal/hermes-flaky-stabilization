@@ -38,8 +38,8 @@ TOKEN_VALUE_RE = secretscrub.TOKEN_VALUE_RE
 
 
 def mask_tokens(text: str) -> str:
-    """Mask every token-shaped substring in *text*."""
-    return secretscrub.mask_token_shapes(text, MASK)
+    """Mask token shapes, labelled assignments, and URL credentials."""
+    return secretscrub.scrub_text(text, MASK)
 
 
 def redact(obj):

@@ -18,6 +18,10 @@ from . import ingest as ingest_mod
 from .jira_client import JiraError
 from .store import IncidentStore
 
+_FULL_ACTIVE = "full_sync_active"
+_FULL_JQL = "full_sync_jql"
+_FULL_SEEN = "full_sync_seen_keys"
+
 
 def _hermes_home() -> str:
     """Thin module-level seam over :func:`config.resolve_hermes_home`.
@@ -132,21 +136,20 @@ def _cmd_sync(home: str, raw: dict[str, Any], *, full: bool = False,
         return 1
     store = IncidentStore(_db_path(home, cfg))
     try:
+        prior_seen: set[str] = set()
         if full:
-            # Restart ingest from scratch so the run enumerates every live
-            # issue (needed to detect deletions/re-keys).
-            ingest_mod.reset_sync_state(store)
+            prior_seen = _prepare_full_sync(store, cfg.jql)
         try:
             result = ingest_mod.run_sync(
                 store, client, cfg.jql, incremental=not full,
                 **cfg.run_sync_kwargs(),
             )
-        except JiraError as e:
+        except (JiraError, ingest_mod.SyncProtocolError) as e:
             # Clean one-line failure (no traceback) with a non-zero exit code,
             # so the nightly cron shim can alert.
             print(f"Sync failed: {e}", file=sys.stderr)
             return 1
-        removed = _reconcile_full_sync(store, result) if full else 0
+        removed = _reconcile_full_sync(store, result, prior_seen) if full else 0
         changed = bool(result["ingested"] or removed)
         incomplete = not result.get("backfill_complete", True)
         # Report unless this is a quiet cron tick with nothing to say; a quiet run
@@ -165,7 +168,31 @@ def _cmd_sync(home: str, raw: dict[str, Any], *, full: bool = False,
         store.close()
 
 
-def _reconcile_full_sync(store: IncidentStore, result: dict[str, Any]) -> int:
+def _prepare_full_sync(store: IncidentStore, jql: str) -> set[str]:
+    """Start a full sweep, or resume a previously truncated sweep safely."""
+    active = store.get_meta(_FULL_ACTIVE) == "1"
+    same_query = store.get_meta(_FULL_JQL) == jql
+    if not (active and same_query):
+        ingest_mod.reset_sync_state(store)
+        store.set_meta(_FULL_ACTIVE, "1")
+        store.set_meta(_FULL_JQL, jql)
+        store.set_meta(_FULL_SEEN, "[]")
+        return set()
+    try:
+        loaded = json.loads(store.get_meta(_FULL_SEEN) or "[]")
+        if not isinstance(loaded, list):
+            raise ValueError("full-sync checkpoint is not a list")
+        return {value for value in loaded if isinstance(value, str) and value}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        # A corrupt reconciliation checkpoint cannot be trusted. Restart the
+        # enumeration; never delete from an incomplete/corrupt seen set.
+        ingest_mod.reset_sync_state(store)
+        store.set_meta(_FULL_SEEN, "[]")
+        return set()
+
+
+def _reconcile_full_sync(store: IncidentStore, result: dict[str, Any],
+                         prior_seen: set[str] | None = None) -> int:
     """After a ``--full`` run, delete local incidents Jira no longer returns.
 
     Deletion is safe ONLY when the run enumerated every live issue (was not
@@ -173,10 +200,15 @@ def _reconcile_full_sync(store: IncidentStore, result: dict[str, Any]) -> int:
     dropping "unseen" locals would be false deletions. Returns the count
     removed, and prints its own skip notice when it cannot safely reconcile.
     """
+    seen = set(prior_seen or set()) | set(result.get("seen_keys") or set())
     if result.get("backfill_complete"):
-        return store.delete_keys_not_in(result.get("seen_keys") or set())
+        removed = store.delete_keys_not_in(seen)
+        store.set_meta(_FULL_ACTIVE, "")
+        store.set_meta(_FULL_JQL, "")
+        store.set_meta(_FULL_SEEN, "[]")
+        return removed
+    store.set_meta(_FULL_SEEN, json.dumps(sorted(seen), separators=(",", ":")))
     print("Full sync was truncated by max_pages before seeing every "
           "issue — skipping deletion of unseen local incidents; "
-          "run `jira sync` again to finish re-indexing.")
+          "run `jira sync --full` again to resume and finish re-indexing.")
     return 0
-

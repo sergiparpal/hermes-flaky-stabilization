@@ -77,8 +77,8 @@ ENV_HARDLINK_COPY = "FLAKY_HEALER_HARDLINK_COPY"
 # (the tag stays in the ref for readability; the @sha256 is what docker verifies).
 # Override with FLAKY_HEALER_DOCKER_IMAGE to pin a different digest.
 DEFAULT_DOCKER_IMAGE = (
-    "mcr.microsoft.com/playwright:v1.60.0-noble"
-    "@sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948"
+    "mcr.microsoft.com/playwright:v1.61.0-noble"
+    "@sha256:57b65fdc9ceabe0ef613124c7bbe2babcf9362c4d85e382fe3b03604e84b428a"
 )
 DEFAULT_BURNIN = (5, 10)
 

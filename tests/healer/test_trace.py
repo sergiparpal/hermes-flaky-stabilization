@@ -41,7 +41,7 @@ def test_race_fixture_expect_with_pending_request():
     assert s.selector == "#item-count"
     assert s.timed_out is True
     assert s.selector_resolved is True
-    assert [r.url for r in s.pending_requests] == ["http://127.0.0.1:4173/api/items"]
+    assert [r.url for r in s.pending_requests] == ["http://127.0.0.1:4173"]
     assert s.pending_requests[0].pending is True
 
 
