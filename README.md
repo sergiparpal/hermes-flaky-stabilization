@@ -187,6 +187,4 @@ silently passing the image.
 
 ## License
 
-GPL-3.0-only — several absorbed plugins are GPLv3, which the union inherits
-(plan D8; note `hermes-flaky-detective`'s README wished otherwise, but its
-LICENSE file is GPLv3). See `LICENSE`.
+MIT License. See `LICENSE`.
