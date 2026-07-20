@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-flaky-stabilization"
-version = "0.1.1"
+version = "0.1.2"
 description = "Unified Hermes Agent plugin: failure history, flaky detection, CI triage, sandboxed healing with PR flow, bug-report structuring, PII gating, and a local Jira incident index."
 requires-python = ">=3.11,<3.14"
-license = "GPL-3.0-only"
+license = "MIT"
 authors = [{ name = "sergiparpal" }]
 
 [project.optional-dependencies]

@@ -6,7 +6,7 @@
 |---|---|---|
 | Q1 | Plugin name stays `hermes-flaky-stabilization`? | **Yes** — manifest name, package `hermes_flaky_stabilization`, data dir `<hermes_home>/flaky-stabilization/`, CLI `flaky-stab`. |
 | Q2 | Build net-new `jira_create_incident` write tool? | **Yes, build it, ship disabled** — `jira.enable_write: false` default, `check_fn` hides it without `JIRA_API_TOKEN`, approval-escalated via `pre_tool_call`, PII-gated (D6/D7). |
-| Q3 | License GPL-3.0-only? | **Yes** — forced by absorbed GPLv3 code; the repo's initial MIT LICENSE is replaced. |
+| Q3 | License MIT? | **Yes** — keep the project metadata consistent with the repo's MIT LICENSE. |
 | Q4 | Keep `test-history` CLI alias? | **Yes** — `hermes test-history ingest|status|prune|rebuild-fts|config` unchanged (D2). |
 
 Preflight: `scripts/preflight.sh` passed on 2026-07-09 (7 sibling repos, hermes-agent 0.18.2 at
@@ -98,10 +98,8 @@ returning the structured, redacted ticket body for the user to file manually.
 this repo (monorepo per stage, D3). Rationale: the tight dataflow coupling and the enrichment-bug
 class of cross-repo contract drift are exactly what unification removes; coexistence is impossible
 anyway because tool names would collide in the registry (§3.3). Each legacy repo gets a final
-release + archived status + README pointer (§11). License: the unified repo is **GPL-3.0-only**
-(several sources are GPL; absorbing their code forces the union to GPL — note that
-flaky-detective's README wished otherwise, but its LICENSE file is GPLv3; record this in the repo
-README).
+release + archived status + README pointer (§11). License: the unified repo is **MIT**, matching
+the repository's LICENSE file and package metadata.
 
 **D9 — The orchestrator implements the fork and both feedback loops (all net-new).** New tool
 **`stabilize_test_failure`** (+ `/stabilize` slash command): ingest-or-locate failure evidence →
