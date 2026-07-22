@@ -38,9 +38,9 @@ mechanically restyle ported legacy modules. Maintain the enforced dependency dir
 ## Testing Guidelines
 
 Write pytest files as `test_*.py` and name tests after observable behavior. Add tests beside the
-affected stage and update snapshots only for intentional schema changes. Docker and live tests
-must use their declared markers; the default suite excludes both and scrubs credentials. Maintain
-at least 85% coverage:
+affected stage and update snapshots only for intentional schema changes. Docker, end-to-end, and
+live tests must use their declared markers; the default suite excludes all three and scrubs
+credentials. Maintain at least 85% coverage:
 
 ```bash
 bash scripts/run_tests.sh -- --cov=hermes_flaky_stabilization --cov-fail-under=85

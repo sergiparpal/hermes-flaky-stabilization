@@ -19,9 +19,10 @@ include = ["hermes_flaky_stabilization*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--import-mode=importlib -m 'not docker and not live'"
+addopts = "--import-mode=importlib -m 'not docker and not e2e and not live'"
 markers = [
     "docker: requires a reachable Docker daemon (skipped when unavailable)",
+    "e2e: requires Docker or installed local Playwright browsers (opt-in only)",
     "live: requires network and credentials (opt-in only, off by default)",
 ]
 

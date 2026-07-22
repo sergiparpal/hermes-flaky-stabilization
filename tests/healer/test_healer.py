@@ -132,6 +132,7 @@ class TestHealWithFakeSandbox:
         assert "timeout: 6000" in report.diff  # 2000 * 3
 
 
+@pytest.mark.e2e
 @e2e_runnable
 class TestHealEndToEnd:
     def test_heals_flaky_selector_for_real(self, browser_env, selector_trace):
